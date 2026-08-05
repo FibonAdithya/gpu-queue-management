@@ -14,13 +14,14 @@ follow:
    whoever is waiting can do nothing else, and if their session dies the queued
    work is simply lost.
 
-The originating case is `wgan-synthetic`: six agents, one per benchmark dataset
-family, each wanting to fetch data, profile it, and train a model ladder,
-against one RTX 4060 with 8GB of VRAM and 64 CPU cores.
+The shape that motivates it: several agents working in parallel, each wanting
+to fetch data, profile it, and train a model ladder, against one consumer card
+with 8GB of VRAM and many CPU cores. The CPU work parallelizes freely; the
+training does not.
 
 ## Constraints
 
-- The target box is an **unprivileged container** (vast.ai PyTorch image). No
+- The target box is an **unprivileged container** (a hosted PyTorch image). No
   Docker-in-Docker, no kernel modules, no sysctls. Long-running processes are
   managed by **supervisor**.
 - The box is **ephemeral**. It may be destroyed and rebuilt; nothing on it may
@@ -78,18 +79,18 @@ any instant and two runner threads cannot both claim it.
 
 ```json
 {
-  "id": "glove-v0-train-01",
+  "id": "myproject-v0-train-01",
   "lane": "gpu",
-  "project": "wgan-synthetic",
+  "project": "myproject",
   "commit": "a1b2c3d",
-  "branch": "ds/glove",
-  "cmd": ["python", "-m", "src.train.train_wgan_gp",
-          "--config", "configs/glove/v0.yaml"],
-  "artifacts": ["runs/glove/v0/summary.json",
-                "runs/glove/v0/run_config.yaml"],
+  "branch": "experiment/v0",
+  "cmd": ["python", "-m", "src.train",
+          "--config", "configs/v0.yaml"],
+  "artifacts": ["runs/v0/summary.json",
+                "runs/v0/run_config.yaml"],
   "timeout_s": 21600,
   "attempts": 0,
-  "dedupe_key": "glove:v0:a1b2c3d"
+  "dedupe_key": "myproject:v0:a1b2c3d"
 }
 ```
 
@@ -120,10 +121,10 @@ Each project the runner serves is declared in configuration:
 root = "/workspace/queue"
 cpu_slots = 4
 
-[project.wgan-synthetic]
-remote   = "git@github.com:Daniel-T-S-Adams/wgan-synthetic.git"
-checkout = "/workspace/checkouts/wgan-synthetic"
-venv     = "/workspace/checkouts/wgan-synthetic/.venv"
+[project.myproject]
+remote   = "git@github.com:you/myproject.git"
+checkout = "/workspace/checkouts/myproject"
+venv     = "/workspace/checkouts/myproject/.venv"
 commit_artifacts = true
 ```
 
@@ -152,7 +153,7 @@ crash-looping job occupies the only card indefinitely.
 `gpu-claim` is usable directly and is what the GPU lane uses internally:
 
 ```
-gpu-claim -- python -m src.train.train_wgan_gp --config ...
+gpu-claim -- python -m src.train --config ...
 ```
 
 Three things must be pinned for independent implementations to interoperate:

@@ -3,16 +3,16 @@ from gpuqueue.spec import JobSpec, SpecError, utcnow_iso
 
 def _minimal(**over):
     d = {
-        "id": "glove-v0-train-01",
+        "id": "myproject-v0-train-01",
         "lane": "gpu",
-        "project": "wgan-synthetic",
+        "project": "myproject",
         "commit": "a1b2c3d",
-        "branch": "ds/glove",
+        "branch": "experiment/v0",
         "cmd": ["python", "-m", "src.train", "--config", "c.yaml"],
-        "artifacts": ["runs/glove/v0/summary.json"],
+        "artifacts": ["runs/v0/summary.json"],
         "timeout_s": 21600,
         "attempts": 0,
-        "dedupe_key": "glove:v0:a1b2c3d",
+        "dedupe_key": "myproject:v0:a1b2c3d",
     }
     d.update(over)
     return d

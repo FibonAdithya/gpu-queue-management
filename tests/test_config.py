@@ -6,10 +6,10 @@ TOML = """
 root = "/workspace/queue"
 cpu_slots = 4
 
-[project.wgan-synthetic]
-remote   = "git@github.com:Daniel-T-S-Adams/wgan-synthetic.git"
-checkout = "/workspace/checkouts/wgan-synthetic"
-venv     = "/workspace/checkouts/wgan-synthetic/.venv"
+[project.myproject]
+remote   = "git@github.com:you/myproject.git"
+checkout = "/workspace/checkouts/myproject"
+venv     = "/workspace/checkouts/myproject/.venv"
 commit_artifacts = true
 """
 
@@ -24,8 +24,8 @@ def test_loads_queue_settings(tmp_path):
     assert cfg.cpu_slots == 4
 
 def test_loads_project(tmp_path):
-    proj = load_config(_write(tmp_path, TOML)).projects["wgan-synthetic"]
-    assert proj.name == "wgan-synthetic"
+    proj = load_config(_write(tmp_path, TOML)).projects["myproject"]
+    assert proj.name == "myproject"
     assert proj.commit_artifacts is True
     assert str(proj.venv).endswith(".venv")
 

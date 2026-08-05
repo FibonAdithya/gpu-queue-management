@@ -13,8 +13,8 @@ someone else's run mysteriously slow. Submit it instead.
 
     gpuq submit --project <name> --commit "$(git rev-parse HEAD)" \
       --branch "$(git rev-parse --abbrev-ref HEAD)" \
-      --lane gpu --artifact runs/glove/v0/summary.json \
-      -- python -m src.train.train_wgan_gp --config configs/glove/v0.yaml
+      --lane gpu --artifact runs/v0/summary.json \
+      -- python -m src.train --config configs/v0.yaml
 
 It prints a job id and returns at once. Then choose:
 
@@ -27,7 +27,7 @@ It prints a job id and returns at once. Then choose:
 whenever you like. If the job already finished, `wait` returns immediately —
 there is no penalty for waiting late, and no need to decide up front.
 
-Six datasets to process? Submit all six, then wait on them one at a time.
+Several datasets to process? Submit them all, then wait on them one at a time.
 The runner will already have been working through them.
 
 ## Which lane

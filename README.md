@@ -41,6 +41,3 @@ point `bootstrap.sh` at the right one with `PYTHON=/path/to/python3.11`.
 
 Per-job VRAM limits are not implemented: a job that holds the card holds
 all of it. See "Not in scope" in `docs/design.md`.
-
-Originating context: `Daniel-T-S-Adams/wgan-synthetic`, which needs six agents
-to research six datasets in parallel against a single RTX 4060.

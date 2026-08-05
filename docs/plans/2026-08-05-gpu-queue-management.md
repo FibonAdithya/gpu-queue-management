@@ -81,16 +81,16 @@ from gpuqueue.spec import JobSpec, SpecError, utcnow_iso
 
 def _minimal(**over):
     d = {
-        "id": "glove-v0-train-01",
+        "id": "myproject-v0-train-01",
         "lane": "gpu",
-        "project": "wgan-synthetic",
+        "project": "myproject",
         "commit": "a1b2c3d",
-        "branch": "ds/glove",
+        "branch": "experiment/v0",
         "cmd": ["python", "-m", "src.train", "--config", "c.yaml"],
-        "artifacts": ["runs/glove/v0/summary.json"],
+        "artifacts": ["runs/v0/summary.json"],
         "timeout_s": 21600,
         "attempts": 0,
-        "dedupe_key": "glove:v0:a1b2c3d",
+        "dedupe_key": "myproject:v0:a1b2c3d",
     }
     d.update(over)
     return d
@@ -1653,10 +1653,10 @@ TOML = """
 root = "/workspace/queue"
 cpu_slots = 4
 
-[project.wgan-synthetic]
-remote   = "git@github.com:Daniel-T-S-Adams/wgan-synthetic.git"
-checkout = "/workspace/checkouts/wgan-synthetic"
-venv     = "/workspace/checkouts/wgan-synthetic/.venv"
+[project.myproject]
+remote   = "git@github.com:you/myproject.git"
+checkout = "/workspace/checkouts/myproject"
+venv     = "/workspace/checkouts/myproject/.venv"
 commit_artifacts = true
 """
 
@@ -1671,8 +1671,8 @@ def test_loads_queue_settings(tmp_path):
     assert cfg.cpu_slots == 4
 
 def test_loads_project(tmp_path):
-    proj = load_config(_write(tmp_path, TOML)).projects["wgan-synthetic"]
-    assert proj.name == "wgan-synthetic"
+    proj = load_config(_write(tmp_path, TOML)).projects["myproject"]
+    assert proj.name == "myproject"
     assert proj.commit_artifacts is True
     assert str(proj.venv).endswith(".venv")
 
@@ -1796,6 +1796,9 @@ def load_config(path: Path) -> RunnerConfig:
 
 ```toml
 # gpuq.example.toml
+# Copied to $GPUQ_CONFIG by bootstrap.sh on first run, then never overwritten.
+# Edit it in place and rerun bootstrap.sh to clone your projects.
+
 [queue]
 root = "/workspace/queue"
 # 4, not the core count: typical CPU jobs here are BLAS-bound and already
@@ -1803,13 +1806,20 @@ root = "/workspace/queue"
 cpu_slots = 4
 poll_interval_s = 2.0
 kill_orphan_cuda = true
+# Every participant on the box must agree on this path, or two tools hold
+# two different locks for the same card.
+claim_dir = "/workspace/lock/gpu"
 
-[project.wgan-synthetic]
-remote   = "git@github.com:Daniel-T-S-Adams/wgan-synthetic.git"
-checkout = "/workspace/checkouts/wgan-synthetic"
-venv     = "/workspace/checkouts/wgan-synthetic/.venv"
+# One block per project the runner serves. Delete this example and add yours.
+# Until you do, bootstrap.sh will report that it cannot clone it — expected,
+# and not fatal.
+[project.example]
+remote   = "git@github.com:you/your-project.git"
+checkout = "/workspace/checkouts/your-project"
+# Put the environment holding torch here. It goes on the job's PATH, which is
+# also what makes `-- python train.py` work on images that ship only python3.
+venv     = "/venv/main"
 commit_artifacts = true
-push = false
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -3465,9 +3475,6 @@ architecture and `docs/plans/` for the implementation plan.
 
 Per-job VRAM limits are not implemented: a job that holds the card holds
 all of it. See "Not in scope" in `docs/design.md`.
-
-Originating context: `Daniel-T-S-Adams/wgan-synthetic`, which needs six agents
-to research six datasets in parallel against a single RTX 4060.
 ```
 
 - [ ] **Step 6: End-to-end verification on a real box**
@@ -3477,7 +3484,7 @@ Run, on the target box:
 GPUQ_PREFIX=/workspace ./bootstrap.sh
 # declare your project in /workspace/gpuq.toml, then:
 ./bootstrap.sh
-gpuq submit --project wgan-synthetic --commit "$(git rev-parse HEAD)" \
+gpuq submit --project myproject --commit "$(git rev-parse HEAD)" \
   --branch main --lane gpu --artifact runs/smoke.json \
   -- python -c "import json,os; os.makedirs('runs',exist_ok=True); json.dump({'ok':1},open('runs/smoke.json','w'))"
 gpuq list
@@ -3721,8 +3728,8 @@ someone else's run mysteriously slow. Submit it instead.
 
     gpuq submit --project <name> --commit "$(git rev-parse HEAD)" \
       --branch "$(git rev-parse --abbrev-ref HEAD)" \
-      --lane gpu --artifact runs/glove/v0/summary.json \
-      -- python -m src.train.train_wgan_gp --config configs/glove/v0.yaml
+      --lane gpu --artifact runs/v0/summary.json \
+      -- python -m src.train --config configs/v0.yaml
 
 It prints a job id and returns at once. Then choose:
 
@@ -3735,7 +3742,7 @@ It prints a job id and returns at once. Then choose:
 whenever you like. If the job already finished, `wait` returns immediately —
 there is no penalty for waiting late, and no need to decide up front.
 
-Six datasets to process? Submit all six, then wait on them one at a time.
+Several datasets to process? Submit them all, then wait on them one at a time.
 The runner will already have been working through them.
 
 ## Which lane
@@ -3801,7 +3808,7 @@ an agent reading a dangling symlink gets nothing with no explanation.
 - [ ] **Step 7: Verify end to end**
 
 ```bash
-gpuq submit --project wgan-synthetic --commit "$(git rev-parse HEAD)" \
+gpuq submit --project myproject --commit "$(git rev-parse HEAD)" \
   --branch main --lane cpu --wait --poll 1 -- sh -c 'sleep 3; echo ok'
 echo "exit: $?"
 ```
