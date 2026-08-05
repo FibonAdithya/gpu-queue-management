@@ -14,7 +14,7 @@
 - **Never import `torch`.** Not even guarded, not even for GPU identity. A JAX or TensorFlow project must be able to use this lock, and importing torch inside the runner daemon costs seconds and initializes a CUDA context in the one process that should never touch the card. GPU identity comes from `nvidia-smi`. `normalize_gpu_uuid` still exists — see "Design gaps resolved", gap 2 — precisely because *other* implementations of the protocol will use torch.
 - **The runner has no threads.** No `threading`, no `concurrent.futures`, no locks. `tick()` is one non-blocking pass and is the entire concurrency story; if a change seems to need a worker thread, it needs a redesign instead. Shared mutable state between a worker and the main loop is the failure mode this rules out by construction.
 - **Every test must pass without a GPU.** CI and dev machines have none. `nvidia-smi` is shelled out through one seam per module (`_run`) that tests monkeypatch. A test requiring real CUDA is a broken test.
-- **Unprivileged container.** No root, no Docker, no kernel modules, no sysctls. Never write outside `$QUEUE_ROOT`, `$GPU_CLAIM_DIR`, and configured checkouts.
+- **Unprivileged container.** No root, no Docker, no kernel modules, no sysctls. At runtime, never write outside `$QUEUE_ROOT`, `$GPU_CLAIM_DIR`, and configured checkouts. `bootstrap.sh` is the one exception and writes exactly two things beyond those: the supervisor program file, and the agent skill under `$GPUQ_SKILLS_DIR` (default `~/.claude/skills/gpu-jobs/`). Both are install-time, both are idempotent, and neither is touched once the runner is up.
 - **Queue root is one filesystem.** `os.rename` is only atomic within a filesystem; the code must never rename across `$QUEUE_ROOT` and anywhere else.
 - **Jobs never invoke git.** Every git subprocess call lives in `git_ops.py` and is made by the runner's `tick()`, between the poll of one job and the start of the next. A job's own `cmd` running git against a checkout it does not own is out of the runner's control, but nothing in this package may do it.
 - **The lock file format is a pinned protocol**, not an implementation detail: lock path `$GPU_CLAIM_DIR/<normalized-uuid>.lock`, claim JSON alongside it with the keys `pid`, `owner`, `cmd`, `started_at`, `key`. A second implementation on the same box must interoperate, so changing any of these is a version bump documented in `docs/design.md`, not a refactor.
@@ -52,6 +52,7 @@ src/gpuqueue/cli_claim.py       `gpu-claim` entry point
 src/gpuqueue/cli_gpuq.py        `gpuq` entry point
 src/gpuqueue/cli_runner.py      `gpuq-runner` entry point
 supervisor/gpuq-runner.conf     supervisor program file, shipped not hand-written
+skills/gpu-jobs/SKILL.md        how an agent submits work instead of running it
 bootstrap.sh                    bare box -> running runner, idempotent
 tests/…                         one test module per source module
 ```
@@ -3390,6 +3391,328 @@ git commit -m "feat: idempotent bootstrap and shipped supervisor program file"
 
 ---
 
+### Task 14: `gpuq wait` and the agent-facing skill
+
+The consumers here are agents, and an agent has two needs that look like two features but are one: sometimes it wants the result now, and sometimes it wants to submit six jobs and come back. Both are `wait`.
+
+**Files:**
+- Create: `skills/gpu-jobs/SKILL.md`
+- Modify: `src/gpuqueue/cli_gpuq.py` (add `wait`, add `--wait` to `submit`), `bootstrap.sh` (install the skill), `tests/test_cli_gpuq.py`
+
+**Interfaces:**
+- Produces: subcommand `gpuq wait <id> [--timeout S] [--poll S]` and flag `gpuq submit --wait`. Helper `wait_for(q: QueueRoot, job_id: str, timeout: float | None, poll: float) -> int`.
+- Exit codes: `0` the job is done, `1` it failed, `2` no such job, `124` the wait timed out (as `timeout(1)`).
+
+Three decisions, all of which an implementer would otherwise have to guess at:
+
+**Waiting on an already-finished job returns immediately.** This is what makes submit-and-wait and submit-and-go-away the same primitive rather than two features. An agent never has to decide up front which mode it is in; calling `wait` late costs nothing, so "submit, do other work, wait whenever" needs no new machinery.
+
+**`--timeout` is the waiter's patience, not the job's.** It does not cancel, kill or otherwise touch the job — the job's own wall-clock limit is `timeout_s` in its spec, enforced by the runner. A timed-out wait is a thing the caller may simply do again. Say this in the help text; it is easy to get backwards.
+
+**A job that briefly cannot be found is not a missing job.** `find()` scans the state directories in order, and the reaper's requeue moves a job *backwards* from `running/` to `pending/`. A scan that passes `pending` before the move and reads `running` after it sees the job in neither. So: a `None` on the *first* lookup means no such job and exits 2; a `None` after that is a transient the loop rides out. Without this, a requeue makes a waiting agent believe its job vanished.
+
+`wait` polls the queue tree directly. It needs no daemon and no IPC, which is the same property that lets `gpuq list` work when everything else is broken.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_cli_gpuq.py`:
+
+```python
+import threading
+import time
+from gpuqueue.queue import QueueRoot
+from gpuqueue.spec import JobSpec
+
+def _submit(root, job_id="j1"):
+    main(["submit", "--project", "p", "--commit", "abc", "--branch", "main",
+          "--id", job_id, "--", "true"])
+
+def test_wait_returns_zero_for_an_already_finished_job(root, capsys):
+    _submit(root)
+    q = QueueRoot(root)
+    q.finish(q.claim("j1"), ok=True)
+    capsys.readouterr()
+    start = time.monotonic()
+    assert main(["wait", "j1"]) == 0
+    assert time.monotonic() - start < 1.0  # immediate, not one poll interval
+
+def test_wait_returns_one_for_a_failed_job(root):
+    _submit(root)
+    q = QueueRoot(root)
+    spec = q.claim("j1")
+    spec.error = "boom"
+    q.finish(spec, ok=False)
+    assert main(["wait", "j1"]) == 1
+
+def test_wait_blocks_until_the_job_finishes(root):
+    _submit(root)
+    q = QueueRoot(root)
+    q.claim("j1")
+
+    def finish_soon():
+        time.sleep(0.3)
+        state, spec = q.find("j1")
+        q.finish(spec, ok=True)
+
+    t = threading.Thread(target=finish_soon)
+    t.start()
+    assert main(["wait", "j1", "--poll", "0.05"]) == 0
+    t.join()
+
+def test_wait_timeout_exits_124_and_leaves_the_job_alone(root):
+    _submit(root)
+    QueueRoot(root).claim("j1")
+    assert main(["wait", "j1", "--timeout", "0.2", "--poll", "0.05"]) == 124
+    assert (root / "running" / "j1.json").exists()  # not cancelled
+
+def test_wait_unknown_job_exits_2(root):
+    assert main(["wait", "nope", "--timeout", "0.2"]) == 2
+
+def test_wait_rides_out_a_requeue(root):
+    """The reaper moves a job running -> pending. A scan that passes pending
+    before the move and reads running after it sees neither; that is a
+    transient, not a missing job."""
+    _submit(root)
+    q = QueueRoot(root)
+    spec = q.claim("j1")
+
+    def requeue_then_finish():
+        time.sleep(0.2)
+        q.requeue(spec)
+        time.sleep(0.2)
+        again = q.claim("j1")
+        q.finish(again, ok=True)
+
+    t = threading.Thread(target=requeue_then_finish)
+    t.start()
+    assert main(["wait", "j1", "--poll", "0.05"]) == 0
+    t.join()
+
+def test_submit_wait_does_both(root, capsys):
+    q = QueueRoot(root)
+    q.ensure_dirs()
+
+    def finish_soon():
+        time.sleep(0.3)
+        found = q.find("j1")
+        while found is None or found[0] == "pending":
+            if found and found[0] == "pending":
+                q.claim("j1")
+            time.sleep(0.05)
+            found = q.find("j1")
+        q.finish(found[1], ok=True)
+
+    t = threading.Thread(target=finish_soon)
+    t.start()
+    rc = main(["submit", "--project", "p", "--commit", "abc", "--branch", "main",
+               "--id", "j1", "--wait", "--poll", "0.05", "--", "true"])
+    t.join()
+    assert rc == 0
+```
+
+These tests use threads to drive the queue from the outside — that is a test harness standing in for the runner, and does not contradict the runner itself being single-threaded.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `pytest tests/test_cli_gpuq.py -v`
+Expected: FAIL — `argument command: invalid choice: 'wait'`
+
+- [ ] **Step 3: Implement**
+
+In `src/gpuqueue/cli_gpuq.py`, add `import time`, then:
+
+```python
+WAIT_TIMED_OUT = 124  # as timeout(1), so a shell can tell the cases apart
+
+
+def wait_for(q: QueueRoot, job_id: str, timeout: float | None,
+             poll: float) -> int:
+    """Block until the job is done or failed. Returns the exit code.
+
+    Returns immediately for a job that has already finished — which is what
+    lets a caller submit, go and do something else, and wait whenever it
+    suits. Waiting late costs nothing.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    seen = False
+    while True:
+        found = q.find(job_id)
+        if found is None:
+            if not seen:
+                print(f"gpuq: no such job: {job_id}", file=sys.stderr)
+                return 2
+            # Seen before, missing now: the reaper is moving it between
+            # directories. Not a missing job.
+        else:
+            seen = True
+            state, spec = found
+            if state in ("done", "failed"):
+                if state == "done":
+                    print(f"done {job_id}")
+                    return 0
+                print(f"failed {job_id}: {spec.error or 'no error recorded'}",
+                      file=sys.stderr)
+                return 1
+        if deadline is not None and time.monotonic() >= deadline:
+            state = found[0] if found else "unknown"
+            print(f"gpuq: {job_id} still {state} after {timeout}s; "
+                  "the job is untouched, wait again when you like",
+                  file=sys.stderr)
+            return WAIT_TIMED_OUT
+        time.sleep(poll)
+
+
+def _cmd_wait(args) -> int:
+    return wait_for(_queue(args), args.id, args.timeout, args.poll)
+```
+
+Extend `_cmd_submit` so that, after it prints the id:
+
+```python
+    print(job_id)
+    if getattr(args, "wait", False):
+        return wait_for(q, job_id, args.timeout, args.poll)
+    return 0
+```
+
+And in `build_parser`, add the flags to `submit` and the new subcommand:
+
+```python
+    s.add_argument("--wait", action="store_true",
+                   help="block until the job finishes, then exit with its result")
+    s.add_argument("--timeout", type=float, default=None,
+                   help="how long to wait, not how long the job may run")
+    s.add_argument("--poll", type=float, default=2.0)
+
+    w = sub.add_parser("wait", help="block until a job finishes")
+    w.add_argument("id")
+    w.add_argument("--timeout", type=float, default=None,
+                   help="how long YOU wait. The job is never cancelled by "
+                        "this; its own limit is timeout_s in the spec.")
+    w.add_argument("--poll", type=float, default=2.0)
+    w.set_defaults(func=_cmd_wait)
+```
+
+- [ ] **Step 4: Run the tests**
+
+Run: `pytest tests/test_cli_gpuq.py -v`
+Expected: 20 passed
+
+- [ ] **Step 5: Write the skill**
+
+Create `skills/gpu-jobs/SKILL.md`:
+
+```markdown
+---
+name: gpu-jobs
+description: Use when running training, evaluation or any GPU work on this box, and when a long CPU job would otherwise block you - submit it to the queue instead of running it directly, then either wait for it or go do something else.
+---
+
+# Running work on a shared GPU box
+
+This box has one GPU and several people or agents who want it. Running a
+training script directly will either fail on an OOM half an hour in, or make
+someone else's run mysteriously slow. Submit it instead.
+
+## Submit
+
+    gpuq submit --project <name> --commit "$(git rev-parse HEAD)" \
+      --branch "$(git rev-parse --abbrev-ref HEAD)" \
+      --lane gpu --artifact runs/glove/v0/summary.json \
+      -- python -m src.train.train_wgan_gp --config configs/glove/v0.yaml
+
+It prints a job id and returns at once. Then choose:
+
+**You need the result now:**
+
+    id=$(gpuq submit … )
+    gpuq wait "$id"        # 0 done, 1 failed, 124 you gave up waiting
+
+**You have other work to do:** do it, then come back and `gpuq wait "$id"`
+whenever you like. If the job already finished, `wait` returns immediately —
+there is no penalty for waiting late, and no need to decide up front.
+
+Six datasets to process? Submit all six, then wait on them one at a time.
+The runner will already have been working through them.
+
+## Which lane
+
+- `--lane gpu` — training, anything that calls CUDA. One at a time, box-wide.
+- `--lane cpu` — data fetching, profiling, analysis. Several at once.
+
+Putting CPU work in the GPU lane blocks everyone else's training for no
+reason. Putting GPU work in the CPU lane means several jobs hit the card at
+once, which is the failure this queue exists to prevent.
+
+## Always pin the commit
+
+`--commit "$(git rev-parse HEAD)"` is not optional. The runner checks out
+that exact tree, so a number it reports can be traced to a configuration
+someone can read back. A branch name alone lets the tree move under a
+queued job and produce a result nobody can reproduce.
+
+Declare what you want kept with `--artifact` (repeatable, paths relative to
+the repo root). The runner collects those and can commit them; anything
+else your job writes dies with the box.
+
+## When something goes wrong
+
+    gpuq list                  # everything, by state
+    gpuq show <id>             # the spec, plus paths to its stdout/stderr logs
+    gpuq cancel <id>           # only while still pending
+
+A failed job carries its stderr tail in `error`, so `gpuq show` usually
+tells you what happened without opening the logs.
+
+A job that fails on CUDA out-of-memory is reported as such and is never
+retried: it is a configuration problem, not a transient. Make the model or
+the batch smaller.
+
+## Do not
+
+- Run GPU work directly. `gpu-claim -- <cmd>` if you truly must run
+  something interactively; it takes the same lock the queue does.
+- Run git in a checkout the runner owns. It manages those, and a concurrent
+  checkout corrupts the tree under a running job.
+```
+
+- [ ] **Step 6: Install it from bootstrap**
+
+In `bootstrap.sh`, after the supervisor section, add:
+
+```bash
+# 6. agent skill, so anything working on this box knows to queue its work
+GPUQ_SKILLS_DIR="${GPUQ_SKILLS_DIR:-$HOME/.claude/skills}"
+run mkdir -p "$GPUQ_SKILLS_DIR/gpu-jobs"
+if [ "$DRY_RUN" -eq 1 ]; then
+  say "would: install skill to $GPUQ_SKILLS_DIR/gpu-jobs/SKILL.md"
+else
+  cp "$REPO_DIR/skills/gpu-jobs/SKILL.md" "$GPUQ_SKILLS_DIR/gpu-jobs/SKILL.md"
+  say "skill installed: $GPUQ_SKILLS_DIR/gpu-jobs/SKILL.md"
+fi
+```
+
+Copied, not symlinked: the skill must survive the repo checkout moving, and
+an agent reading a dangling symlink gets nothing with no explanation.
+
+- [ ] **Step 7: Verify end to end**
+
+```bash
+gpuq submit --project wgan-synthetic --commit "$(git rev-parse HEAD)" \
+  --branch main --lane cpu --wait --poll 1 -- sh -c 'sleep 3; echo ok'
+echo "exit: $?"
+```
+Expected: prints the id, blocks about three seconds, prints `done <id>`, exits 0.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/gpuqueue/cli_gpuq.py tests/test_cli_gpuq.py skills/gpu-jobs/SKILL.md bootstrap.sh
+git commit -m "feat: gpuq wait, and a skill telling agents to queue their work"
+```
+
+---
+
 ## Self-review against the spec
 
 **Spec coverage:**
@@ -3408,6 +3731,7 @@ git commit -m "feat: idempotent bootstrap and shipped supervisor program file"
 | Preflight refuses on foreign processes | 6, 7 (`gpu-claim`), 12 (queued GPU jobs, in `_take_card`) |
 | Failure table (non-zero, runner death, timeout, OOM, duplicate) | 2, 10, 11, 12 |
 | Bootstrap, shipped supervisor config, one host variable | 13 |
+| Consumers may be agents, not people (design "Constraints") | 14 — `gpuq wait` plus a skill; both submit-and-wait and submit-and-go-away fall out of one primitive |
 | Not in scope (multi-GPU, multi-host, durable storage, auth) | no tasks, correctly |
 
 **Deliberately deferred:** per-job VRAM/memory limits, per the 2026-08-05 decision recorded in Global Constraints.
