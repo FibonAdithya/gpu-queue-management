@@ -78,11 +78,21 @@ class Runner:
         die and be restarted by supervisor, exactly as before. Reporting is
         additive, and a filer that changed crash semantics would be a second
         bug shipped alongside the first.
+
+        Some phases nest: `_take_card` already reports and re-raises a
+        preflight exception before it reaches `admit`, which is itself
+        wrapped in `_phase("admit", ...)`. Without the tag check below that
+        same exception would be filed a second time here, under a different
+        phase string -- and because `signature()` hashes phase into the
+        payload, that is a second, undeduped issue for one crash. The
+        `__gpuq_reported__` tag set by `_report_bug` is how the inner,
+        more specific site keeps the outer one from re-filing.
         """
         try:
             fn()
         except Exception as e:
-            self._report_bug(e, phase)
+            if not getattr(e, "__gpuq_reported__", False):
+                self._report_bug(e, phase)
             raise
 
     def _report_bug(self, exc: BaseException, phase: str,
@@ -93,7 +103,26 @@ class Runner:
         token or no network must run jobs exactly as it does without
         autofix; losing a bug report is an acceptable outcome, losing a job
         is not.
+
+        On a real gpuq fault, `file_bug` makes at least two `gh` calls
+        before its throttle applies, each with its own subprocess timeout of
+        up to 30s -- and this all happens on the single thread that also
+        polls every running job, so a network-partitioned box can stall
+        polling for roughly a minute per occurrence. The common cases are
+        free of that cost: `CallerError` and errno-classified `StartFailed`
+        are classified and returned before any `gh` subprocess runs.
         """
+        # Tag first, and regardless of what filing does below: the tag means
+        # "this exception already had its one chance to be reported", not
+        # "filing succeeded". A caller further up the stack (see `_phase`)
+        # must not re-file it just because this attempt failed or was a
+        # no-op. Guarded because an exception type with __slots__ would
+        # otherwise turn a cosmetic dedup problem into a crash inside the
+        # one function that must never raise.
+        try:
+            exc.__gpuq_reported__ = True
+        except Exception:
+            pass
         if not self.cfg.autofix.enabled:
             return
         try:
@@ -229,9 +258,13 @@ class Runner:
         try:
             workdir = self._prepare_workdir(spec, project)  # git, on the loop
         except Exception as e:
-            self._report_bug(e, "checkout", spec)
+            # Card release first: one job's problem must never strand
+            # another job's hold on the card, and `_report_bug` never
+            # raises but that is not a property this cleanup should have to
+            # depend on to be unconditional.
             self._exit_claim(claim_cm)
             self._fail_running(spec, f"checkout failed: {e}")
+            self._report_bug(e, "checkout", spec)
             return False
         out_log, err_log = self.queue.log_paths(spec.id)
         try:
@@ -240,10 +273,10 @@ class Runner:
                 extra_env={"GPUQ_JOB_ID": spec.id,
                            "GPUQ_QUEUE_ROOT": str(self.queue.root)})
         except StartFailed as e:
-            self._report_bug(e, "execute", spec)
             self._exit_claim(claim_cm)
             self._remove_worktree_at(project, workdir)
             self._fail_running(spec, str(e))
+            self._report_bug(e, "execute", spec)
             return False
 
         spec.pid = running.pid

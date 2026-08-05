@@ -327,6 +327,24 @@ def test_a_reap_failure_files_a_bug_and_still_crashes_the_tick(env, filed,
     assert [c["phase"] for c in filed] == ["reap"]
 
 
+def test_a_preflight_failure_files_only_the_inner_phase(env, filed,
+                                                        monkeypatch):
+    """`_take_card` already reports and re-raises a preflight exception
+    before it reaches `admit`, which `tick` also wraps in `_phase`. Without
+    the reported-tag, the same exception would be filed again there under a
+    different phase string -- two issues, one crash. The inner, more
+    specific site must win; the outer one must see it is already done."""
+    r, sha = env
+    _enable(r)
+    monkeypatch.setattr(rn, "preflight",
+                        lambda: (_ for _ in ()).throw(
+                            RuntimeError("preflight exploded")))
+    submit(r, sha, "j1", ["true"], lane="gpu")
+    with pytest.raises(RuntimeError, match="preflight exploded"):
+        r.tick()
+    assert [c["phase"] for c in filed] == ["preflight"]
+
+
 def test_a_missing_artifact_reaches_the_filer_as_caller_error(env, filed):
     """Caller fault. file_bug is still called -- it owns the decision, and
     the runner must not pre-judge -- but it is handed a CallerError, which
