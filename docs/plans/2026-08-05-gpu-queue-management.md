@@ -3181,6 +3181,14 @@ git commit -m "feat: single-threaded runner loop with lane admission and seriali
 
 The default claim dir here is `$GPUQ_PREFIX/lock/gpu`, not `/var/lock/gpu`: the target is an unprivileged container that may not be able to write under `/var`. `bootstrap.sh` exports `GPU_CLAIM_DIR` into the supervisor environment so every participant on the box derives the same path — a lock is only correct if everyone uses one.
 
+Three things this task got wrong on first contact with a real box, all fixed above:
+
+- **`$PYTHON`, not `python3`.** A box with several interpreters must not have this guessed for it — the runner has to be installed into the one that is 3.11+, which is not always the one called `python3`. The version check names the interpreter it rejected and says how to override it.
+- **The checkout step shelled out to bare `python`.** That binary does not exist on most modern distributions; only `python3` does. Under `set -e` it aborted the run before the supervisor program file was installed.
+- **A failed clone must not be fatal.** The first run writes a config full of example placeholders and tells you to edit it, so a clone failure there is the *expected* case. Aborting on it meant a first run never installed the supervisor program file at all. It now reports per project and continues.
+
+The bootstrap test picks a 3.11+ interpreter that has `pip`, preferring the repo venv, and **skips** the checks that actually run `bootstrap.sh` when the box has none — printing `SKIP`, rather than reporting a pass it did not earn.
+
 - [ ] **Step 1: Write the failing test**
 
 ```bash
@@ -3194,6 +3202,19 @@ check() { if eval "$2"; then echo "ok   - $1"; else echo "FAIL - $1"; fails=$((f
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# The checks that actually run bootstrap need a 3.11+ interpreter with pip.
+# Prefer the repo venv, then any newer python on PATH. If there is none,
+# skip those checks loudly rather than reporting a pass we did not earn.
+PYTHON=""
+for cand in "$repo/.venv/bin/python" python3.13 python3.12 python3.11 python3; do
+  if command -v "$cand" >/dev/null 2>&1 &&
+     "$cand" -c 'import sys;sys.exit(0 if sys.version_info>=(3,11) else 1)' 2>/dev/null &&
+     "$cand" -c 'import pip' 2>/dev/null; then
+    PYTHON="$cand"; break
+  fi
+done
+export PYTHON
+
 check "bootstrap.sh is executable" "[ -x '$repo/bootstrap.sh' ]"
 check "supervisor conf is shipped" "[ -f '$repo/supervisor/gpuq-runner.conf' ]"
 check "shellcheck-clean (skipped if absent)" \
@@ -3205,6 +3226,12 @@ check "supervisor conf autorestarts" \
   "grep -q 'autorestart=true' '$repo/supervisor/gpuq-runner.conf'"
 check "supervisor conf passes GPU_CLAIM_DIR" \
   "grep -q 'GPU_CLAIM_DIR' '$repo/supervisor/gpuq-runner.conf'"
+
+if [ -z "$PYTHON" ]; then
+  echo "SKIP - bootstrap install checks: no Python 3.11+ with pip on this box"
+  echo "---"; [ "$fails" -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }
+  exit 0
+fi
 
 out="$(GPUQ_PREFIX="$tmp/ws" SUPERVISOR_CONF_DIR="$tmp/conf" \
        bash "$repo/bootstrap.sh" --dry-run --no-supervisor 2>&1)"
@@ -3253,6 +3280,10 @@ QUEUE_ROOT="${QUEUE_ROOT:-$GPUQ_PREFIX/queue}"
 GPU_CLAIM_DIR="${GPU_CLAIM_DIR:-$GPUQ_PREFIX/lock/gpu}"
 GPUQ_CONFIG="${GPUQ_CONFIG:-$GPUQ_PREFIX/gpuq.toml}"
 SUPERVISOR_CONF_DIR="${SUPERVISOR_CONF_DIR:-/etc/supervisor/conf.d}"
+# Which interpreter the runner is installed into. A box with several
+# Pythons must not have this guessed for it: the runner has to live in
+# the one that is 3.11+, which is not always the one called python3.
+PYTHON="${PYTHON:-python3}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DRY_RUN=0
@@ -3274,19 +3305,21 @@ say "prefix:      $GPUQ_PREFIX"
 say "queue root:  $QUEUE_ROOT"
 say "claim dir:   $GPU_CLAIM_DIR"
 say "config:      $GPUQ_CONFIG"
+say "python:      $PYTHON"
 
 # 1. install the package
 # Check the interpreter first: pip's requires-python failure names a version
 # but not what to do about it, and this runs on boxes nobody built by hand.
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || {
-  say "bootstrap: need Python 3.11+ (tomllib); found $(python3 -V 2>&1)"
+"$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || {
+  say "bootstrap: need Python 3.11+ (tomllib); $PYTHON is $("$PYTHON" -V 2>&1)"
+  say "           set PYTHON=/path/to/python3.11 if the box has another one"
   exit 1
 }
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  say "would: pip install -e $REPO_DIR"
+  say "would: $PYTHON -m pip install -e $REPO_DIR"
 else
-  pip install --quiet -e "$REPO_DIR"
+  "$PYTHON" -m pip install --quiet -e "$REPO_DIR"
 fi
 
 # 2. state directories
@@ -3307,16 +3340,27 @@ else
 fi
 
 # 4. clone declared checkouts
+#
+# Never fatal. The first run writes a config full of example placeholders and
+# tells you to edit it, so a failed clone here is the expected case, not an
+# error -- and aborting would stop the supervisor program file from being
+# installed at all. Report per project and carry on; the runner fails jobs
+# for an unclonable project with a legible message of its own.
 if [ "$DRY_RUN" -eq 0 ] && [ -f "$GPUQ_CONFIG" ]; then
-  GPUQ_CONFIG="$GPUQ_CONFIG" python - <<'PY'
+  GPUQ_CONFIG="$GPUQ_CONFIG" "$PYTHON" - <<'PYEOF' || say "checkout step reported problems; continuing"
 import os
+import sys
 from pathlib import Path
 from gpuqueue.config import load_config
 from gpuqueue.git_ops import ensure_checkout
+
 cfg = load_config(Path(os.environ["GPUQ_CONFIG"]))
 for name, project in cfg.projects.items():
-    print(f"checkout {name}: {ensure_checkout(project)}")
-PY
+    try:
+        print(f"checkout {name}: {ensure_checkout(project)}", file=sys.stderr)
+    except Exception as e:
+        print(f"checkout {name}: SKIPPED -- {e}", file=sys.stderr)
+PYEOF
 fi
 
 # 5. supervisor program file, shipped rather than hand-written
