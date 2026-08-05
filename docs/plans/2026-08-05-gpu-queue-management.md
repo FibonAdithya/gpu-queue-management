@@ -3200,6 +3200,7 @@ Three things this task got wrong on first contact with a real box, all fixed abo
 
 - **`$PYTHON`, not `python3`.** A box with several interpreters must not have this guessed for it — the runner has to be installed into the one that is 3.11+, which is not always the one called `python3`. The version check names the interpreter it rejected and says how to override it.
 - **The checkout step shelled out to bare `python`.** That binary does not exist on most modern distributions; only `python3` does. Under `set -e` it aborted the run before the supervisor program file was installed.
+- **The supervisor command must be an absolute interpreter.** `command=gpuq-runner` assumes supervisord's PATH contains the install location; it does not when the package lives in a venv, and the only symptom is `ERROR (no such file)`. It is now `@PYTHON@ -m gpuqueue.cli_runner`, substituted at install time — which is also why every CLI module needs its `__main__` guard.
 - **A failed clone must not be fatal.** The first run writes a config full of example placeholders and tells you to edit it, so a clone failure there is the *expected* case. Aborting on it meant a first run never installed the supervisor program file at all. It now reports per project and continues.
 
 The bootstrap test picks a 3.11+ interpreter that has `pip`, preferring the repo venv, and **skips** the checks that actually run `bootstrap.sh` when the box has none — printing `SKIP`, rather than reporting a pass it did not earn.
@@ -3235,8 +3236,8 @@ check "supervisor conf is shipped" "[ -f '$repo/supervisor/gpuq-runner.conf' ]"
 check "shellcheck-clean (skipped if absent)" \
   "! command -v shellcheck >/dev/null || shellcheck '$repo/bootstrap.sh'"
 check "sets -euo pipefail" "grep -q 'set -euo pipefail' '$repo/bootstrap.sh'"
-check "supervisor conf runs gpuq-runner" \
-  "grep -q 'command=.*gpuq-runner' '$repo/supervisor/gpuq-runner.conf'"
+check "supervisor conf runs the runner" \
+  "grep -q 'command=.*gpuqueue.cli_runner' '$repo/supervisor/gpuq-runner.conf'"
 check "supervisor conf autorestarts" \
   "grep -q 'autorestart=true' '$repo/supervisor/gpuq-runner.conf'"
 check "supervisor conf passes GPU_CLAIM_DIR" \
@@ -3271,6 +3272,12 @@ GPUQ_PREFIX="$tmp/ws" SUPERVISOR_CONF_DIR="$tmp/conf" \
   bash "$repo/bootstrap.sh" >/dev/null 2>&1
 check "installs the supervisor program file" \
   "[ -f '$tmp/conf/gpuq-runner.conf' ]"
+# supervisord runs with its own PATH, which will not contain a venv's bin
+# directory. A bare console-script name there fails with "ERROR (no such file)".
+check "supervisor command uses an absolute interpreter, not a bare name" \
+  "grep -qE '^command=/.* -m gpuqueue.cli_runner' '$tmp/conf/gpuq-runner.conf'"
+check "no placeholders left unsubstituted" \
+  "! grep -q '@[A-Z_]*@' '$tmp/conf/gpuq-runner.conf'"
 
 echo "---"; [ "$fails" -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }
 ```
@@ -3378,13 +3385,26 @@ for name, project in cfg.projects.items():
 PYEOF
 fi
 
+# 6. agent skill, so anything working on this box knows to queue its work
+GPUQ_SKILLS_DIR="${GPUQ_SKILLS_DIR:-$HOME/.claude/skills}"
+run mkdir -p "$GPUQ_SKILLS_DIR/gpu-jobs"
+if [ "$DRY_RUN" -eq 1 ]; then
+  say "would: install skill to $GPUQ_SKILLS_DIR/gpu-jobs/SKILL.md"
+else
+  # Copied, not symlinked: the skill must survive the repo checkout moving,
+  # and an agent reading a dangling symlink gets nothing and no explanation.
+  cp "$REPO_DIR/skills/gpu-jobs/SKILL.md" "$GPUQ_SKILLS_DIR/gpu-jobs/SKILL.md"
+  say "skill installed: $GPUQ_SKILLS_DIR/gpu-jobs/SKILL.md"
+fi
+
 # 5. supervisor program file, shipped rather than hand-written
 if [ "$USE_SUPERVISOR" -eq 1 ]; then
   run mkdir -p "$SUPERVISOR_CONF_DIR"
   if [ "$DRY_RUN" -eq 1 ]; then
     say "would: install $SUPERVISOR_CONF_DIR/gpuq-runner.conf"
   else
-    sed -e "s|@QUEUE_ROOT@|$QUEUE_ROOT|g" \
+    sed -e "s|@PYTHON@|$(command -v "$PYTHON" || echo "$PYTHON")|g" \
+        -e "s|@QUEUE_ROOT@|$QUEUE_ROOT|g" \
         -e "s|@GPU_CLAIM_DIR@|$GPU_CLAIM_DIR|g" \
         -e "s|@GPUQ_CONFIG@|$GPUQ_CONFIG|g" \
         -e "s|@GPUQ_PREFIX@|$GPUQ_PREFIX|g" \
@@ -3408,7 +3428,10 @@ say "bootstrap complete"
 ; Placeholders are substituted at install time; that is what makes a
 ; rebuilt box identical rather than similar.
 [program:gpuq-runner]
-command=gpuq-runner --config @GPUQ_CONFIG@
+; Absolute interpreter, not a bare console-script name: supervisord runs
+; with its own PATH, which will not include a venv's bin directory. A
+; bare 'gpuq-runner' here fails with a bare 'ERROR (no such file)'.
+command=@PYTHON@ -m gpuqueue.cli_runner --config @GPUQ_CONFIG@
 directory=@GPUQ_PREFIX@
 autostart=true
 autorestart=true

@@ -111,7 +111,8 @@ if [ "$USE_SUPERVISOR" -eq 1 ]; then
   if [ "$DRY_RUN" -eq 1 ]; then
     say "would: install $SUPERVISOR_CONF_DIR/gpuq-runner.conf"
   else
-    sed -e "s|@QUEUE_ROOT@|$QUEUE_ROOT|g" \
+    sed -e "s|@PYTHON@|$(command -v "$PYTHON" || echo "$PYTHON")|g" \
+        -e "s|@QUEUE_ROOT@|$QUEUE_ROOT|g" \
         -e "s|@GPU_CLAIM_DIR@|$GPU_CLAIM_DIR|g" \
         -e "s|@GPUQ_CONFIG@|$GPUQ_CONFIG|g" \
         -e "s|@GPUQ_PREFIX@|$GPUQ_PREFIX|g" \

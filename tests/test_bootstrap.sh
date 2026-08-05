@@ -26,8 +26,8 @@ check "supervisor conf is shipped" "[ -f '$repo/supervisor/gpuq-runner.conf' ]"
 check "shellcheck-clean (skipped if absent)" \
   "! command -v shellcheck >/dev/null || shellcheck '$repo/bootstrap.sh'"
 check "sets -euo pipefail" "grep -q 'set -euo pipefail' '$repo/bootstrap.sh'"
-check "supervisor conf runs gpuq-runner" \
-  "grep -q 'command=.*gpuq-runner' '$repo/supervisor/gpuq-runner.conf'"
+check "supervisor conf runs the runner" \
+  "grep -q 'command=.*gpuqueue.cli_runner' '$repo/supervisor/gpuq-runner.conf'"
 check "supervisor conf autorestarts" \
   "grep -q 'autorestart=true' '$repo/supervisor/gpuq-runner.conf'"
 check "supervisor conf passes GPU_CLAIM_DIR" \
@@ -62,5 +62,11 @@ GPUQ_PREFIX="$tmp/ws" SUPERVISOR_CONF_DIR="$tmp/conf" \
   bash "$repo/bootstrap.sh" >/dev/null 2>&1
 check "installs the supervisor program file" \
   "[ -f '$tmp/conf/gpuq-runner.conf' ]"
+# supervisord runs with its own PATH, which will not contain a venv's bin
+# directory. A bare console-script name there fails with "ERROR (no such file)".
+check "supervisor command uses an absolute interpreter, not a bare name" \
+  "grep -qE '^command=/.* -m gpuqueue.cli_runner' '$tmp/conf/gpuq-runner.conf'"
+check "no placeholders left unsubstituted" \
+  "! grep -q '@[A-Z_]*@' '$tmp/conf/gpuq-runner.conf'"
 
 echo "---"; [ "$fails" -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }
