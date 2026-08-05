@@ -32,8 +32,9 @@ same box should get scheduling without reimplementing it.
 
 ## Status
 
-Implemented. Install with `bootstrap.sh`; see `docs/design.md` for the
-architecture and `docs/plans/` for the implementation plan.
+Implemented. To put it on your own GPU box, follow `docs/deploying.md` — it
+assumes nothing about the host beyond an ssh alias. See `docs/design.md` for
+the architecture and `docs/plans/` for the implementation plan.
 
 Needs Python 3.11+ (stdlib `tomllib`). If the box's `python3` is older,
 point `bootstrap.sh` at the right one with `PYTHON=/path/to/python3.11`.

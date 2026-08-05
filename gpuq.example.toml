@@ -1,3 +1,6 @@
+# Copied to $GPUQ_CONFIG by bootstrap.sh on first run, then never overwritten.
+# Edit it in place and rerun bootstrap.sh to clone your projects.
+
 [queue]
 root = "/workspace/queue"
 # 4, not the core count: typical CPU jobs here are BLAS-bound and already
@@ -5,9 +8,17 @@ root = "/workspace/queue"
 cpu_slots = 4
 poll_interval_s = 2.0
 kill_orphan_cuda = true
+# Every participant on the box must agree on this path, or two tools hold
+# two different locks for the same card.
+claim_dir = "/workspace/lock/gpu"
 
-[project.wgan-synthetic]
-remote   = "git@github.com:Daniel-T-S-Adams/wgan-synthetic.git"
-checkout = "/workspace/checkouts/wgan-synthetic"
-venv     = "/workspace/checkouts/wgan-synthetic/.venv"
+# One block per project the runner serves. Delete this example and add yours.
+# Until you do, bootstrap.sh will report that it cannot clone it — expected,
+# and not fatal.
+[project.example]
+remote   = "git@github.com:you/your-project.git"
+checkout = "/workspace/checkouts/your-project"
+# Put the environment holding torch here. It goes on the job's PATH, which is
+# also what makes `-- python train.py` work on images that ship only python3.
+venv     = "/venv/main"
 commit_artifacts = true
