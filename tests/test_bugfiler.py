@@ -178,3 +178,163 @@ def test_the_state_file_is_created_with_its_parents(tmp_path, cfg):
 def test_a_cap_of_zero_never_dispatches(cfg):
     cfg.max_dispatches_per_day = 0
     assert bugfiler.may_dispatch(cfg, NOW) is False
+
+
+from gpuqueue.bugreport import CallerError
+from gpuqueue.git_ops import GitError
+from gpuqueue.spec import JobSpec
+
+
+def _boom(exc=None):
+    try:
+        raise exc or GitError("git worktree add failed (128): fatal")
+    except Exception as e:
+        return e
+
+
+def _spec():
+    return JobSpec(id="j1", lane="gpu", project="p", commit="deadbeef",
+                   branch="main", cmd=["python", "train.py"])
+
+
+def _created(gh):
+    """The body handed to `gh issue create`, or None."""
+    for args, stdin in gh.calls:
+        if args[:2] == ["issue", "create"]:
+            return args, stdin
+    return None, None
+
+
+def test_a_disabled_config_does_nothing(gh, cfg):
+    cfg.enabled = False
+    assert bugfiler.file_bug(cfg, _boom(), "checkout") == "disabled"
+    assert gh.calls == []
+
+
+def test_a_caller_fault_never_files(gh, cfg):
+    exc = _boom(CallerError("declared artifact not produced: runs/s.json"))
+    assert bugfiler.file_bug(cfg, exc, "artifacts") == "caller-fault"
+    assert gh.calls == []
+
+
+def test_a_gpuq_fault_files_an_issue(gh, cfg):
+    assert bugfiler.file_bug(cfg, _boom(), "checkout", spec=_spec()) == "filed"
+    args, body = _created(gh)
+    assert args is not None
+    assert "sig: " in body
+    assert "GitError" in body
+
+
+def test_a_filed_issue_carries_the_auto_label(gh, cfg):
+    bugfiler.file_bug(cfg, _boom(), "checkout")
+    args, _ = _created(gh)
+    assert args[args.index("--label") + 1] == bugfiler.AUTO_LABEL
+
+
+def test_a_filed_issue_records_a_dispatch(gh, cfg):
+    bugfiler.file_bug(cfg, _boom(), "checkout", now=NOW)
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 1
+
+
+def test_an_existing_open_issue_is_commented_not_refiled(gh, cfg):
+    sig_body = "sig: {sig}\noccurrences: 1\nfirst seen: x\nlast seen: x"
+
+    exc = _boom()
+    from gpuqueue.bugreport import signature
+    sig = signature(exc, "checkout")
+    gh.replies[("issue", "list")] = json.dumps(
+        [{"number": 7, "body": sig_body.format(sig=sig)}])
+
+    assert bugfiler.file_bug(cfg, exc, "checkout") == "commented-issue"
+    assert _created(gh)[0] is None
+    assert any(a[:2] == ["issue", "comment"] for a, _ in gh.calls)
+
+
+def test_commenting_bumps_the_occurrence_count_in_the_body(gh, cfg):
+    from gpuqueue.bugreport import signature
+    exc = _boom()
+    sig = signature(exc, "checkout")
+    gh.replies[("issue", "list")] = json.dumps(
+        [{"number": 7, "body": f"sig: {sig}\noccurrences: 1\n"
+                               "first seen: a\nlast seen: a"}])
+    bugfiler.file_bug(cfg, exc, "checkout")
+    edits = [stdin for a, stdin in gh.calls if a[:2] == ["issue", "edit"]]
+    assert edits and "occurrences: 2" in edits[0]
+
+
+def test_a_recurrence_does_not_burn_a_dispatch(gh, cfg):
+    from gpuqueue.bugreport import signature
+    exc = _boom()
+    gh.replies[("issue", "list")] = json.dumps(
+        [{"number": 7, "body": f"sig: {signature(exc, 'checkout')}\n"
+                               "occurrences: 1\nfirst seen: a\nlast seen: a"}])
+    bugfiler.file_bug(cfg, exc, "checkout", now=NOW)
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 0
+
+
+def test_an_open_pr_takes_the_comment_instead(gh, cfg):
+    """One fix run per bug, not one per job the bug kills."""
+    from gpuqueue.bugreport import signature
+    exc = _boom()
+    sig = signature(exc, "checkout")
+    gh.replies[("pr", "list")] = json.dumps(
+        [{"number": 12, "body": f"addresses sig: {sig}"}])
+    assert bugfiler.file_bug(cfg, exc, "checkout") == "commented-pr"
+    assert any(a[:2] == ["pr", "comment"] for a, _ in gh.calls)
+
+
+def test_past_the_cap_the_issue_still_files_but_is_labelled_throttled(gh, cfg):
+    for _ in range(3):
+        bugfiler.record_dispatch(cfg, NOW)
+    assert bugfiler.file_bug(cfg, _boom(), "checkout", now=NOW) \
+        == "filed-throttled"
+    args, _ = _created(gh)
+    assert args[args.index("--label") + 1] == bugfiler.THROTTLED_LABEL
+
+
+def test_a_throttled_file_does_not_record_a_dispatch(gh, cfg):
+    for _ in range(3):
+        bugfiler.record_dispatch(cfg, NOW)
+    bugfiler.file_bug(cfg, _boom(), "checkout", now=NOW)
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 3
+
+
+def test_a_previously_fixed_bug_says_the_fix_did_not_hold(gh, cfg,
+                                                          monkeypatch):
+    """The closed lookup answers with the same `issue list` verb as the open
+    one, so this test needs a fake that reads the query, not just the verb."""
+    from gpuqueue.bugreport import signature
+    exc = _boom()
+    sig = signature(exc, "checkout")
+
+    def fake(_cfg, args, stdin=None):
+        gh.calls.append((args, stdin))
+        if args[:2] == ["issue", "list"] and "--state" in args \
+                and args[args.index("--state") + 1] == "closed":
+            return json.dumps([{"number": 3, "body": f"sig: {sig}"}])
+        return "[]"
+
+    monkeypatch.setattr(bugfiler, "_gh", fake)
+    bugfiler.file_bug(cfg, exc, "checkout")
+    _, body = _created(gh)
+    assert "#3" in body and "did not hold" in body
+
+
+def test_an_agent_report_is_labelled_reported_and_carries_the_prose(gh, cfg):
+    gh.replies[("issue", "create")] = \
+        "https://github.com/you/gpuq/issues/42\n"
+    number = bugfiler.file_agent_report(cfg, "gpuq wait hangs", "it hangs")
+    args, body = _created(gh)
+    assert args[args.index("--label") + 1] == bugfiler.REPORTED_LABEL
+    assert "it hangs" in body
+    assert number == 42
+
+
+def test_an_agent_report_carries_no_signature(gh, cfg):
+    """No traceback, so no signature -- and therefore no automatic dedup.
+    The owner closes duplicates when they add `fix-me`."""
+    gh.replies[("issue", "create")] = \
+        "https://github.com/you/gpuq/issues/42\n"
+    bugfiler.file_agent_report(cfg, "t", "b")
+    _, body = _created(gh)
+    assert "sig: " not in body

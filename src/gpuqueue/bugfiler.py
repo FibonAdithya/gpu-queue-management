@@ -14,10 +14,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .bugreport import (build_report, bump_body, is_gpuq_fault, issue_body,
+                        issue_title)
 from .config import AutofixConfig
 
 log = logging.getLogger("gpuqueue.bugfiler")
@@ -155,3 +158,106 @@ def may_dispatch(cfg: AutofixConfig, now: datetime) -> bool:
 def record_dispatch(cfg: AutofixConfig, now: datetime) -> None:
     kept = [s for s in _load_dispatches(cfg) if s > now - _PRUNE_AFTER]
     _save_dispatches(cfg, [*kept, now])
+
+
+_ISSUE_NUMBER = re.compile(r"/issues/(\d+)")
+_labels_ensured = False
+
+
+def ensure_labels(cfg: AutofixConfig) -> None:
+    """`gh issue create --label` fails outright on a label that does not
+    exist, so make them once per process rather than documenting a manual
+    step a rebuilt box will skip."""
+    global _labels_ensured
+    if _labels_ensured:
+        return
+    for name, colour, desc in (
+        (AUTO_LABEL, "B60205", "filed by the gpuq runner from its own traceback"),
+        (REPORTED_LABEL, "FBCA04", "filed by an agent; needs `fix-me` to run"),
+        (THROTTLED_LABEL, "666666", "filed as evidence; deliberately not run"),
+        ("fix-me", "0E8A16", "owner authorises an autofix run"),
+    ):
+        try:
+            _gh(cfg, ["label", "create", name, "--repo", cfg.repo,
+                      "--color", colour, "--description", desc, "--force"])
+        except GhError as e:
+            log.warning("could not ensure label %s: %s", name, e)
+    _labels_ensured = True
+
+
+def _create_issue(cfg: AutofixConfig, title: str, body: str,
+                  label: str) -> int | None:
+    ensure_labels(cfg)
+    out = _gh(cfg, ["issue", "create", "--repo", cfg.repo, "--title", title,
+                    "--label", label, "--body-file", "-"], stdin=body)
+    match = _ISSUE_NUMBER.search(out or "")
+    return int(match.group(1)) if match else None
+
+
+def file_bug(cfg: AutofixConfig, exc: BaseException, phase: str, *,
+             spec=None, queue_counts: dict[str, int] | None = None,
+             now: datetime | None = None) -> str:
+    """File, comment or stay silent. Returns what it did.
+
+    Raises GhError if GitHub is unreachable; the runner's _report_bug is
+    what makes that harmless.
+    """
+    if not cfg.enabled or not cfg.repo:
+        return "disabled"
+    if not is_gpuq_fault(exc):
+        return "caller-fault"
+
+    now = now or datetime.now(timezone.utc)
+    report = build_report(exc, phase, spec=spec, queue_counts=queue_counts,
+                          gpuq_commit=gpuq_commit(),
+                          occurred_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    # 1. an open issue with this signature: record the recurrence, run nothing.
+    existing = find_open_issue(cfg, report.sig)
+    if existing:
+        _gh(cfg, ["issue", "comment", str(existing["number"]),
+                  "--repo", cfg.repo, "--body-file", "-"],
+            stdin=f"Seen again at {report.occurred_at} "
+                  f"(job {report.job['id'] if report.job else 'n/a'}).")
+        bumped = bump_body(existing.get("body") or "", report.occurred_at)
+        if bumped != (existing.get("body") or ""):
+            _gh(cfg, ["issue", "edit", str(existing["number"]),
+                      "--repo", cfg.repo, "--body-file", "-"], stdin=bumped)
+        return "commented-issue"
+
+    # 2. an open PR already addressing it: one run per bug, not per job.
+    pr = find_open_pr(cfg, report.sig)
+    if pr is not None:
+        _gh(cfg, ["pr", "comment", str(pr), "--repo", cfg.repo,
+                  "--body-file", "-"],
+            stdin=f"Still failing on the box at {report.occurred_at} "
+                  f"(sig: {report.sig}).")
+        return "commented-pr"
+
+    body = issue_body(report)
+
+    # 3. fixed before and back again: the previous attempt is the best
+    #    context the next one can have.
+    closed = find_recent_closed(cfg, report.sig)
+    if closed is not None:
+        body += (f"\nPreviously fixed in #{closed}; that fix did not hold.\n")
+
+    throttled = not may_dispatch(cfg, now)
+    label = THROTTLED_LABEL if throttled else AUTO_LABEL
+    _create_issue(cfg, issue_title(report), body, label)
+    if throttled:
+        # Evidence is never lost; budget cannot run away.
+        log.warning("autofix throttled: filed %s with no run", report.sig)
+        return "filed-throttled"
+    record_dispatch(cfg, now)
+    return "filed"
+
+
+def file_agent_report(cfg: AutofixConfig, title: str, body: str) -> int | None:
+    """The `gpuq bug` path. Prose and unreliable blame, so it dispatches
+    nothing until the owner adds `fix-me`."""
+    text = ("Filed by an agent with `gpuq bug`. This is prose, not a "
+            "traceback: the blame in it is a guess and there is no "
+            "signature to deduplicate on. Nothing runs until the owner "
+            "adds `fix-me`.\n\n---\n\n" + body)
+    return _create_issue(cfg, f"[gpuq] {title}", text, REPORTED_LABEL)
