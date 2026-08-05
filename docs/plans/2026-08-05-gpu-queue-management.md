@@ -1806,6 +1806,9 @@ root = "/workspace/queue"
 cpu_slots = 4
 poll_interval_s = 2.0
 kill_orphan_cuda = true
+# How often to sweep for CUDA processes no live job owns. This shells out to
+# nvidia-smi, so it is throttled; the cheap recovery reaps run every poll.
+orphan_cuda_interval_s = 60.0
 # Every participant on the box must agree on this path, or two tools hold
 # two different locks for the same card.
 claim_dir = "/workspace/lock/gpu"
@@ -3856,6 +3859,7 @@ git commit -m "feat: gpuq wait, and a skill telling agents to queue their work"
 
 **Added after the plan, by decision on 2026-08-05:**
 - `JobSpec.runner_pid` and the `orphaned` flag on `gpuq list`/`show`. A job outlives a runner that dies abruptly; nothing then supervises it. Surfaced rather than acted on, because the design's stance is that the operator sees the queue and repairs it. Detection is by ownership — a live job whose recorded runner is dead — not by parent pid, since reparenting lands on the nearest subreaper rather than reliably on init.
+- Reaping every poll, with the orphaned-CUDA sweep throttled to `orphan_cuda_interval_s`. Gating the reaper on job completions meant an idle runner never reaped — found on real hardware, and it contradicted the design's own rationale for putting the reaper in the runner at all. `clean_partials` now skips live jobs' worktrees, which tick-cadence reaping makes necessary.
 - `results_remote` / `results_checkout` / `results_branch` on a project. Artifacts publish to a separate repository so the box holds a read-only key for code and a write key reaching nothing but results. Paths are namespaced `<project>/<job-id>/<path>`, or each run overwrites the last.
 
 **Known adjustments an implementer will hit:**

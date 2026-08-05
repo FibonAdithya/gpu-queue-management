@@ -8,6 +8,9 @@ root = "/workspace/queue"
 cpu_slots = 4
 poll_interval_s = 2.0
 kill_orphan_cuda = true
+# How often to sweep for CUDA processes no live job owns. This shells out to
+# nvidia-smi, so it is throttled; the cheap recovery reaps run every poll.
+orphan_cuda_interval_s = 60.0
 # Every participant on the box must agree on this path, or two tools hold
 # two different locks for the same card.
 claim_dir = "/workspace/lock/gpu"

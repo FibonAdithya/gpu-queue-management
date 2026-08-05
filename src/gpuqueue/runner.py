@@ -48,7 +48,8 @@ class Runner:
         self.queue.ensure_dirs()
         self.active: dict[str, Active] = {}
         self._stopping = False
-        self._reap_due = True  # on start, then after every completion
+        # None means "never swept", so the first tick does a full one.
+        self._last_cuda_sweep: float | None = None
 
     # --- lifecycle ----------------------------------------------------
     def run_forever(self) -> None:
@@ -64,11 +65,30 @@ class Runner:
         self._stopping = True
 
     def tick(self) -> None:
-        if self._reap_due:
-            reap(self.queue, self.cfg, active_ids=set(self.active))
-            self._reap_due = False
+        self._reap()
         self.collect()
         self.admit()
+
+    def _reap(self) -> None:
+        """Recover abandoned work every tick; sweep the card on a timer.
+
+        The recovery path — requeueing a job whose runner died, releasing its
+        claim, clearing debris — is three file operations, so it runs every
+        time. Gating it on job completions meant an idle runner never reaped
+        at all, which is precisely when there is something to recover.
+
+        The orphaned-CUDA sweep is the expensive part: a nvidia-smi subprocess
+        plus a walk of the process tree. It is a safety net rather than a
+        recovery path, so it runs at most once per orphan_cuda_interval_s and
+        stays out of a loop that also gates job admission.
+        """
+        now = time.monotonic()
+        sweep = (self._last_cuda_sweep is None
+                 or now - self._last_cuda_sweep >= self.cfg.orphan_cuda_interval_s)
+        reap(self.queue, self.cfg, active_ids=set(self.active),
+             include_orphan_cuda=sweep)
+        if sweep:
+            self._last_cuda_sweep = now
 
     def shutdown(self) -> None:
         """Kill what is running and leave it in running/ with no pid.
@@ -212,8 +232,6 @@ class Runner:
             self.active.pop(job_id, None)
             self._settle(active, result)
             finished.append(job_id)
-        if finished:
-            self._reap_due = True  # design: reap between jobs
         return finished
 
     def _settle(self, active: Active, result: JobResult) -> None:

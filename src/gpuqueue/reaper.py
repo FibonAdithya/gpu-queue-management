@@ -63,6 +63,12 @@ def clean_partials(queue: QueueRoot) -> list[str]:
         return cleaned
     live = {s.id for s in queue.list_state("running")}
     for path in work.rglob("*.part"):
+        # Never sweep inside a job that is still going. A .part file there is
+        # that job's business, not debris. This matters because reaping now
+        # runs on every tick rather than only between jobs.
+        rel = path.relative_to(work)
+        if rel.parts and rel.parts[0] in live:
+            continue
         cleaned.append(str(path))
         if path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
@@ -75,11 +81,23 @@ def clean_partials(queue: QueueRoot) -> list[str]:
 
 
 def reap(queue: QueueRoot, cfg: RunnerConfig,
-         active_ids: set[str] | None = None) -> dict:
+         active_ids: set[str] | None = None,
+         include_orphan_cuda: bool = True) -> dict:
+    """Recover what a dead runner left behind.
+
+    Split by cost. Releasing claims, requeueing abandoned jobs and removing
+    debris are file operations, cheap enough to run on every tick — and they
+    are the recovery path, so they should be. Killing orphaned CUDA processes
+    shells out to nvidia-smi and walks the process tree with ps; it is a
+    safety net with no latency requirement, so the runner puts it on a timer
+    and passes include_orphan_cuda=False the rest of the time.
+    """
     stale = release_stale(cfg.claim_dir)
     requeued, failed = requeue_orphans(queue, active_ids)
-    protect = {s.pid for s in queue.list_state("running") if s.pid}
-    killed = kill_orphan_cuda(protect) if cfg.kill_orphan_cuda else []
+    killed = []
+    if include_orphan_cuda and cfg.kill_orphan_cuda:
+        protect = {s.pid for s in queue.list_state("running") if s.pid}
+        killed = kill_orphan_cuda(protect)
     cleaned = clean_partials(queue)
     return {"stale_claims": stale, "requeued": requeued, "failed": failed,
             "killed_pids": killed, "cleaned_paths": cleaned}

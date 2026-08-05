@@ -133,7 +133,8 @@ property which stops a shared box accumulating drifted working copies.
 
 ## Reaper
 
-Runs on runner start and between jobs:
+Runs on every poll of the runner loop, because the state it recovers from —
+a runner that died — is one where nothing else will happen to trigger it:
 
 - Read each claim file; if its pid is dead, release the claim and log it.
 - Kill CUDA processes that no live job owns.
@@ -143,7 +144,16 @@ Runs on runner start and between jobs:
 Plus a per-job wall-clock watchdog.
 
 Reaping lives in the runner, not in a supervising agent, because it has to run
-when nothing else is alive. That is precisely when a leaked job needs reaping.
+when nothing else is alive. That is precisely when a leaked job needs reaping —
+which is also why it cannot be triggered by job completions: an idle runner
+would then never reap, in exactly the situation that calls for it.
+
+The steps are split by cost. Releasing claims, requeueing abandoned jobs and
+clearing debris are file operations and run every poll. Killing orphaned CUDA
+processes needs `nvidia-smi` and a walk of the process tree, and is a safety
+net rather than a recovery path, so it runs at most once per
+`orphan_cuda_interval_s` (default 60) and stays out of the loop that gates job
+admission.
 
 The requeue-once rule is load-bearing. Without an attempt counter, a
 crash-looping job occupies the only card indefinitely.

@@ -35,6 +35,7 @@ class RunnerConfig:
     poll_interval_s: float = 2.0
     claim_dir: Path | None = None
     kill_orphan_cuda: bool = True
+    orphan_cuda_interval_s: float = 60.0
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
 
@@ -86,5 +87,6 @@ def load_config(path: Path) -> RunnerConfig:
         poll_interval_s=float(queue.get("poll_interval_s", 2.0)),
         claim_dir=Path(claim_dir) if claim_dir else None,
         kill_orphan_cuda=bool(queue.get("kill_orphan_cuda", True)),
+        orphan_cuda_interval_s=float(queue.get("orphan_cuda_interval_s", 60.0)),
         projects=projects,
     )

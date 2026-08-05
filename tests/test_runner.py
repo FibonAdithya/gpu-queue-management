@@ -208,3 +208,48 @@ def test_shutdown_survives_a_job_file_removed_by_hand(env):
     assert r.active == {}
     # the GPU claim was released despite the other job's missing file
     assert list((r.cfg.claim_dir).glob("*.lock.json")) == []
+
+
+def test_an_idle_runner_still_reaps_an_abandoned_job(env):
+    """The failure this fixes: a job left in running/ by a dead runner was
+    only recovered when some *other* job completed or the runner restarted.
+    On an idle box -- precisely when there is something to recover -- nothing
+    ever happened."""
+    r, sha = env
+    submit(r, sha, "j1", ["true"])
+    spec = r.queue.claim("j1")
+    spec.pid = 4000000          # a runner that is gone
+    spec.runner_pid = 4000001
+    r.queue.update(spec)
+
+    r.tick()                    # nothing else happening, nothing completing
+
+    # requeued once and picked straight back up, all in the one tick
+    state, recovered = r.queue.find("j1")
+    assert recovered.attempts == 1
+    assert state in ("pending", "running", "done")
+    assert drain(r)
+
+def test_the_cuda_sweep_is_throttled(env, monkeypatch):
+    """The cheap reaps run every tick; the nvidia-smi sweep must not."""
+    r, sha = env
+    calls = []
+    monkeypatch.setattr(rn, "reap",
+                        lambda q, c, active_ids=None, include_orphan_cuda=True:
+                        calls.append(include_orphan_cuda) or {})
+    r.cfg.orphan_cuda_interval_s = 3600
+    for _ in range(5):
+        r.tick()
+    assert len(calls) == 5, "the cheap reap must run on every tick"
+    assert calls[0] is True, "the first tick sweeps"
+    assert not any(calls[1:]), "later ticks inside the interval must not sweep"
+
+def test_the_cuda_sweep_runs_again_once_the_interval_passes(env, monkeypatch):
+    r, sha = env
+    calls = []
+    monkeypatch.setattr(rn, "reap",
+                        lambda q, c, active_ids=None, include_orphan_cuda=True:
+                        calls.append(include_orphan_cuda) or {})
+    r.cfg.orphan_cuda_interval_s = 0    # everything is always due
+    r.tick(); r.tick()
+    assert calls == [True, True]

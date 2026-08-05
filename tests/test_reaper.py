@@ -107,3 +107,35 @@ def test_does_not_kill_when_cuda_list_is_invisible(q, monkeypatch):
     monkeypatch.setattr(rp, "compute_apps", lambda: None)
     monkeypatch.setattr(rp, "_kill", lambda pid: pytest.fail("killed blind"))
     assert reap(q, cfg)["killed_pids"] == []
+
+
+def test_clean_partials_leaves_a_live_jobs_files_alone(tmp_path):
+    """Reaping now runs on every tick, so it must not sweep inside a job that
+    is still going -- a .part file there is that job's business, not debris."""
+    from gpuqueue.reaper import clean_partials
+    q = QueueRoot(tmp_path / "q"); q.ensure_dirs()
+    q.submit(mkspec("live"))
+    q.claim("live")                       # now in running/
+    live_part = q.work_dir("live") / "checkpoint.part"
+    live_part.parent.mkdir(parents=True, exist_ok=True)
+    live_part.write_text("half a checkpoint")
+    dead_part = q.work_dir("gone") / "leftover.part"
+    dead_part.parent.mkdir(parents=True, exist_ok=True)
+    dead_part.write_text("debris")
+
+    clean_partials(q)
+
+    assert live_part.exists(), "swept a running job's own file"
+    assert not dead_part.exists()
+
+def test_reap_can_skip_the_expensive_cuda_sweep(tmp_path, monkeypatch):
+    from gpuqueue.reaper import reap
+    import gpuqueue.reaper as rp
+    called = []
+    monkeypatch.setattr(rp, "kill_orphan_cuda", lambda protect: called.append(1) or [])
+    q = QueueRoot(tmp_path / "q"); q.ensure_dirs()
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path / "c")
+    reap(q, cfg, include_orphan_cuda=False)
+    assert called == []
+    reap(q, cfg, include_orphan_cuda=True)
+    assert called == [1]
