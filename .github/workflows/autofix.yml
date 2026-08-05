@@ -1,0 +1,90 @@
+# Opens a PR against a bug gpuq filed on itself. Nothing here merges.
+#
+# Triggers on `issues` and never on the pull-request-target event type,
+# so nothing fork-authored can reach the OAuth token.
+name: autofix
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  fix:
+    # Two doors, matching the two filing paths. Structural evidence from the
+    # runner runs on arrival; agent prose waits for a human to add `fix-me`.
+    # `throttled` is the off switch the box itself applies: the issue filed,
+    # the evidence is there, and the run is deliberately not happening.
+    if: >-
+      vars.GPUQ_AUTOFIX != 'off'
+      && !contains(github.event.issue.labels.*.name, 'throttled')
+      && (
+           (github.event.action == 'opened'
+            && contains(github.event.issue.labels.*.name, 'gpuq-auto'))
+        || (github.event.action == 'labeled'
+            && github.event.label.name == 'fix-me')
+         )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install gpuq and its test dependencies
+        run: python -m pip install --quiet -e '.[dev]'
+
+      - name: Confirm the suite is green before touching anything
+        run: python -m pytest -q
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            A bug has been filed against gpuq, the job queue in this
+            repository. The issue body is the evidence: read it first.
+
+            Repository: ${{ github.repository }}
+            Issue: #${{ github.event.issue.number }}
+
+            What to do, in order:
+
+            1. Reproduce the failure as a failing test under `tests/` BEFORE
+               changing any source. Commit that test, watch it fail, then
+               fix it. The owner reviews this PR by reading the test, not by
+               reading the diff — a fix with no failing-first test is worth
+               less than no PR at all.
+
+            2. Stay inside `src/gpuqueue/` and `tests/`. If the real fix
+               needs `bootstrap.sh`, `supervisor/`, or the config schema in
+               `config.py`, say so prominently at the top of the PR body
+               rather than making the change quietly.
+
+            3. If the root cause is caller error that the classifier
+               mislabelled — the job asked for something gpuq was right to
+               refuse — close the issue with an explanation and change
+               nothing. Do not make gpuq more permissive to silence a
+               report. `gpuq` deliberately treats CUDA OOM and timeouts as
+               configuration errors rather than transients; a PR that
+               loosens a check to make a bug go away is the failure mode
+               this instruction exists to prevent.
+
+            4. This runner has no GPU. Your fix must be verifiable by
+               `python -m pytest -q` on CPU. If verifying it genuinely
+               requires a card, say so plainly in the PR body rather than
+               implying a green CI run proves it works.
+
+            5. One root cause per PR. If you find a second bug, mention it
+               in the PR body and leave it.
+
+            Read `docs/specs/2026-08-05-autofix-design.md` for why this
+            system exists and `docs/design.md` for how the queue works.
+            Open a PR against `main`; do not merge it.
