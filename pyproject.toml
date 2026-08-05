@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-queue-management"
+version = "0.1.0"
+description = "Host-level GPU arbitration and job queueing for shared single-GPU boxes"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+gpu-claim = "gpuqueue.cli_claim:main"
+gpuq = "gpuqueue.cli_gpuq:main"
+gpuq-runner = "gpuqueue.cli_runner:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
