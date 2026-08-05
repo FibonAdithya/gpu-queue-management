@@ -93,6 +93,18 @@ for name, project in cfg.projects.items():
 PYEOF
 fi
 
+# 6. agent skill, so anything working on this box knows to queue its work
+GPUQ_SKILLS_DIR="${GPUQ_SKILLS_DIR:-$HOME/.claude/skills}"
+run mkdir -p "$GPUQ_SKILLS_DIR/gpu-jobs"
+if [ "$DRY_RUN" -eq 1 ]; then
+  say "would: install skill to $GPUQ_SKILLS_DIR/gpu-jobs/SKILL.md"
+else
+  # Copied, not symlinked: the skill must survive the repo checkout moving,
+  # and an agent reading a dangling symlink gets nothing and no explanation.
+  cp "$REPO_DIR/skills/gpu-jobs/SKILL.md" "$GPUQ_SKILLS_DIR/gpu-jobs/SKILL.md"
+  say "skill installed: $GPUQ_SKILLS_DIR/gpu-jobs/SKILL.md"
+fi
+
 # 5. supervisor program file, shipped rather than hand-written
 if [ "$USE_SUPERVISOR" -eq 1 ]; then
   run mkdir -p "$SUPERVISOR_CONF_DIR"

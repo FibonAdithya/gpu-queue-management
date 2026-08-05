@@ -193,3 +193,18 @@ def test_the_runner_spawns_no_threads(env):
     assert threading.active_count() == before
     drain(r)
     assert threading.active_count() == before
+
+def test_shutdown_survives_a_job_file_removed_by_hand(env):
+    """The queue is advertised as repairable with mv. A spec that moved out
+    from under the runner must not crash shutdown, and above all must not
+    strand another job's hold on the card."""
+    r, sha = env
+    submit(r, sha, "g1", ["sleep", "30"], lane="gpu")
+    submit(r, sha, "c1", ["sleep", "30"], lane="cpu")
+    r.admit()
+    (r.queue.root / "running" / "c1.json").unlink()
+
+    r.shutdown()
+    assert r.active == {}
+    # the GPU claim was released despite the other job's missing file
+    assert list((r.cfg.claim_dir).glob("*.lock.json")) == []

@@ -38,3 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     runner.run_forever()
     logging.info("runner stopped")
     return 0
+
+
+if __name__ == "__main__":  # python -m gpuqueue.cli_runner
+    raise SystemExit(main())

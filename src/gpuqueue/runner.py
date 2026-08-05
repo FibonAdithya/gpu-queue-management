@@ -78,13 +78,27 @@ class Runner:
         the runner died.
         """
         for job_id, active in list(self.active.items()):
-            kill_job(active.running)
-            self._release_card(active)
-            self._remove_worktree(active)
-            spec = active.running.spec
-            spec.pid = None
-            self.queue.update(spec)
             self.active.pop(job_id, None)
+            # Each step is guarded separately. The queue is meant to be
+            # repairable with mv, so a spec file may have moved out from
+            # under us — and one job's problem must never strand another
+            # job's hold on the card.
+            try:
+                kill_job(active.running)
+            except Exception as e:
+                log.warning("shutdown: could not kill %s: %s", job_id, e)
+            try:
+                self._release_card(active)
+            except Exception as e:
+                log.error("shutdown: could not release the card after %s: %s",
+                          job_id, e)
+            try:
+                self._remove_worktree(active)
+                spec = active.running.spec
+                spec.pid = None
+                self.queue.update(spec)
+            except Exception as e:
+                log.warning("shutdown: could not record %s: %s", job_id, e)
             log.info("stopped %s for shutdown; left for the reaper", job_id)
 
     # --- admission ----------------------------------------------------

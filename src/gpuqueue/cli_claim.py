@@ -65,3 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     except ClaimBusy as e:
         print(f"gpu-claim: {e}", file=sys.stderr)
         return EX_TEMPFAIL
+
+
+if __name__ == "__main__":  # python -m gpuqueue.cli_claim
+    raise SystemExit(main())

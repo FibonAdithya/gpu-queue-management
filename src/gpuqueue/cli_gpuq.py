@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from .queue import QueueRoot, STATES
 from .spec import JobSpec, SpecError
 
 DEFAULT_QUEUE_ROOT = "/workspace/queue"
+WAIT_TIMED_OUT = 124  # as timeout(1), so a shell can tell the cases apart
 
 
 def generate_id(prefix: str) -> str:
@@ -49,7 +51,50 @@ def _cmd_submit(args) -> int:
         print(f"gpuq: {e}", file=sys.stderr)
         return 2
     print(job_id)
+    if getattr(args, "wait", False):
+        return wait_for(q, job_id, args.timeout, args.poll)
     return 0
+
+
+def wait_for(q: QueueRoot, job_id: str, timeout: float | None,
+             poll: float) -> int:
+    """Block until the job is done or failed. Returns the exit code.
+
+    Returns immediately for a job that has already finished — which is what
+    lets a caller submit, go and do something else, and wait whenever it
+    suits. Waiting late costs nothing.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    seen = False
+    while True:
+        found = q.find(job_id)
+        if found is None:
+            if not seen:
+                print(f"gpuq: no such job: {job_id}", file=sys.stderr)
+                return 2
+            # Seen before, missing now: the reaper is moving it between
+            # directories. Not a missing job.
+        else:
+            seen = True
+            state, spec = found
+            if state in ("done", "failed"):
+                if state == "done":
+                    print(f"done {job_id}")
+                    return 0
+                print(f"failed {job_id}: {spec.error or 'no error recorded'}",
+                      file=sys.stderr)
+                return 1
+        if deadline is not None and time.monotonic() >= deadline:
+            state = found[0] if found else "unknown"
+            print(f"gpuq: {job_id} still {state} after {timeout}s; "
+                  "the job is untouched, wait again when you like",
+                  file=sys.stderr)
+            return WAIT_TIMED_OUT
+        time.sleep(poll)
+
+
+def _cmd_wait(args) -> int:
+    return wait_for(_queue(args), args.id, args.timeout, args.poll)
 
 
 def _cmd_list(args) -> int:
@@ -103,8 +148,21 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--artifact", action="append", default=[])
     s.add_argument("--timeout-s", dest="timeout_s", type=int, default=3600)
     s.add_argument("--dedupe-key", dest="dedupe_key", default=None)
+    s.add_argument("--wait", action="store_true",
+                   help="block until the job finishes, then exit with its result")
+    s.add_argument("--timeout", type=float, default=None,
+                   help="how long to wait, not how long the job may run")
+    s.add_argument("--poll", type=float, default=2.0)
     s.add_argument("cmd", nargs=argparse.REMAINDER)
     s.set_defaults(func=_cmd_submit)
+
+    w = sub.add_parser("wait", help="block until a job finishes")
+    w.add_argument("id")
+    w.add_argument("--timeout", type=float, default=None,
+                   help="how long YOU wait. The job is never cancelled by "
+                        "this; its own limit is timeout_s in the spec.")
+    w.add_argument("--poll", type=float, default=2.0)
+    w.set_defaults(func=_cmd_wait)
 
     l = sub.add_parser("list")
     l.add_argument("--state", choices=list(STATES), default=None)
@@ -130,3 +188,7 @@ def main(argv: list[str] | None = None) -> int:
             print("gpuq: a command is required after --", file=sys.stderr)
             return 2
     return args.func(args)
+
+
+if __name__ == "__main__":  # python -m gpuqueue.cli_gpuq
+    raise SystemExit(main())
