@@ -118,22 +118,34 @@ _PRUNE_AFTER = timedelta(days=2)
 
 
 def _load_dispatches(cfg: AutofixConfig) -> list[datetime]:
-    """Timestamps of past auto-dispatches. Unreadable means empty.
+    """Timestamps of past auto-dispatches. Unreadable or malformed means
+    empty.
 
     This file guards a budget, not queue state. Refusing to file because we
     cannot read it would lose evidence to protect a counter, which is the
-    wrong way round.
+    wrong way round -- so every failure here, including a `dispatches` that
+    isn't a list at all (a hand-edited file, a future writer's bug), must
+    fail towards zero recorded dispatches rather than raise.
     """
     try:
         raw = json.loads(Path(cfg.state_file).read_text())["dispatches"]
+        if not isinstance(raw, list):
+            return []
     except Exception:
         return []
     out = []
     for stamp in raw:
         try:
-            out.append(datetime.fromisoformat(stamp))
+            when = datetime.fromisoformat(stamp)
         except (TypeError, ValueError):
             continue
+        if when.tzinfo is None:
+            # A naive timestamp -- hand-edited, or a future writer that
+            # passed a naive `now` -- must not blow up the aware/naive
+            # comparison in dispatches_in_last_day. Assume UTC, since that
+            # is the only zone _save_dispatches ever writes.
+            when = when.replace(tzinfo=timezone.utc)
+        out.append(when)
     return out
 
 
@@ -161,28 +173,38 @@ def record_dispatch(cfg: AutofixConfig, now: datetime) -> None:
 
 
 _ISSUE_NUMBER = re.compile(r"/issues/(\d+)")
-_labels_ensured = False
+
+# Names of labels confirmed present, tracked one at a time rather than one
+# all-or-nothing flag. `gh issue create --label` fails outright on a label
+# that does not exist, and a transient failure on a single label (an auth
+# hiccup, a rate limit) must not be remembered as success for the whole
+# set -- otherwise every later file_bug/file_agent_report in this process's
+# life raises GhError on a label gh never actually created, and since the
+# runner swallows GhError, filing silently stops for good. Only genuinely
+# confirmed labels are skipped; anything that failed is retried next call.
+_labels_ensured: set[str] = set()
+
+_LABEL_SPECS = (
+    (AUTO_LABEL, "B60205", "filed by the gpuq runner from its own traceback"),
+    (REPORTED_LABEL, "FBCA04", "filed by an agent; needs `fix-me` to run"),
+    (THROTTLED_LABEL, "666666", "filed as evidence; deliberately not run"),
+    ("fix-me", "0E8A16", "owner authorises an autofix run"),
+)
 
 
 def ensure_labels(cfg: AutofixConfig) -> None:
-    """`gh issue create --label` fails outright on a label that does not
-    exist, so make them once per process rather than documenting a manual
-    step a rebuilt box will skip."""
-    global _labels_ensured
-    if _labels_ensured:
-        return
-    for name, colour, desc in (
-        (AUTO_LABEL, "B60205", "filed by the gpuq runner from its own traceback"),
-        (REPORTED_LABEL, "FBCA04", "filed by an agent; needs `fix-me` to run"),
-        (THROTTLED_LABEL, "666666", "filed as evidence; deliberately not run"),
-        ("fix-me", "0E8A16", "owner authorises an autofix run"),
-    ):
+    """Make the labels this module needs once per process rather than
+    documenting a manual step a rebuilt box will skip."""
+    for name, colour, desc in _LABEL_SPECS:
+        if name in _labels_ensured:
+            continue
         try:
             _gh(cfg, ["label", "create", name, "--repo", cfg.repo,
                       "--color", colour, "--description", desc, "--force"])
         except GhError as e:
             log.warning("could not ensure label %s: %s", name, e)
-    _labels_ensured = True
+        else:
+            _labels_ensured.add(name)
 
 
 def _create_issue(cfg: AutofixConfig, title: str, body: str,

@@ -23,11 +23,11 @@ def gh(monkeypatch):
         return "[]"
 
     monkeypatch.setattr(bugfiler, "_gh", fake)
-    # ensure_labels caches "done" in a module global so a long-lived runner
-    # does not re-create four labels per bug. Reset it, or every test after
-    # the first sees a different call sequence.
+    # ensure_labels caches confirmed labels in a module global so a
+    # long-lived runner does not re-create four labels per bug. Reset it,
+    # or every test after the first sees a different call sequence.
     # raising=False because this global does not exist yet at Task 5.
-    monkeypatch.setattr(bugfiler, "_labels_ensured", False, raising=False)
+    monkeypatch.setattr(bugfiler, "_labels_ensured", set(), raising=False)
     fake.calls, fake.replies = calls, replies
     return fake
 
@@ -338,3 +338,57 @@ def test_an_agent_report_carries_no_signature(gh, cfg):
     bugfiler.file_agent_report(cfg, "t", "b")
     _, body = _created(gh)
     assert "sig: " not in body
+
+
+def test_a_failed_label_creation_is_retried_not_cached_as_done(gh, cfg,
+                                                                monkeypatch):
+    """A transient failure creating one label (auth hiccup, rate limit)
+    must not be remembered as success for the whole set. If it were, every
+    later file_bug/file_agent_report in this process's life would raise
+    GhError on `gh issue create --label` refusing a label gh never actually
+    made -- and since the runner swallows GhError, filing would silently
+    stop for the rest of the process."""
+    attempts = {"n": 0}
+
+    def fake(_cfg, args, stdin=None):
+        gh.calls.append((args, stdin))
+        if args[:2] == ["label", "create"] and args[2] == bugfiler.AUTO_LABEL:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise bugfiler.GhError("rate limited")
+        return "[]"
+
+    monkeypatch.setattr(bugfiler, "_gh", fake)
+    bugfiler.ensure_labels(cfg)
+    bugfiler.ensure_labels(cfg)
+
+    creates = [a for a, _ in gh.calls if a[:2] == ["label", "create"]]
+    auto_creates = [a for a in creates if a[2] == bugfiler.AUTO_LABEL]
+    other_creates = [a for a in creates if a[2] != bugfiler.AUTO_LABEL]
+    # The failed label is retried on the second call...
+    assert len(auto_creates) == 2
+    # ...but labels that succeeded the first time are not recreated.
+    assert len(other_creates) == 3
+
+
+def test_a_non_iterable_dispatches_value_does_not_stop_filing(cfg):
+    """{"dispatches": 5} is malformed, not merely unreadable -- the loop in
+    _load_dispatches must not escape as a bare TypeError trying to iterate
+    an int. The state file is a budget guard, not queue state: malformed
+    means zero recorded dispatches, not a raise."""
+    cfg.state_file.write_text(json.dumps({"dispatches": 5}))
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 0
+    assert bugfiler.may_dispatch(cfg, NOW) is True
+
+
+def test_a_naive_timestamp_does_not_crash_the_comparison(cfg):
+    """A hand-edited file, or a future writer passing a naive `now`, can
+    leave one timestamp without tzinfo. Comparing it against an aware `now`
+    must not raise -- naive timestamps are treated as UTC, the only zone
+    _save_dispatches ever writes."""
+    from datetime import datetime as dt
+    naive = dt(2026, 8, 5, 11, 0).isoformat()
+    aware = (NOW - timedelta(hours=1)).isoformat()
+    cfg.state_file.write_text(json.dumps({"dispatches": [naive, aware]}))
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 2
+    assert bugfiler.may_dispatch(cfg, NOW) is True
