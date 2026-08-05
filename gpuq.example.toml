@@ -1,0 +1,13 @@
+[queue]
+root = "/workspace/queue"
+# 4, not the core count: typical CPU jobs here are BLAS-bound and already
+# thread internally, so one per core oversubscribes. Measure before tuning.
+cpu_slots = 4
+poll_interval_s = 2.0
+kill_orphan_cuda = true
+
+[project.wgan-synthetic]
+remote   = "git@github.com:Daniel-T-S-Adams/wgan-synthetic.git"
+checkout = "/workspace/checkouts/wgan-synthetic"
+venv     = "/workspace/checkouts/wgan-synthetic/.venv"
+commit_artifacts = true
