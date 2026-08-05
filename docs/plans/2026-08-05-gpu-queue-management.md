@@ -1294,12 +1294,23 @@ def test_foreign_reports_stranger(monkeypatch):
     assert [p["pid"] for p in foreign_processes()] == [4321]
 
 def test_preflight_raises_naming_pid_and_command(monkeypatch):
-    monkeypatch.setattr(pf, "foreign_processes",
-                        lambda allow=None: [{"pid": 4321, "used_mb": 900,
-                                             "name": "train.py"}])
+    monkeypatch.setattr(pf, "compute_apps",
+                        lambda: [{"pid": 4321, "used_mb": 900, "name": "train.py"}])
+    monkeypatch.setattr(pf, "own_pids", lambda: set())
     with pytest.raises(PreflightFailed) as e:
         pf.preflight()
     assert "4321" in str(e.value) and "train.py" in str(e.value)
+
+def test_preflight_queries_the_card_once(monkeypatch):
+    """Two queries let the visibility check and the contention check
+    disagree about what they saw."""
+    calls = []
+    def counted():
+        calls.append(1)
+        return []
+    monkeypatch.setattr(pf, "compute_apps", counted)
+    pf.preflight()
+    assert len(calls) == 1
 
 def test_preflight_passes_when_cannot_see(monkeypatch, capsys):
     """Unprivileged containers often cannot enumerate compute apps. Warn,
@@ -1310,9 +1321,11 @@ def test_preflight_passes_when_cannot_see(monkeypatch, capsys):
     assert "cannot enumerate" in capsys.readouterr().err
 
 def test_preflight_passes_when_clear(monkeypatch):
-    monkeypatch.setattr(pf, "foreign_processes", lambda allow=None: [])
+    monkeypatch.setattr(pf, "compute_apps", lambda: [])
     pf.preflight()
 ```
+
+`preflight` must call `compute_apps()` **once** and filter the result itself, via a shared `_foreign(apps, allow)` helper that `foreign_processes` also uses. Delegating to `foreign_processes` means two `nvidia-smi` invocations per preflight, and lets the "can we see the list?" check and the "who is on the card?" check disagree about what they saw.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -1396,20 +1409,28 @@ def _descendants(pid: int) -> set[int]:
     return kids
 
 
-def foreign_processes(allow: set[int] | None = None) -> list[dict]:
-    apps = compute_apps()
-    if apps is None:
-        return []
+def _foreign(apps: list[dict], allow: set[int] | None) -> list[dict]:
     exempt = set(allow or set()) | own_pids()
     return [a for a in apps if a["pid"] not in exempt]
 
 
+def foreign_processes(allow: set[int] | None = None) -> list[dict]:
+    apps = compute_apps()
+    if apps is None:
+        return []
+    return _foreign(apps, allow)
+
+
 def preflight(allow: set[int] | None = None) -> None:
-    if compute_apps() is None:
+    # One query, not two: asking twice costs a second nvidia-smi and lets
+    # the "can we see the list?" check and the "who is on the card?" check
+    # disagree about what they saw.
+    apps = compute_apps()
+    if apps is None:
         print("gpu-claim: warning: cannot enumerate CUDA processes on this "
               "box; proceeding on the advisory lock alone", file=sys.stderr)
         return
-    foreign = foreign_processes(allow)
+    foreign = _foreign(apps, allow)
     if foreign:
         lines = [f"  pid {a['pid']:>7}  {a['used_mb'] or '?'} MiB  {a['name']}"
                  for a in foreign]
@@ -1420,7 +1441,7 @@ def preflight(allow: set[int] | None = None) -> None:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pytest tests/test_preflight.py -v`
-Expected: 10 passed
+Expected: 11 passed
 
 - [ ] **Step 5: Commit**
 
