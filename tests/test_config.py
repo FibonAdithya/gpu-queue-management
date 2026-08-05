@@ -56,3 +56,33 @@ def test_missing_file_raises_config_error(tmp_path):
 def test_example_config_in_repo_is_loadable():
     from pathlib import Path
     load_config(Path(__file__).resolve().parents[1] / "gpuq.example.toml")
+
+
+SPLIT = """
+[queue]
+root = "/workspace/queue"
+
+[project.myproject]
+remote   = "git@github.com:you/myproject.git"
+checkout = "/workspace/checkouts/myproject"
+commit_artifacts = true
+results_remote   = "git@github.com:you/myproject-results.git"
+results_checkout = "/workspace/checkouts/myproject-results"
+results_branch   = "main"
+"""
+
+def test_loads_a_results_repo(tmp_path):
+    proj = load_config(_write(tmp_path, SPLIT)).projects["myproject"]
+    assert proj.results_remote.endswith("myproject-results.git")
+    assert str(proj.results_checkout).endswith("myproject-results")
+    assert proj.results_branch == "main"
+
+def test_results_defaults_to_none(tmp_path):
+    proj = load_config(_write(tmp_path, TOML)).projects["myproject"]
+    assert proj.results_remote is None and proj.results_checkout is None
+
+def test_half_a_results_repo_is_rejected(tmp_path):
+    """One without the other has nowhere to publish."""
+    bad = SPLIT.replace('results_checkout = "/workspace/checkouts/myproject-results"\n', "")
+    with pytest.raises(ConfigError, match="results_remote and results_checkout"):
+        load_config(_write(tmp_path, bad))

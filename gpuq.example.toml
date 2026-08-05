@@ -22,3 +22,11 @@ checkout = "/workspace/checkouts/your-project"
 # also what makes `-- python train.py` work on images that ship only python3.
 venv     = "/venv/main"
 commit_artifacts = true
+
+# Where artifacts are published. Left as-is they are committed into the
+# checkout above and die with the box. Uncomment to push them to a separate
+# results repository instead, so the box needs write access to nothing but
+# results -- anyone who can queue a job here can use that key.
+# results_remote   = "git@github.com:you/your-results.git"
+# results_checkout = "/workspace/checkouts/your-results"
+# results_branch   = "main"

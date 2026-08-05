@@ -53,10 +53,43 @@ def remove_worktree(checkout: Path, dest: Path) -> None:
     git(["worktree", "prune"], cwd=checkout, check=False)
 
 
+def ensure_results_checkout(project: ProjectConfig) -> Path | None:
+    """Clone the results repository, if this project publishes to one."""
+    if not (project.results_remote and project.results_checkout):
+        return None
+    path = Path(project.results_checkout)
+    if not (path / ".git").exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        git(["clone", project.results_remote, str(path)])
+    return path
+
+
 def commit_artifacts(project: ProjectConfig, branch: str,
                      files: list[Path], rel_paths: list[str],
-                     message: str) -> str | None:
-    checkout = ensure_checkout(project)
+                     message: str, job_id: str | None = None) -> str | None:
+    """Publish a job's declared artifacts. Returns the new sha, or None.
+
+    Two arrangements. By default artifacts are committed into the project's
+    own checkout, and pushed only if `push` is set.
+
+    If the project declares a results repository, they go there instead. That
+    is what lets a shared box hold a read-only key for your code and a write
+    key that reaches nothing but results — anyone who can queue a job on the
+    box can push with it, so the smaller that blast radius, the better.
+
+    In a results repository the paths are namespaced `<project>/<job>/<path>`.
+    A results repo aggregates many runs and many projects; committing at the
+    bare declared path means each run silently overwrites the last, and
+    "results survive the box" would only be true of the most recent one.
+    """
+    results = ensure_results_checkout(project)
+    if results is not None:
+        checkout, branch, push = results, project.results_branch, True
+        prefix = Path(project.name) / (job_id or "unknown")
+        rel_paths = [str(prefix / r) for r in rel_paths]
+    else:
+        checkout, push = ensure_checkout(project), project.push
+
     git(["checkout", "-q", branch], cwd=checkout, check=False)
     for src, rel in zip(files, rel_paths):
         dst = checkout / rel
@@ -70,6 +103,6 @@ def commit_artifacts(project: ProjectConfig, branch: str,
         return None
     git([*_IDENTITY, "commit", "-qm", message], cwd=checkout)
     sha = git(["rev-parse", "HEAD"], cwd=checkout).strip()
-    if project.push:
+    if push:
         git(["push", "origin", f"HEAD:{branch}"], cwd=checkout, check=False)
     return sha

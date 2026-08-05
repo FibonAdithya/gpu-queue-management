@@ -251,7 +251,7 @@ class Runner:
             rels.append(rel)
         if project.commit_artifacts:
             git_ops.commit_artifacts(project, spec.branch, srcs, rels,
-                                     f"artifacts: {spec.id}")
+                                     f"artifacts: {spec.id}", job_id=spec.id)
 
     def _describe_failure(self, spec: JobSpec, result: JobResult) -> str:
         if result.timed_out:

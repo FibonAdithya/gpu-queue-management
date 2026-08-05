@@ -136,6 +136,75 @@ so a job that says `-- python train.py` fails without it.
 
 A private `remote` needs a deploy key on the box.
 
+### Where results go, and what key that needs
+
+`commit_artifacts` writes a job's declared artifacts into a git repository.
+Which one decides how much access the box needs — and *anyone who can queue a
+job on the box can use that access*, because the box's ssh access is the
+security boundary (`docs/design.md`, "Not in scope").
+
+| Arrangement | Config | Key on the box | Survives the box being destroyed? |
+|---|---|---|---|
+| Local only | `commit_artifacts = true` | read-only | **No.** Pull results before teardown |
+| Push to the code repo | `+ push = true` | **write, to your code repo** | Yes |
+| **Split** | `+ results_remote`/`results_checkout` | read-only for code, write for results only | Yes |
+
+The split is the one worth the extra moving part. The code repo key stays
+read-only, and the writable key reaches nothing but a results repository:
+
+```toml
+[project.myproject]
+remote   = "git@github.com:you/myproject.git"          # read-only deploy key
+checkout = "/workspace/checkouts/myproject"
+venv     = "/venv/main"
+commit_artifacts = true
+
+results_remote   = "git@github.com:you/myproject-results.git"   # write key
+results_checkout = "/workspace/checkouts/myproject-results"
+results_branch   = "main"
+```
+
+Artifacts land at **`<project>/<job-id>/<declared path>`** in the results repo.
+A results repo aggregates many runs and often several projects; committing at
+the bare declared path means each run silently overwrites the last, and
+"results survive the box" would be true only of the most recent one. A results
+repo is always pushed — durability is the entire reason it exists — so `push`
+is not consulted in this mode and your code repo is never pushed to.
+
+GitHub allows one deploy key per repository, so this needs two keys. On the box:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/code_ro   -N "" -C "gpuq code read-only"
+ssh-keygen -t ed25519 -f ~/.ssh/results_rw -N "" -C "gpuq results write"
+cat >> ~/.ssh/config <<'CONF'
+Host github-code
+  HostName github.com
+  IdentityFile ~/.ssh/code_ro
+  IdentitiesOnly yes
+Host github-results
+  HostName github.com
+  IdentityFile ~/.ssh/results_rw
+  IdentitiesOnly yes
+CONF
+```
+
+Add `code_ro.pub` to the code repo's deploy keys **without** write access, and
+`results_rw.pub` to the results repo **with** write access. Then use the host
+aliases in the config so each repo gets the right key:
+
+```toml
+remote         = "git@github-code:you/myproject.git"
+results_remote = "git@github-results:you/myproject-results.git"
+```
+
+Verify the read-only key really is read-only — a deploy key added with write
+access by accident defeats the whole arrangement:
+
+```bash
+ssh $BOX 'cd /workspace/checkouts/myproject && git push --dry-run origin HEAD'
+# expect: ERROR: Write access to repository not granted
+```
+
 ## 5. Verify
 
 ```bash

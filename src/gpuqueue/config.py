@@ -20,6 +20,12 @@ class ProjectConfig:
     venv: Path | None = None
     commit_artifacts: bool = False
     push: bool = False
+    # Optional split: publish artifacts to a *different* repository from the
+    # one the code is checked out from. This is what lets the box hold a
+    # read-only key for your code and a write key only for results.
+    results_remote: str | None = None
+    results_checkout: Path | None = None
+    results_branch: str = "main"
 
 
 @dataclass
@@ -56,6 +62,11 @@ def load_config(path: Path) -> RunnerConfig:
             raise ConfigError(f"[project.{name}].checkout is required")
         if not p.get("remote"):
             raise ConfigError(f"[project.{name}].remote is required")
+        r_remote, r_checkout = p.get("results_remote"), p.get("results_checkout")
+        if bool(r_remote) != bool(r_checkout):
+            raise ConfigError(
+                f"[project.{name}]: results_remote and results_checkout must be "
+                "set together; one without the other has nowhere to publish")
         projects[name] = ProjectConfig(
             name=name,
             remote=p["remote"],
@@ -63,6 +74,9 @@ def load_config(path: Path) -> RunnerConfig:
             venv=Path(p["venv"]) if p.get("venv") else None,
             commit_artifacts=bool(p.get("commit_artifacts", False)),
             push=bool(p.get("push", False)),
+            results_remote=r_remote,
+            results_checkout=Path(r_checkout) if r_checkout else None,
+            results_branch=p.get("results_branch", "main"),
         )
 
     claim_dir = queue.get("claim_dir")

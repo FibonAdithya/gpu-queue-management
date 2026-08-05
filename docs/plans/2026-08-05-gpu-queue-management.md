@@ -1820,6 +1820,14 @@ checkout = "/workspace/checkouts/your-project"
 # also what makes `-- python train.py` work on images that ship only python3.
 venv     = "/venv/main"
 commit_artifacts = true
+
+# Where artifacts are published. Left as-is they are committed into the
+# checkout above and die with the box. Uncomment to push them to a separate
+# results repository instead, so the box needs write access to nothing but
+# results -- anyone who can queue a job here can use that key.
+# results_remote   = "git@github.com:you/your-results.git"
+# results_checkout = "/workspace/checkouts/your-results"
+# results_branch   = "main"
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -3845,6 +3853,10 @@ git commit -m "feat: gpuq wait, and a skill telling agents to queue their work"
 | Not in scope (multi-GPU, multi-host, durable storage, auth) | no tasks, correctly |
 
 **Deliberately deferred:** per-job VRAM/memory limits, per the 2026-08-05 decision recorded in Global Constraints.
+
+**Added after the plan, by decision on 2026-08-05:**
+- `JobSpec.runner_pid` and the `orphaned` flag on `gpuq list`/`show`. A job outlives a runner that dies abruptly; nothing then supervises it. Surfaced rather than acted on, because the design's stance is that the operator sees the queue and repairs it. Detection is by ownership — a live job whose recorded runner is dead — not by parent pid, since reparenting lands on the nearest subreaper rather than reliably on init.
+- `results_remote` / `results_checkout` / `results_branch` on a project. Artifacts publish to a separate repository so the box holds a read-only key for code and a write key reaching nothing but results. Paths are namespaced `<project>/<job-id>/<path>`, or each run overwrites the last.
 
 **Known adjustments an implementer will hit:**
 - Task 3 Step 3 notes the `--lane` `choices=` conflict with `test_submit_invalid_lane_exits_nonzero`; the resolution (drop `choices=`) is stated there.

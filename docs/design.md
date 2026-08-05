@@ -203,6 +203,9 @@ plus a bootstrap run.
   here anticipates it. One card, one box.
 - **Multi-host scheduling.** `flock` is host-local by nature. Coordinating
   across boxes needs a different mechanism and a different design.
-- **Durable artifact storage.** Consumers commit what they want to keep.
+- **Durable artifact storage.** Consumers commit what they want to keep. A
+  project may name a separate results repository, which is how a box holds a
+  read-only key for code and a write key that reaches nothing else; beyond
+  that, retention is the consumer's problem.
 - **Authentication.** Anyone who can write to `$QUEUE_ROOT` can queue work.
   The box's ssh access is the security boundary.
