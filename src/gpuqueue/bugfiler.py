@@ -47,8 +47,12 @@ def _gh(cfg: AutofixConfig, args: list[str], stdin: str | None = None) -> str:
     try:
         proc = subprocess.run(["gh", *args], input=stdin, env=env, text=True,
                               capture_output=True, timeout=GH_TIMEOUT_S)
-    except FileNotFoundError as e:
-        raise GhError("gh is not installed on this box") from e
+    except OSError as e:
+        # FileNotFoundError, PermissionError and their OSError siblings all
+        # mean the same thing to a caller: gh did not run. Keep the message
+        # honest about which -- "not installed" and "not executable" call
+        # for different fixes from whoever reads the runner log.
+        raise GhError(f"cannot run gh: {e}") from e
     except subprocess.TimeoutExpired as e:
         raise GhError(f"gh {args[0]} timed out after {GH_TIMEOUT_S}s") from e
     if proc.returncode != 0:

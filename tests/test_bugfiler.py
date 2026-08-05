@@ -115,6 +115,18 @@ def test_a_missing_gh_binary_raises_gh_error(monkeypatch, cfg):
         bugfiler._gh(cfg, ["issue", "list"])
 
 
+def test_a_gh_binary_that_exists_but_is_not_executable_raises_gh_error(
+        monkeypatch, cfg):
+    """PermissionError is an OSError sibling of FileNotFoundError -- a gh
+    that exists but lacks +x must not escape as a raw builtin exception."""
+    def fake_run(argv, **kw):
+        raise PermissionError("gh")
+
+    monkeypatch.setattr(bugfiler.subprocess, "run", fake_run)
+    with pytest.raises(bugfiler.GhError, match="gh"):
+        bugfiler._gh(cfg, ["issue", "list"])
+
+
 def test_gpuq_commit_is_a_short_sha_or_unknown():
     got = bugfiler.gpuq_commit()
     assert got == "unknown" or (7 <= len(got) <= 12 and got.isalnum())
