@@ -86,3 +86,40 @@ def test_half_a_results_repo_is_rejected(tmp_path):
     bad = SPLIT.replace('results_checkout = "/workspace/checkouts/myproject-results"\n', "")
     with pytest.raises(ConfigError, match="results_remote and results_checkout"):
         load_config(_write(tmp_path, bad))
+
+
+AUTOFIX = TOML + """
+[autofix]
+enabled = true
+repo = "you/gpu-queue-management"
+"""
+
+def test_autofix_is_off_unless_declared(tmp_path):
+    cfg = load_config(_write(tmp_path, TOML))
+    assert cfg.autofix.enabled is False
+    assert cfg.autofix.repo is None
+
+def test_autofix_loads(tmp_path):
+    af = load_config(_write(tmp_path, AUTOFIX)).autofix
+    assert af.enabled is True
+    assert af.repo == "you/gpu-queue-management"
+
+def test_autofix_defaults(tmp_path):
+    af = load_config(_write(tmp_path, AUTOFIX)).autofix
+    assert af.max_dispatches_per_day == 3
+    assert af.closed_lookback_days == 30
+    assert af.token_env == "GPUQ_GITHUB_TOKEN"
+
+def test_autofix_state_file_defaults_under_the_queue_root(tmp_path):
+    af = load_config(_write(tmp_path, AUTOFIX)).autofix
+    assert str(af.state_file) == "/workspace/queue/autofix.json"
+
+def test_enabled_autofix_without_a_repo_is_rejected(tmp_path):
+    text = TOML + '\n[autofix]\nenabled = true\n'
+    with pytest.raises(ConfigError, match="repo"):
+        load_config(_write(tmp_path, text))
+
+def test_a_repo_must_look_like_owner_slash_name(tmp_path):
+    text = TOML + '\n[autofix]\nenabled = true\nrepo = "https://github.com/a/b"\n'
+    with pytest.raises(ConfigError, match="owner/name"):
+        load_config(_write(tmp_path, text))

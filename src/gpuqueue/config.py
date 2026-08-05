@@ -29,6 +29,24 @@ class ProjectConfig:
 
 
 @dataclass
+class AutofixConfig:
+    """Where gpuq files bugs against itself, and how hard it is allowed to try.
+
+    Off by default. Turning it on means the box holds a GitHub token, so it
+    is never something a config inherits by accident.
+    """
+    enabled: bool = False
+    repo: str | None = None            # owner/name
+    # Which environment variable holds the fine-grained PAT. Named rather
+    # than GH_TOKEN so an issues-only key is not inherited by every other
+    # tool on the box that speaks to GitHub.
+    token_env: str = "GPUQ_GITHUB_TOKEN"
+    max_dispatches_per_day: int = 3
+    closed_lookback_days: int = 30
+    state_file: Path | None = None     # defaults to <queue_root>/autofix.json
+
+
+@dataclass
 class RunnerConfig:
     queue_root: Path
     cpu_slots: int = 4
@@ -37,6 +55,7 @@ class RunnerConfig:
     kill_orphan_cuda: bool = True
     orphan_cuda_interval_s: float = 60.0
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
+    autofix: AutofixConfig = field(default_factory=AutofixConfig)
 
 
 def default_config_path() -> Path:
@@ -81,6 +100,25 @@ def load_config(path: Path) -> RunnerConfig:
         )
 
     claim_dir = queue.get("claim_dir")
+
+    a = data.get("autofix") or {}
+    repo = a.get("repo")
+    enabled = bool(a.get("enabled", False))
+    if enabled and not repo:
+        raise ConfigError("[autofix].repo is required when enabled")
+    if repo and (repo.count("/") != 1 or repo.startswith(("http", "git@"))):
+        raise ConfigError(f"[autofix].repo must be owner/name, got {repo!r}")
+    state_file = a.get("state_file")
+    autofix = AutofixConfig(
+        enabled=enabled,
+        repo=repo,
+        token_env=a.get("token_env", "GPUQ_GITHUB_TOKEN"),
+        max_dispatches_per_day=int(a.get("max_dispatches_per_day", 3)),
+        closed_lookback_days=int(a.get("closed_lookback_days", 30)),
+        state_file=Path(state_file) if state_file
+                   else Path(root) / "autofix.json",
+    )
+
     return RunnerConfig(
         queue_root=Path(root),
         cpu_slots=cpu_slots,
@@ -89,4 +127,5 @@ def load_config(path: Path) -> RunnerConfig:
         kill_orphan_cuda=bool(queue.get("kill_orphan_cuda", True)),
         orphan_cuda_interval_s=float(queue.get("orphan_cuda_interval_s", 60.0)),
         projects=projects,
+        autofix=autofix,
     )
