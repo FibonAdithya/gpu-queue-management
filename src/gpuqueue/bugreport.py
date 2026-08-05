@@ -10,6 +10,9 @@ Nothing in this module does I/O. Filing lives in bugfiler.py.
 from __future__ import annotations
 
 import errno as _errno
+import hashlib
+import traceback
+from pathlib import Path
 
 from .executor import StartFailed
 
@@ -48,3 +51,24 @@ def is_gpuq_fault(exc: BaseException) -> bool:
     if isinstance(exc, StartFailed):
         return getattr(exc, "errno", None) not in _CALLER_EXEC_ERRNOS
     return True
+
+
+def signature(exc: BaseException, phase: str) -> str:
+    """A stable fingerprint: phase, exception type, gpuqueue frame names.
+
+    Function names rather than line numbers, so an unrelated edit above the
+    raise does not make the same bug look new and file a second issue.
+    Frames outside the package are dropped: a caller's stack is not part of
+    gpuq's identity, and including it would give one bug a signature per
+    project on the box.
+    """
+    if phase not in PHASES:
+        raise ValueError(f"unknown phase {phase!r}; expected one of {PHASES}")
+    frames = [f.name for f in traceback.extract_tb(exc.__traceback__)
+              if _is_gpuqueue_frame(f.filename)]
+    payload = "|".join([phase, type(exc).__name__, *frames])
+    return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
+def _is_gpuqueue_frame(filename: str) -> bool:
+    return Path(filename).parent.name == "gpuqueue"
