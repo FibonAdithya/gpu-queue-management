@@ -75,3 +75,25 @@ def test_read_claim_returns_none_on_garbage(tmp_path):
     p = tmp_path / "bad.lock.json"
     p.write_text("{not json")
     assert read_claim(p) is None
+
+
+def test_job_orphaned_when_the_runner_is_gone():
+    """A live job whose runner is dead: nothing enforces its timeout and
+    nothing will collect its result."""
+    from gpuqueue.claim import job_orphaned
+    assert job_orphaned(os.getpid(), 4000000) is True
+
+def test_job_not_orphaned_while_its_runner_lives():
+    from gpuqueue.claim import job_orphaned
+    assert job_orphaned(os.getpid(), os.getpid()) is False
+
+def test_job_not_orphaned_once_it_has_exited():
+    """A dead job is the reaper's business, not an orphan."""
+    from gpuqueue.claim import job_orphaned
+    assert job_orphaned(4000000, 4000001) is False
+
+def test_unknown_owner_is_not_reported_as_orphaned():
+    """A spec written before runner_pid existed cannot be judged; an unknown
+    owner is not evidence of an absent one."""
+    from gpuqueue.claim import job_orphaned
+    assert job_orphaned(os.getpid(), None) is False

@@ -31,6 +31,7 @@ class JobSpec:
     dedupe_key: str | None = None
     submitted_at: str = field(default_factory=utcnow_iso)
     pid: int | None = None
+    runner_pid: int | None = None
     exit_code: int | None = None
     error: str | None = None
 

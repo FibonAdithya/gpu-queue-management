@@ -50,6 +50,29 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def job_orphaned(job_pid: int | None, runner_pid: int | None) -> bool:
+    """True when a job is still running but the runner that started it is gone.
+
+    Jobs run in their own session so the runner can kill a whole process
+    group, which also means they survive a runner that dies abruptly. Such a
+    job keeps running with nobody supervising it: no watchdog enforces its
+    timeout and nothing will collect its result.
+
+    Ownership is the signal, not the parent pid. Reparenting does not reliably
+    land on init — any process marked a subreaper (a user systemd, a container
+    init) adopts it instead, so "PPid is 1" is true on some hosts and false on
+    others for the very same situation.
+
+    A job with no recorded runner cannot be judged, so it is not reported: an
+    unknown owner is not evidence of an absent one.
+    """
+    if not job_pid or not pid_alive(job_pid):
+        return False
+    if runner_pid is None:
+        return False
+    return not pid_alive(runner_pid)
+
+
 def list_claims(directory: Path | None = None) -> list[tuple[Path, dict]]:
     d = Path(directory) if directory else claim_dir()
     if not d.is_dir():

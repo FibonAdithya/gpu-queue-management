@@ -13,6 +13,7 @@ every git call is trivially serialized because there is only one caller.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import time
 from dataclasses import dataclass
@@ -186,6 +187,9 @@ class Runner:
             return False
 
         spec.pid = running.pid
+        # Record the owner too: if this runner dies, a live job with a dead
+        # runner is an orphan nothing is supervising, and `gpuq list` says so.
+        spec.runner_pid = os.getpid()
         self.queue.update(spec)  # the reaper reads this to tell live from dead
         self.active[spec.id] = Active(running=running, project=project,
                                       workdir=workdir, claim_cm=claim_cm)

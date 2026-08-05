@@ -191,8 +191,13 @@ Things that have actually bitten, and what they look like:
 
 ## Boxes
 
-Record deployments here so the next person knows what to expect.
+Record deployments here so the next person knows what to expect. The row below
+is an example of the useful level of detail — replace it with your own.
 
 | Alias | Hardware | Interpreter | Notes |
 |---|---|---|---|
-| `tig-gpu` | RTX 4060, 8 GB | `/venv/main/bin/python` 3.12.13, torch 2.12.0+cu130 | vast.ai unprivileged container, root. `nvidia-smi` enumerates compute apps, so preflight is a real guard. Verified 2026-08-05 |
+| `<your-box>` | e.g. RTX 4060, 8 GB | e.g. `/venv/main/bin/python` 3.12, torch 2.x | Hosted unprivileged container, root. `nvidia-smi` enumerates compute apps, so preflight is a real guard — record this either way, it is the difference between a guard and a warning. Verified `<date>` |
+
+The one field worth being precise about is whether `nvidia-smi` could enumerate
+compute apps, because it varies by image and decides whether preflight actually
+protects you. See [Preflight](#preflight-is-only-as-good-as-nvidia-smi).

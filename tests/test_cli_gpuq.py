@@ -172,3 +172,53 @@ def test_submit_wait_does_both(root, capsys):
                "--id", "j1", "--wait", "--poll", "0.05", "--", "true"])
     t.join()
     assert rc == 0
+
+
+def test_list_flags_an_orphaned_job(root, capsys):
+    """Decision D: surface it, do not act on it."""
+    import os
+    _submit(root)
+    q = QueueRoot(root)
+    spec = q.claim("j1")
+    spec.pid = os.getpid()       # a live "job"
+    spec.runner_pid = 4000000    # whose runner is gone
+    q.update(spec)
+    capsys.readouterr()
+    main(["list", "--json"])
+    row = [r for r in json.loads(capsys.readouterr().out) if r["id"] == "j1"][0]
+    assert row["orphaned"] is True
+
+def test_list_does_not_flag_a_normally_running_job(root, capsys):
+    import os
+    _submit(root)
+    q = QueueRoot(root)
+    spec = q.claim("j1")
+    spec.pid = os.getpid()
+    spec.runner_pid = os.getpid()
+    q.update(spec)
+    capsys.readouterr()
+    main(["list", "--json"])
+    row = [r for r in json.loads(capsys.readouterr().out) if r["id"] == "j1"][0]
+    assert row["orphaned"] is False
+
+def test_show_reports_orphaned(root, capsys):
+    import os
+    _submit(root)
+    q = QueueRoot(root)
+    spec = q.claim("j1")
+    spec.pid, spec.runner_pid = os.getpid(), 4000000
+    q.update(spec)
+    capsys.readouterr()
+    main(["show", "j1"])
+    assert json.loads(capsys.readouterr().out)["orphaned"] is True
+
+def test_plain_list_marks_orphans_visibly(root, capsys):
+    import os
+    _submit(root)
+    q = QueueRoot(root)
+    spec = q.claim("j1")
+    spec.pid, spec.runner_pid = os.getpid(), 4000000
+    q.update(spec)
+    capsys.readouterr()
+    main(["list"])
+    assert "ORPHANED" in capsys.readouterr().out

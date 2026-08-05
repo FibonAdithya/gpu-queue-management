@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .claim import job_orphaned
 from .queue import QueueRoot, STATES
 from .spec import JobSpec, SpecError
 
@@ -97,16 +98,25 @@ def _cmd_wait(args) -> int:
     return wait_for(_queue(args), args.id, args.timeout, args.poll)
 
 
+def _orphaned(state: str, spec: JobSpec) -> bool:
+    """A running job whose runner has died. Nothing enforces its timeout and
+    nothing will collect its result until the process exits on its own."""
+    return state == "running" and job_orphaned(spec.pid, spec.runner_pid)
+
+
 def _cmd_list(args) -> int:
     q = _queue(args)
     states = [args.state] if args.state else list(STATES)
-    rows = [{"state": s, **spec.to_dict()}
+    rows = [{"state": s, "orphaned": _orphaned(s, spec), **spec.to_dict()}
             for s in states for spec in q.list_state(s)]
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
         for r in rows:
-            print(f"{r['state']:<8} {r['lane']:<3} {r['id']:<40} {r['project']}")
+            flag = "  ORPHANED (runner gone; nothing is supervising it)" \
+                if r["orphaned"] else ""
+            print(f"{r['state']:<8} {r['lane']:<3} {r['id']:<40} "
+                  f"{r['project']}{flag}")
     return 0
 
 
@@ -118,7 +128,8 @@ def _cmd_show(args) -> int:
         return 1
     state, spec = found
     out, err = q.log_paths(args.id)
-    print(json.dumps({"state": state, **spec.to_dict(),
+    print(json.dumps({"state": state, "orphaned": _orphaned(state, spec),
+                      **spec.to_dict(),
                       "stdout_log": str(out), "stderr_log": str(err)}, indent=2))
     return 0
 
