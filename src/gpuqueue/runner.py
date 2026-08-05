@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import bugfiler
 from . import git_ops
 from .bugreport import CallerError
 from .claim import gpu_claim, ClaimBusy
@@ -27,7 +28,7 @@ from .executor import (start_job, poll_job, kill_job, JobResult, RunningJob,
                        StartFailed)
 from .gpuid import gpu_key, GpuIdError
 from .preflight import preflight, PreflightFailed
-from .queue import QueueRoot
+from .queue import QueueRoot, STATES
 from .reaper import reap
 from .spec import JobSpec
 
@@ -66,9 +67,42 @@ class Runner:
         self._stopping = True
 
     def tick(self) -> None:
-        self._reap()
-        self.collect()
-        self.admit()
+        self._phase("reap", self._reap)
+        self._phase("execute", self.collect)
+        self._phase("admit", self.admit)
+
+    def _phase(self, phase: str, fn) -> None:
+        """Report an unhandled exception, then let it out.
+
+        Re-raised deliberately: a runner whose reaper is broken should still
+        die and be restarted by supervisor, exactly as before. Reporting is
+        additive, and a filer that changed crash semantics would be a second
+        bug shipped alongside the first.
+        """
+        try:
+            fn()
+        except Exception as e:
+            self._report_bug(e, phase)
+            raise
+
+    def _report_bug(self, exc: BaseException, phase: str,
+                    spec: JobSpec | None = None) -> None:
+        """File a bug against gpuq, and never let that break the queue.
+
+        Every path into bugfiler goes through here. A box with no `gh`, no
+        token or no network must run jobs exactly as it does without
+        autofix; losing a bug report is an acceptable outcome, losing a job
+        is not.
+        """
+        if not self.cfg.autofix.enabled:
+            return
+        try:
+            counts = {s: len(self.queue.list_state(s)) for s in STATES}
+            outcome = bugfiler.file_bug(self.cfg.autofix, exc, phase,
+                                        spec=spec, queue_counts=counts)
+            log.info("autofix (%s): %s", phase, outcome)
+        except Exception as e:
+            log.warning("autofix: could not file a bug for %s: %s", phase, e)
 
     def _reap(self) -> None:
         """Recover abandoned work every tick; sweep the card on a timer.
@@ -173,6 +207,9 @@ class Runner:
         except PreflightFailed as e:
             log.warning("%s waiting: %s", spec.id, e)
             return None
+        except Exception as e:
+            self._report_bug(e, "preflight", spec)
+            raise
         try:
             key = gpu_key()
         except GpuIdError as e:
@@ -192,6 +229,7 @@ class Runner:
         try:
             workdir = self._prepare_workdir(spec, project)  # git, on the loop
         except Exception as e:
+            self._report_bug(e, "checkout", spec)
             self._exit_claim(claim_cm)
             self._fail_running(spec, f"checkout failed: {e}")
             return False
@@ -202,6 +240,7 @@ class Runner:
                 extra_env={"GPUQ_JOB_ID": spec.id,
                            "GPUQ_QUEUE_ROOT": str(self.queue.root)})
         except StartFailed as e:
+            self._report_bug(e, "execute", spec)
             self._exit_claim(claim_cm)
             self._remove_worktree_at(project, workdir)
             self._fail_running(spec, str(e))
@@ -248,6 +287,7 @@ class Runner:
             try:
                 self._collect_artifacts(spec, active.project, active.workdir)
             except Exception as e:
+                self._report_bug(e, "artifacts", spec)
                 ok = False
                 spec.error = str(e)
         if not ok and spec.error is None:

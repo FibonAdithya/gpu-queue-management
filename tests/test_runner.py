@@ -267,3 +267,133 @@ def test_a_missing_artifact_raises_caller_error_not_a_gpuq_bug(env):
             project, r.queue.work_dir("j1"))
     assert "never.json" in str(caught.value)
     assert is_gpuq_fault(caught.value) is False
+
+@pytest.fixture
+def filed(monkeypatch):
+    """Capture what the runner would have filed, without touching GitHub."""
+    calls = []
+
+    def fake(cfg, exc, phase, spec=None, queue_counts=None, now=None):
+        calls.append({"phase": phase, "exc": exc, "spec": spec,
+                      "counts": queue_counts})
+        return "filed"
+
+    monkeypatch.setattr(rn.bugfiler, "file_bug", fake)
+    return calls
+
+
+def _enable(r):
+    from gpuqueue.config import AutofixConfig
+    r.cfg.autofix = AutofixConfig(enabled=True, repo="you/gpuq")
+
+
+def test_a_checkout_failure_files_a_bug(env, filed, monkeypatch):
+    r, sha = env
+    _enable(r)
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: (_ for _ in ()).throw(
+                            rn.git_ops.GitError("worktree add failed")))
+    submit(r, sha, "j1", ["true"])
+    r.admit()
+    assert [c["phase"] for c in filed] == ["checkout"]
+    assert filed[0]["spec"].id == "j1"
+
+
+def test_the_job_still_fails_normally_when_a_bug_is_filed(env, filed,
+                                                          monkeypatch):
+    """Filing is additive. The job's own fate is unchanged."""
+    r, sha = env
+    _enable(r)
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: (_ for _ in ()).throw(
+                            rn.git_ops.GitError("worktree add failed")))
+    submit(r, sha, "j1", ["true"])
+    r.admit()
+    body = json.loads((r.queue.root / "failed" / "j1.json").read_text())
+    assert "checkout failed" in body["error"]
+
+
+def test_a_reap_failure_files_a_bug_and_still_crashes_the_tick(env, filed,
+                                                               monkeypatch):
+    """Reporting must not change what supervisor sees. A broken reaper still
+    takes the runner down and gets restarted; it just leaves evidence now."""
+    r, sha = env
+    _enable(r)
+    monkeypatch.setattr(rn, "reap",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("reaper exploded")))
+    with pytest.raises(RuntimeError, match="reaper exploded"):
+        r.tick()
+    assert [c["phase"] for c in filed] == ["reap"]
+
+
+def test_a_missing_artifact_reaches_the_filer_as_caller_error(env, filed):
+    """Caller fault. file_bug is still called -- it owns the decision, and
+    the runner must not pre-judge -- but it is handed a CallerError, which
+    Task 7 turns into 'caller-fault' and no issue."""
+    from gpuqueue.bugreport import CallerError
+    r, sha = env
+    _enable(r)
+    submit(r, sha, "j1", ["true"], artifacts=["runs/never.json"])
+    drain(r)
+    assert [type(c["exc"]) for c in filed] == [CallerError]
+    assert filed[0]["phase"] == "artifacts"
+
+
+def test_an_ordinary_job_failure_files_nothing(env, filed):
+    """exit N, timeout and OOM never reach the filer at all: they are not
+    exceptions and gpuq's code did not raise."""
+    r, sha = env
+    _enable(r)
+    submit(r, sha, "j1", ["sh", "-c", "echo bad >&2; exit 4"])
+    drain(r)
+    assert filed == []
+
+
+def test_a_timeout_files_nothing(env, filed):
+    r, sha = env
+    _enable(r)
+    submit(r, sha, "j1", ["sleep", "30"], timeout_s=1)
+    drain(r, limit=60)
+    assert filed == []
+
+
+def test_an_unstartable_command_reaches_the_filer_as_start_failed(env, filed):
+    """The filer classifies it out by errno; the runner does not pre-judge."""
+    from gpuqueue.executor import StartFailed
+    r, sha = env
+    _enable(r)
+    submit(r, sha, "j1", ["definitely-not-a-real-binary"])
+    drain(r)
+    assert [type(c["exc"]) for c in filed] == [StartFailed]
+    assert filed[0]["phase"] == "execute"
+
+
+def test_the_report_carries_the_queue_counts(env, filed, monkeypatch):
+    r, sha = env
+    _enable(r)
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: (_ for _ in ()).throw(
+                            rn.git_ops.GitError("nope")))
+    submit(r, sha, "j1", ["true"])
+    r.admit()
+    assert set(filed[0]["counts"]) == {"pending", "running", "done", "failed"}
+
+
+def test_a_broken_filer_never_breaks_the_queue(env, monkeypatch):
+    """The whole point. gh missing, token wrong, GitHub down -- jobs run."""
+    r, sha = env
+    _enable(r)
+    monkeypatch.setattr(rn.bugfiler, "file_bug",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            rn.bugfiler.GhError("gh is not installed")))
+    submit(r, sha, "j1", ["true"], artifacts=["runs/never.json"])
+    drain(r)
+    assert (r.queue.root / "failed" / "j1.json").exists()
+
+
+def test_filing_is_skipped_entirely_when_autofix_is_off(env, filed):
+    r, sha = env  # autofix left at its default, disabled
+    submit(r, sha, "j1", ["true"], artifacts=["runs/never.json"])
+    drain(r)
+    assert filed == []
