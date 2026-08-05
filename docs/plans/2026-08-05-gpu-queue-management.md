@@ -19,6 +19,7 @@
 - **Jobs never invoke git.** Every git subprocess call lives in `git_ops.py` and is made by the runner's `tick()`, between the poll of one job and the start of the next. A job's own `cmd` running git against a checkout it does not own is out of the runner's control, but nothing in this package may do it.
 - **The lock file format is a pinned protocol**, not an implementation detail: lock path `$GPU_CLAIM_DIR/<normalized-uuid>.lock`, claim JSON alongside it with the keys `pid`, `owner`, `cmd`, `started_at`, `key`. A second implementation on the same box must interoperate, so changing any of these is a version bump documented in `docs/design.md`, not a refactor.
 - **All timestamps are UTC ISO-8601** with a `Z` suffix, e.g. `2026-08-05T12:00:00Z`.
+- **Every CLI module ends with a `__main__` guard.** Without it `python -m gpuqueue.cli_runner` loads the module, calls nothing and exits 0 — while the installed console script works fine. A daemon that silently does nothing when started one of the two obvious ways is the kind of bug that costs an hour at 2am.
 - **Per-job VRAM/memory limits are OUT OF SCOPE** for this plan, by explicit decision on 2026-08-05. The GPU lane is one slot; a job that holds the card holds all of it. Do not add a `vram_mb` field, a packing scheduler, or `PYTORCH_CUDA_ALLOC_CONF` manipulation. A later phase will revisit it.
 
 ## Design gaps resolved by this plan
@@ -2905,13 +2906,27 @@ class Runner:
         the runner died.
         """
         for job_id, active in list(self.active.items()):
-            kill_job(active.running)
-            self._release_card(active)
-            self._remove_worktree(active)
-            spec = active.running.spec
-            spec.pid = None
-            self.queue.update(spec)
             self.active.pop(job_id, None)
+            # Each step is guarded separately. The queue is meant to be
+            # repairable with mv, so a spec file may have moved out from
+            # under us — and one job's problem must never strand another
+            # job's hold on the card.
+            try:
+                kill_job(active.running)
+            except Exception as e:
+                log.warning("shutdown: could not kill %s: %s", job_id, e)
+            try:
+                self._release_card(active)
+            except Exception as e:
+                log.error("shutdown: could not release the card after %s: %s",
+                          job_id, e)
+            try:
+                self._remove_worktree(active)
+                spec = active.running.spec
+                spec.pid = None
+                self.queue.update(spec)
+            except Exception as e:
+                log.warning("shutdown: could not record %s: %s", job_id, e)
             log.info("stopped %s for shutdown; left for the reaper", job_id)
 
     # --- admission ----------------------------------------------------
@@ -3806,6 +3821,11 @@ git commit -m "feat: gpuq wait, and a skill telling agents to queue their work"
 - `test_dedupe_prints_existing_id_for_pending` in Task 3 relies on generated ids; if it proves brittle, pass explicit `--id j1` / `--id j2` and assert the printed value equals `j1` both times.
 - Task 12's `test_a_busy_card_leaves_the_job_pending_not_failed` takes the lock from the test process itself. `flock` is per-open-file-description, not per-process, so this genuinely excludes — but if it ever passes vacuously, promote it to the subprocess form used in `tests/test_claim.py`.
 - A held GPU claim is entered and exited by hand (`cm.__enter__()` / `cm.__exit__()`), because the claim outlives the function that takes it. Every path that abandons a job — busy card, failed checkout, unstartable command, shutdown — must go through `_exit_claim`, or the card stays locked by a runner that is no longer using it.
+
+**Found by running it, not by testing it** (both now covered by tests):
+- No CLI module had a `__main__` guard; `python -m gpuqueue.cli_runner` was a silent no-op.
+- `Runner.shutdown()` crashed on a job whose spec file had moved, abandoning the rest of the loop — including the card release. The queue is advertised as repairable with `mv`, so that is a supported scenario. Each step is guarded separately now.
+- `bootstrap.sh` used bare `python`, and aborted the whole run when a placeholder project would not clone.
 
 **Rejected alternatives, so they are not re-proposed:**
 - *A thread per job.* Obvious, and wrong here: it puts a worker and the loop on the same queue files, lane counters and `JobSpec` objects, then needs a lock around each and a handshake so the pid lands before the reaper looks. `Popen` already provides the concurrency; polling it costs one `tick()`.
