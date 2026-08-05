@@ -4,27 +4,32 @@
 
 **Goal:** Build the four components in `docs/design.md` — `gpu-claim`, `gpuq`, `gpuq-runner`, `bootstrap.sh` — so a shared single-GPU box serializes GPU work behind an advisory lock and runs queued jobs without anyone holding an ssh session.
 
-**Architecture:** One Python package, `gpuqueue`, exposing three console scripts. State lives in a directory tree; transitions are `os.rename` within one filesystem. The GPU lock is `flock` on a file named by the normalized GPU UUID. The runner is a single process: a main loop that admits jobs, performs *all* git operations, and reaps; plus worker threads that only `subprocess` and write files.
+**Architecture:** One Python package, `gpuqueue`, exposing three console scripts. State lives in a directory tree; transitions are `os.rename` within one filesystem. The GPU lock is `flock` on a file named by the normalized GPU UUID. The runner is a **single-threaded** process: one `tick()` starts subprocesses, polls the ones already running, performs *all* git operations, and reaps. Jobs run concurrently because they are separate *processes*, not because the runner has threads.
 
-**Tech Stack:** Python 3.10+, stdlib only at runtime (`tomli` backport on <3.11), `pytest` for tests, `flock(2)` via `fcntl`, `nvidia-smi` and optionally `torch` for GPU identity, supervisor for process management.
+**Tech Stack:** Python 3.11+, standard library only at runtime (`fcntl`, `subprocess`, `tomllib`, `json`, `pathlib`), `pytest` for tests, `nvidia-smi` for GPU identity, supervisor for process management.
 
 ## Global Constraints
 
-- **Python 3.10+.** Use `tomllib` on 3.11+, `tomli` on 3.10. No other runtime dependency.
-- **No runtime dependency on `torch`.** `torch` is used for GPU identity *when importable*; `nvidia-smi` is the fallback. The runner must work in an environment without torch.
+- **Python 3.11+, standard library only at runtime.** 3.11 is the floor because `tomllib` arrives there; a `tomli` backport would be a dependency, and this package installs onto boxes with arbitrary ML stacks where any dependency is a chance to conflict with theirs. `pytest` as a test-only extra is fine.
+- **Never import `torch`.** Not even guarded, not even for GPU identity. A JAX or TensorFlow project must be able to use this lock, and importing torch inside the runner daemon costs seconds and initializes a CUDA context in the one process that should never touch the card. GPU identity comes from `nvidia-smi`. `normalize_gpu_uuid` still exists — see "Design gaps resolved", gap 2 — precisely because *other* implementations of the protocol will use torch.
+- **The runner has no threads.** No `threading`, no `concurrent.futures`, no locks. `tick()` is one non-blocking pass and is the entire concurrency story; if a change seems to need a worker thread, it needs a redesign instead. Shared mutable state between a worker and the main loop is the failure mode this rules out by construction.
+- **Every test must pass without a GPU.** CI and dev machines have none. `nvidia-smi` is shelled out through one seam per module (`_run`) that tests monkeypatch. A test requiring real CUDA is a broken test.
 - **Unprivileged container.** No root, no Docker, no kernel modules, no sysctls. Never write outside `$QUEUE_ROOT`, `$GPU_CLAIM_DIR`, and configured checkouts.
 - **Queue root is one filesystem.** `os.rename` is only atomic within a filesystem; the code must never rename across `$QUEUE_ROOT` and anywhere else.
-- **Workers never invoke git.** Every git subprocess call lives in `git_ops.py` and is called only from the runner's main loop thread. A worker thread calling into `git_ops` is a bug.
+- **Jobs never invoke git.** Every git subprocess call lives in `git_ops.py` and is made by the runner's `tick()`, between the poll of one job and the start of the next. A job's own `cmd` running git against a checkout it does not own is out of the runner's control, but nothing in this package may do it.
+- **The lock file format is a pinned protocol**, not an implementation detail: lock path `$GPU_CLAIM_DIR/<normalized-uuid>.lock`, claim JSON alongside it with the keys `pid`, `owner`, `cmd`, `started_at`, `key`. A second implementation on the same box must interoperate, so changing any of these is a version bump documented in `docs/design.md`, not a refactor.
 - **All timestamps are UTC ISO-8601** with a `Z` suffix, e.g. `2026-08-05T12:00:00Z`.
 - **Per-job VRAM/memory limits are OUT OF SCOPE** for this plan, by explicit decision on 2026-08-05. The GPU lane is one slot; a job that holds the card holds all of it. Do not add a `vram_mb` field, a packing scheduler, or `PYTORCH_CUDA_ALLOC_CONF` manipulation. A later phase will revisit it.
 
 ## Design gaps resolved by this plan
 
-Two things `docs/design.md` does not settle. Both are decided here; if you disagree, raise it before implementing rather than improvising.
+Three things `docs/design.md` does not settle. All are decided here; if you disagree, raise it before implementing rather than improvising.
 
-**1. Concurrent jobs at different pinned commits.** The design gives each project one checkout and pins `commit` per job. Two concurrent CPU jobs at different commits cannot share one working tree. **Resolution:** the main loop creates a per-job detached `git worktree` at the pinned commit under `$QUEUE_ROOT/work/<id>`, and removes it after artifacts are collected. The long-lived checkout remains the only place commits are made. Git stays main-loop-only and serialized.
+**1. Concurrent jobs at different pinned commits.** The design gives each project one checkout and pins `commit` per job. Two concurrent CPU jobs at different commits cannot share one working tree — the second job's checkout rewrites the tree under the first one's feet, mid-run. **Resolution:** `tick()` creates a per-job detached `git worktree` at the pinned commit under `$QUEUE_ROOT/work/<id>`, and removes it after artifacts are collected. The long-lived checkout remains the only place commits are made. Git stays serialized because only `tick()` calls it.
 
-**2. GPU UUID normalization.** `torch.cuda.get_device_properties(d).uuid` returns a `uuid.UUID` whose `str()` is bare hyphenated hex. `nvidia-smi --query-gpu=uuid` returns `GPU-<same hex>`. Two producers, two different lock filenames, one physical card — the precise failure UUID-keying exists to prevent. **Resolution:** `normalize_gpu_uuid()` strips a leading `GPU-`/`MIG-`, lowercases, and keeps only `[0-9a-f-]`. Every producer goes through it. Task 4 tests both spellings collapse to one key.
+**2. GPU UUID normalization.** This package derives identity from `nvidia-smi --query-gpu=uuid`, which returns `GPU-<hex>`. But the design names `torch.cuda.get_device_properties(d).uuid` as the key derivation, and that returns a `uuid.UUID` whose `str()` is bare hyphenated hex. A torch-based producer and this one would take *different lock files for the same physical card* — the precise failure UUID-keying exists to prevent. **Resolution:** `normalize_gpu_uuid()` strips a leading `GPU-`/`MIG-`, lowercases, and strips surrounding whitespace; every producer goes through it before the filename is formed, and the normalized form is what the pinned protocol specifies. Task 4 tests that both spellings collapse to one key. This is the one place where not importing torch still obliges us to care what torch emits.
+
+**3. Concurrency without threads.** Several jobs must run at once, and the obvious shape — a thread per job — puts a worker and the main loop on the same queue files, the same lane counters and the same `JobSpec` objects, with a lock around each. **Resolution:** the runner is single-threaded. `subprocess.Popen` already gives concurrency; `tick()` starts what the lanes allow, polls what is already running, and settles what has finished. Nothing is shared because nothing is concurrent inside the process. The GPU claim is entered non-blocking in `tick()` and held across ticks (`cm.__enter__()` / `cm.__exit__()` by hand) rather than wrapped around a blocking `wait()` — a `wait=True` claim in a single-threaded loop would deadlock the whole runner behind one card.
 
 ---
 
@@ -39,10 +44,10 @@ src/gpuqueue/gpuid.py           GPU identity: derivation + normalization
 src/gpuqueue/claim.py           flock acquire/release, claim file read/write
 src/gpuqueue/preflight.py       foreign CUDA process detection
 src/gpuqueue/config.py          TOML config: QueueConfig, ProjectConfig
-src/gpuqueue/git_ops.py         clone, worktree add/remove, commit artifacts (main loop only)
-src/gpuqueue/executor.py        run one job spec as a subprocess with timeout
+src/gpuqueue/git_ops.py         clone, worktree add/remove, commit artifacts (runner loop only)
+src/gpuqueue/executor.py        start / poll / kill one job's subprocess, with the watchdog
 src/gpuqueue/reaper.py          dead claims, orphan CUDA procs, .part files, requeue-once
-src/gpuqueue/runner.py          main loop, lane admission, completion drain
+src/gpuqueue/runner.py          the single-threaded tick: reap, collect, admit
 src/gpuqueue/cli_claim.py       `gpu-claim` entry point
 src/gpuqueue/cli_gpuq.py        `gpuq` entry point
 src/gpuqueue/cli_runner.py      `gpuq-runner` entry point
@@ -51,7 +56,7 @@ bootstrap.sh                    bare box -> running runner, idempotent
 tests/…                         one test module per source module
 ```
 
-Each module has one responsibility and no upward dependencies: `spec` and `gpuid` depend on nothing; `queue`, `claim`, `preflight` depend on those; `runner` depends on everything and is depended on by nothing but its CLI.
+Each module has one responsibility and no upward dependencies: `spec` and `gpuid` depend on nothing; `queue`, `claim`, `preflight` depend on those; `runner` depends on everything and is depended on by nothing but its CLI. `git_ops` is imported by `runner` alone, which is what makes "only the loop runs git" checkable by reading the import graph rather than by trusting a comment.
 
 ---
 
@@ -144,8 +149,11 @@ build-backend = "setuptools.build_meta"
 name = "gpu-queue-management"
 version = "0.1.0"
 description = "Host-level GPU arbitration and job queueing for shared single-GPU boxes"
-requires-python = ">=3.10"
-dependencies = ["tomli>=2.0; python_version < '3.11'"]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
 
 [project.scripts]
 gpu-claim = "gpuqueue.cli_claim:main"
@@ -255,7 +263,7 @@ git commit -m "feat: package scaffold and JobSpec with validation"
 
 **Interfaces:**
 - Consumes: `JobSpec`, `SpecError`, `utcnow_iso` from `gpuqueue.spec`.
-- Produces: `QueueRoot(root: Path)` with `ensure_dirs() -> None`, `submit(spec: JobSpec) -> str` (returns the id actually queued — an existing id if deduped), `claim(job_id: str) -> JobSpec | None` (atomic pending→running; `None` if someone else won), `finish(spec: JobSpec, ok: bool) -> None` (running→done/failed), `requeue(spec: JobSpec) -> None` (running→pending, `attempts += 1`), `list_state(state: str) -> list[JobSpec]`, `find(job_id: str) -> tuple[str, JobSpec] | None`, `cancel(job_id: str) -> bool`, `path_for(state, job_id) -> Path`, `log_paths(job_id) -> tuple[Path, Path]`, `work_dir(job_id) -> Path`. Constant `STATES = ("pending", "running", "done", "failed")`.
+- Produces: `QueueRoot(root: Path)` with `ensure_dirs() -> None`, `submit(spec: JobSpec) -> str` (returns the id actually queued — an existing id if deduped), `claim(job_id: str) -> JobSpec | None` (atomic pending→running; `None` if someone else won), `update(spec: JobSpec, state: str = "running") -> None` (rewrite a spec in place, atomically), `finish(spec: JobSpec, ok: bool) -> None` (running→done/failed), `requeue(spec: JobSpec) -> None` (running→pending, `attempts += 1`), `list_state(state: str) -> list[JobSpec]`, `find(job_id: str) -> tuple[str, JobSpec] | None`, `cancel(job_id: str) -> bool`, `path_for(state, job_id) -> Path`, `log_paths(job_id) -> tuple[Path, Path]`, `work_dir(job_id) -> Path`. Constant `STATES = ("pending", "running", "done", "failed")`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -316,6 +324,14 @@ def test_finish_not_ok_moves_to_failed_and_keeps_error(q):
     q.finish(spec, ok=False)
     body = json.loads((q.root / "failed" / "j1.json").read_text())
     assert body["error"] == "boom"
+
+def test_update_rewrites_in_place_without_changing_state(q):
+    q.submit(mkspec())
+    spec = q.claim("j1")
+    spec.pid = 4242
+    q.update(spec)
+    assert json.loads((q.root / "running" / "j1.json").read_text())["pid"] == 4242
+    assert q.find("j1")[0] == "running"
 
 def test_requeue_increments_attempts(q):
     q.submit(mkspec())
@@ -468,6 +484,11 @@ class QueueRoot:
             return None
         return self._read(dst)
 
+    def update(self, spec: JobSpec, state: str = "running") -> None:
+        """Rewrite a spec where it already is. The runner records a pid this
+        way, so the reaper can tell a live job from an abandoned one."""
+        self._write(self.path_for(state, spec.id), spec)
+
     def finish(self, spec: JobSpec, ok: bool) -> None:
         state = "done" if ok else "failed"
         self._write(self.path_for("running", spec.id), spec)
@@ -523,7 +544,7 @@ class QueueRoot:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pytest tests/test_queue.py -v`
-Expected: 15 passed
+Expected: 16 passed
 
 - [ ] **Step 5: Commit**
 
@@ -802,7 +823,9 @@ git commit -m "feat: gpuq submit/list/show/cancel"
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `normalize_gpu_uuid(raw: str) -> str`, `gpu_uuid_from_torch(index: int = 0) -> str | None`, `gpu_uuid_from_nvidia_smi(index: int = 0) -> str | None`, `gpu_key(index: int = 0) -> str` (torch, then nvidia-smi, then `name-index` fallback; raises `GpuIdError` if none work), `lock_filename(key: str) -> str`. Exception `GpuIdError(RuntimeError)`.
+- Produces: `normalize_gpu_uuid(raw: str) -> str`, `gpu_uuid_from_nvidia_smi(index: int = 0) -> str | None`, `gpu_name_index_fallback(index: int = 0) -> str | None`, `gpu_key(index: int = 0) -> str` (uuid, then `name-index` fallback; raises `GpuIdError` if neither works), `lock_filename(key: str) -> str`. Exception `GpuIdError(RuntimeError)`.
+
+No `gpu_uuid_from_torch`. The design names torch as the key derivation, and that remains true of the *protocol* — see design gap 2 — but this implementation reads `nvidia-smi` only. `normalize_gpu_uuid` is what makes the two agree.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -827,23 +850,27 @@ def test_normalize_rejects_empty():
     with pytest.raises(GpuIdError):
         normalize_gpu_uuid("   ")
 
-def test_gpu_key_prefers_torch(monkeypatch):
-    monkeypatch.setattr(gpuid, "gpu_uuid_from_torch", lambda i=0: HEX)
-    monkeypatch.setattr(gpuid, "gpu_uuid_from_nvidia_smi",
-                        lambda i=0: "ffffffff-0000-0000-0000-000000000002")
-    assert gpu_key() == HEX
-
-def test_gpu_key_falls_back_to_nvidia_smi(monkeypatch):
-    monkeypatch.setattr(gpuid, "gpu_uuid_from_torch", lambda i=0: None)
+def test_gpu_key_normalizes_the_smi_spelling(monkeypatch):
     monkeypatch.setattr(gpuid, "gpu_uuid_from_nvidia_smi", lambda i=0: f"GPU-{HEX}")
     assert gpu_key() == HEX
 
+def test_gpu_key_falls_back_to_name_index(monkeypatch):
+    monkeypatch.setattr(gpuid, "gpu_uuid_from_nvidia_smi", lambda i=0: None)
+    monkeypatch.setattr(gpuid, "gpu_name_index_fallback",
+                        lambda i=0: "NVIDIA GeForce RTX 4060-0")
+    assert gpu_key() == "nvidia geforce rtx 4060-0"
+
 def test_gpu_key_raises_when_no_source_works(monkeypatch):
-    monkeypatch.setattr(gpuid, "gpu_uuid_from_torch", lambda i=0: None)
     monkeypatch.setattr(gpuid, "gpu_uuid_from_nvidia_smi", lambda i=0: None)
     monkeypatch.setattr(gpuid, "gpu_name_index_fallback", lambda i=0: None)
     with pytest.raises(GpuIdError):
         gpu_key()
+
+def test_module_never_imports_torch():
+    """A JAX project must be able to use this lock, and the runner daemon
+    must not initialize a CUDA context just to read an identifier."""
+    import inspect
+    assert "import torch" not in inspect.getsource(gpuid)
 
 def test_lock_filename_is_a_safe_basename():
     name = lock_filename(HEX)
@@ -880,9 +907,15 @@ processes with different CUDA_VISIBLE_DEVICES mappings both see their card
 as index 0, so an index-keyed lock hands them different locks for the same
 physical GPU.
 
-Normalization is load-bearing for the same reason one level down. torch
-reports a bare hyphenated hex UUID; nvidia-smi reports the same value with
-a "GPU-" prefix. Unnormalized, those are two lock files for one card.
+Normalization is load-bearing for the same reason one level down. We read
+nvidia-smi, which reports "GPU-<hex>"; a torch-based implementation of the
+same protocol reports the bare hex. Unnormalized, those are two lock files
+for one card.
+
+torch is deliberately never imported here. A JAX project must be able to
+use this lock, and importing torch in the runner daemon costs seconds and
+initializes a CUDA context in the one process that should never touch the
+card.
 """
 from __future__ import annotations
 
@@ -911,18 +944,6 @@ def _run(argv: list[str]) -> str:
                           text=True, timeout=15).stdout
 
 
-def gpu_uuid_from_torch(index: int = 0) -> str | None:
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return None
-        props = torch.cuda.get_device_properties(index)
-        uuid = getattr(props, "uuid", None)
-        return str(uuid) if uuid is not None else None
-    except Exception:
-        return None
-
-
 def gpu_uuid_from_nvidia_smi(index: int = 0) -> str | None:
     try:
         out = _run(["nvidia-smi", "--query-gpu=uuid",
@@ -934,32 +955,28 @@ def gpu_uuid_from_nvidia_smi(index: int = 0) -> str | None:
 
 
 def gpu_name_index_fallback(index: int = 0) -> str | None:
-    """Design-specified fallback for builds whose torch lacks .uuid."""
-    try:
-        import torch
-        name = torch.cuda.get_device_properties(index).name
-        return f"{name}-{index}"
-    except Exception:
-        pass
+    """Design-specified fallback for drivers that report no UUID.
+
+    Weaker than a UUID — it cannot survive a CUDA_VISIBLE_DEVICES remap —
+    but a degraded key shared by everyone on the box still serializes the
+    card, and refusing to run is worse.
+    """
     try:
         out = _run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
-        lines = [l.strip() for l in out.splitlines() if l.strip()]
-        return f"{lines[index]}-{index}" if index < len(lines) else None
     except Exception:
         return None
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    return f"{lines[index]}-{index}" if index < len(lines) else None
 
 
 def gpu_key(index: int = 0) -> str:
-    for source in (gpu_uuid_from_torch, gpu_uuid_from_nvidia_smi):
+    for source in (gpu_uuid_from_nvidia_smi, gpu_name_index_fallback):
         raw = source(index)
         if raw:
             return normalize_gpu_uuid(raw)
-    raw = gpu_name_index_fallback(index)
-    if raw:
-        return normalize_gpu_uuid(raw)
     raise GpuIdError(
-        "cannot derive a GPU key: torch reports no CUDA device and "
-        "nvidia-smi is unavailable"
+        "cannot derive a GPU key: nvidia-smi reports neither a uuid nor a "
+        "device name. Is a GPU visible in this container?"
     )
 
 
@@ -970,7 +987,7 @@ def lock_filename(key: str) -> str:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pytest tests/test_gpuid.py -v`
-Expected: 11 passed
+Expected: 12 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1579,7 +1596,7 @@ Expected: 9 passed
 
 - [ ] **Step 5: Manually verify on a box with a GPU**
 
-Run: `gpu-claim -- python -c "import torch; print(torch.cuda.is_available())"`, and in a second shell while it runs: `gpu-claim --status` and `gpu-claim -- true` (expect exit 75).
+Run: `gpu-claim -- sh -c 'nvidia-smi -L; sleep 30'`, and in a second shell while it runs: `gpu-claim --status` and `gpu-claim -- true` (expect exit 75).
 Expected: first prints `True`; `--status` shows one claim; second returns 75 naming the holder's pid.
 
 - [ ] **Step 6: Commit**
@@ -1683,10 +1700,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib
+import tomllib  # stdlib from 3.11, which is why 3.11 is the floor
 
 
 class ConfigError(ValueError):
@@ -1789,7 +1803,7 @@ git commit -m "feat: TOML runner configuration with shipped example"
 
 ---
 
-### Task 9: Git operations (main-loop only)
+### Task 9: Git operations (runner-loop only)
 
 **Files:**
 - Create: `src/gpuqueue/git_ops.py`
@@ -1799,7 +1813,7 @@ git commit -m "feat: TOML runner configuration with shipped example"
 - Consumes: `ProjectConfig`.
 - Produces: `git(args: list[str], cwd: Path | None = None, check: bool = True) -> str`, `ensure_checkout(project: ProjectConfig) -> Path`, `add_worktree(checkout: Path, dest: Path, commit: str) -> Path`, `remove_worktree(checkout: Path, dest: Path) -> None`, `commit_artifacts(project, branch, files: list[Path], rel_paths: list[str], message: str) -> str | None` (returns the new commit sha, or `None` if nothing changed). Exception `GitError(RuntimeError)`.
 
-**Every function here runs on the runner's main loop thread only.** Concurrent CPU jobs committing into one checkout would corrupt the index; serialization is by construction, not by discipline.
+**Every function here is called from `Runner.tick()` and nowhere else.** Concurrent jobs committing into one checkout would corrupt the index. Because the runner is single-threaded, there is exactly one caller and serialization is a property of the design rather than a rule someone has to remember.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1910,11 +1924,11 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'gpuqueue.git_ops'`
 
 ```python
 # src/gpuqueue/git_ops.py
-"""All git. Called only from the runner's main loop thread.
+"""All git. Called only from Runner.tick().
 
-Workers write artifacts to disk; the main loop moves them into the
-checkout and commits between polls. Repository mutation is serialized by
-construction rather than by discipline.
+Jobs write artifacts into their own worktree; the loop moves them into the
+checkout and commits between polls. The runner has one thread, so there is
+one caller here and repository mutation is serialized by construction.
 """
 from __future__ import annotations
 
@@ -2001,7 +2015,7 @@ git commit -m "feat: git operations with per-job worktrees at pinned commits"
 
 ---
 
-### Task 10: Executor — run one job
+### Task 10: Executor — start, poll and kill one job
 
 **Files:**
 - Create: `src/gpuqueue/executor.py`
@@ -2009,16 +2023,26 @@ git commit -m "feat: git operations with per-job worktrees at pinned commits"
 
 **Interfaces:**
 - Consumes: `JobSpec`, `ProjectConfig`.
-- Produces: dataclass `JobResult(exit_code: int, timed_out: bool, oom: bool, stderr_tail: str, pid: int | None)` and `run_job(spec, workdir: Path, out_log: Path, err_log: Path, project: ProjectConfig | None = None, on_start: callable | None = None, extra_env: dict | None = None) -> JobResult`. Constant `STDERR_TAIL_BYTES = 4000`. Helper `looks_like_oom(text: str) -> bool`.
+- Produces:
+  - dataclass `RunningJob(spec, proc, out_log, err_log, out_fh, err_fh, deadline: float)` with property `pid`.
+  - dataclass `JobResult(exit_code: int, timed_out: bool, oom: bool, stderr_tail: str)`.
+  - `start_job(spec, workdir: Path, out_log: Path, err_log: Path, project: ProjectConfig | None = None, extra_env: dict | None = None) -> RunningJob`, raising `StartFailed` when the binary cannot be executed.
+  - `poll_job(running: RunningJob) -> JobResult | None` — `None` while it is still running; kills the process group and returns a `timed_out` result once the deadline passes.
+  - `kill_job(running: RunningJob) -> JobResult` — for runner shutdown.
+  - Constant `STDERR_TAIL_BYTES = 4000`; helper `looks_like_oom(text: str) -> bool`; exception `StartFailed(RuntimeError)`.
+
+The split into start/poll is what lets the runner be single-threaded. A blocking `run_job(...)` forces a thread per job; `poll_job` returning `None` lets one loop supervise every job at once. The wall-clock watchdog lives here, in `poll_job`, because that is the only place that knows the deadline and holds the handle needed to kill the group.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 # tests/test_executor.py
 import os
+import time
 from pathlib import Path
 import pytest
-from gpuqueue.executor import run_job, looks_like_oom, STDERR_TAIL_BYTES
+from gpuqueue.executor import (start_job, poll_job, kill_job, looks_like_oom,
+                               StartFailed, STDERR_TAIL_BYTES)
 from gpuqueue.spec import JobSpec
 
 def mkspec(cmd, timeout_s=30, **over):
@@ -2030,27 +2054,53 @@ def mkspec(cmd, timeout_s=30, **over):
 def _logs(tmp_path):
     return tmp_path / "j1.out", tmp_path / "j1.err"
 
+def finish(running, limit=30.0):
+    """Poll to completion the way the runner's tick loop would."""
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        result = poll_job(running)
+        if result is not None:
+            return result
+        time.sleep(0.02)
+    raise AssertionError("job did not finish")
+
 def test_success_returns_zero_and_captures_stdout(tmp_path):
     out, err = _logs(tmp_path)
-    r = run_job(mkspec(["sh", "-c", "echo hello"]), tmp_path, out, err)
+    r = finish(start_job(mkspec(["sh", "-c", "echo hello"]), tmp_path, out, err))
     assert r.exit_code == 0 and r.timed_out is False
     assert out.read_text().strip() == "hello"
 
+def test_poll_returns_none_while_running(tmp_path):
+    out, err = _logs(tmp_path)
+    running = start_job(mkspec(["sleep", "5"]), tmp_path, out, err)
+    assert poll_job(running) is None
+    kill_job(running)
+
+def test_start_reports_the_pid_immediately(tmp_path):
+    """The runner writes this into running/<id>.json before the next tick,
+    so the reaper can tell a live job from an abandoned one."""
+    out, err = _logs(tmp_path)
+    running = start_job(mkspec(["sleep", "5"]), tmp_path, out, err)
+    assert running.pid > 0
+    kill_job(running)
+
 def test_failure_captures_stderr_tail(tmp_path):
     out, err = _logs(tmp_path)
-    r = run_job(mkspec(["sh", "-c", "echo boom >&2; exit 7"]), tmp_path, out, err)
+    r = finish(start_job(mkspec(["sh", "-c", "echo boom >&2; exit 7"]),
+                         tmp_path, out, err))
     assert r.exit_code == 7
     assert "boom" in r.stderr_tail
 
 def test_stderr_tail_is_bounded(tmp_path):
     out, err = _logs(tmp_path)
-    r = run_job(mkspec(["sh", "-c", "head -c 100000 /dev/zero | tr '\\0' 'x' >&2; exit 1"]),
-                tmp_path, out, err)
+    r = finish(start_job(
+        mkspec(["sh", "-c", "head -c 100000 /dev/zero | tr '\\0' 'x' >&2; exit 1"]),
+        tmp_path, out, err))
     assert len(r.stderr_tail) <= STDERR_TAIL_BYTES
 
 def test_timeout_kills_and_flags(tmp_path):
     out, err = _logs(tmp_path)
-    r = run_job(mkspec(["sleep", "30"], timeout_s=1), tmp_path, out, err)
+    r = finish(start_job(mkspec(["sleep", "30"], timeout_s=1), tmp_path, out, err))
     assert r.timed_out is True and r.exit_code != 0
 
 def test_timeout_kills_the_whole_process_group(tmp_path):
@@ -2059,30 +2109,32 @@ def test_timeout_kills_the_whole_process_group(tmp_path):
     out, err = _logs(tmp_path)
     marker = tmp_path / "child.pid"
     cmd = ["sh", "-c", f"sleep 30 & echo $! > {marker}; sleep 30"]
-    r = run_job(mkspec(cmd, timeout_s=1), tmp_path, out, err)
+    r = finish(start_job(mkspec(cmd, timeout_s=1), tmp_path, out, err))
     assert r.timed_out is True
     child = int(marker.read_text().strip())
     with pytest.raises(OSError):
         os.kill(child, 0)
+
+def test_kill_job_terminates_a_live_job(tmp_path):
+    """Runner shutdown must not leave a job holding the card."""
+    out, err = _logs(tmp_path)
+    running = start_job(mkspec(["sleep", "30"]), tmp_path, out, err)
+    r = kill_job(running)
+    assert r.exit_code != 0
+    assert running.proc.poll() is not None
 
 def test_runs_in_the_given_workdir(tmp_path):
     out, err = _logs(tmp_path)
     work = tmp_path / "work"
     work.mkdir()
     (work / "here.txt").write_text("x")
-    run_job(mkspec(["sh", "-c", "ls"]), work, out, err)
+    finish(start_job(mkspec(["sh", "-c", "ls"]), work, out, err))
     assert "here.txt" in out.read_text()
-
-def test_on_start_receives_pid(tmp_path):
-    out, err = _logs(tmp_path)
-    seen = []
-    run_job(mkspec(["true"]), tmp_path, out, err, on_start=seen.append)
-    assert seen and seen[0] > 0
 
 def test_extra_env_is_passed(tmp_path):
     out, err = _logs(tmp_path)
-    run_job(mkspec(["sh", "-c", "echo $GPUQ_JOB_ID"]), tmp_path, out, err,
-            extra_env={"GPUQ_JOB_ID": "j1"})
+    finish(start_job(mkspec(["sh", "-c", "echo $GPUQ_JOB_ID"]), tmp_path, out, err,
+                     extra_env={"GPUQ_JOB_ID": "j1"}))
     assert out.read_text().strip() == "j1"
 
 def test_venv_bin_is_prepended_to_path(tmp_path):
@@ -2091,14 +2143,14 @@ def test_venv_bin_is_prepended_to_path(tmp_path):
     (venv / "bin").mkdir(parents=True)
     out, err = _logs(tmp_path)
     proj = ProjectConfig(name="p", remote="r", checkout=tmp_path, venv=venv)
-    run_job(mkspec(["sh", "-c", "echo $PATH"]), tmp_path, out, err, project=proj)
+    finish(start_job(mkspec(["sh", "-c", "echo $PATH"]), tmp_path, out, err,
+                     project=proj))
     assert out.read_text().startswith(str(venv / "bin"))
 
-def test_missing_executable_is_a_failure_not_a_crash(tmp_path):
+def test_missing_executable_raises_start_failed_naming_the_binary(tmp_path):
     out, err = _logs(tmp_path)
-    r = run_job(mkspec(["definitely-not-a-real-binary"]), tmp_path, out, err)
-    assert r.exit_code != 0
-    assert "definitely-not-a-real-binary" in r.stderr_tail
+    with pytest.raises(StartFailed, match="definitely-not-a-real-binary"):
+        start_job(mkspec(["definitely-not-a-real-binary"]), tmp_path, out, err)
 
 def test_looks_like_oom_detects_cuda_oom():
     assert looks_like_oom("RuntimeError: CUDA out of memory. Tried to allocate")
@@ -2107,11 +2159,12 @@ def test_looks_like_oom_detects_cuda_oom():
 
 def test_oom_flag_set_from_stderr(tmp_path):
     out, err = _logs(tmp_path)
-    r = run_job(mkspec(["sh", "-c",
-                        "echo 'CUDA out of memory' >&2; exit 1"]),
-                tmp_path, out, err)
+    r = finish(start_job(mkspec(["sh", "-c", "echo 'CUDA out of memory' >&2; exit 1"]),
+                         tmp_path, out, err))
     assert r.oom is True
 ```
+
+`looks_like_oom` matching torch's exception text is not an import of torch — it is a string the job's stderr may contain.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -2122,7 +2175,13 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'gpuqueue.executor'`
 
 ```python
 # src/gpuqueue/executor.py
-"""Run one job spec as a subprocess. Knows nothing about queues or git."""
+"""Start, poll and kill one job's subprocess.
+
+Knows nothing about queues, lanes or git. Deliberately non-blocking: the
+runner is single-threaded, so nothing here may wait for a job to finish.
+`start_job` hands back a handle, `poll_job` answers "done yet?" and returns
+None while the answer is no.
+"""
 from __future__ import annotations
 
 import os
@@ -2132,6 +2191,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 from .config import ProjectConfig
 from .spec import JobSpec
@@ -2139,6 +2199,10 @@ from .spec import JobSpec
 STDERR_TAIL_BYTES = 4000
 _OOM = re.compile(r"cuda out of memory|outofmemoryerror|cublas_status_alloc_failed",
                   re.IGNORECASE)
+
+
+class StartFailed(RuntimeError):
+    """The job's command could not be executed at all."""
 
 
 def looks_like_oom(text: str) -> bool:
@@ -2151,7 +2215,21 @@ class JobResult:
     timed_out: bool
     oom: bool
     stderr_tail: str
-    pid: int | None
+
+
+@dataclass
+class RunningJob:
+    spec: JobSpec
+    proc: subprocess.Popen
+    out_log: Path
+    err_log: Path
+    out_fh: IO[bytes]
+    err_fh: IO[bytes]
+    deadline: float  # time.monotonic() value past which it is killed
+
+    @property
+    def pid(self) -> int:
+        return self.proc.pid
 
 
 def _tail(path: Path, n: int = STDERR_TAIL_BYTES) -> str:
@@ -2172,42 +2250,68 @@ def _env_for(project: ProjectConfig | None, extra: dict | None) -> dict:
     return env
 
 
-def run_job(spec: JobSpec, workdir: Path, out_log: Path, err_log: Path,
-            project: ProjectConfig | None = None,
-            on_start=None, extra_env: dict | None = None) -> JobResult:
+def start_job(spec: JobSpec, workdir: Path, out_log: Path, err_log: Path,
+              project: ProjectConfig | None = None,
+              extra_env: dict | None = None) -> RunningJob:
     out_log.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_log, "wb") as fo, open(err_log, "wb") as fe:
-        try:
-            proc = subprocess.Popen(
-                spec.cmd, cwd=str(workdir), stdout=fo, stderr=fe,
-                env=_env_for(project, extra_env),
-                start_new_session=True,  # own process group, so we can kill it all
-            )
-        except OSError as e:
-            fe.write(f"{e}\n".encode())
-            fe.flush()
-            return JobResult(exit_code=127, timed_out=False, oom=False,
-                             stderr_tail=_tail(err_log), pid=None)
+    fo = open(out_log, "wb")
+    fe = open(err_log, "wb")
+    try:
+        proc = subprocess.Popen(
+            spec.cmd, cwd=str(workdir), stdout=fo, stderr=fe,
+            env=_env_for(project, extra_env),
+            start_new_session=True,  # own process group, so we can kill it all
+        )
+    except OSError as e:
+        # Record it where a consumer looks for failures, then tell the caller.
+        fe.write(f"{e}\n".encode())
+        fo.close()
+        fe.close()
+        raise StartFailed(f"cannot execute {spec.cmd[0]!r}: {e}") from e
+    return RunningJob(spec=spec, proc=proc, out_log=out_log, err_log=err_log,
+                      out_fh=fo, err_fh=fe,
+                      deadline=time.monotonic() + spec.timeout_s)
 
-        if on_start:
-            on_start(proc.pid)
 
-        timed_out = False
-        try:
-            proc.wait(timeout=spec.timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _kill_group(proc)
+def poll_job(running: RunningJob) -> JobResult | None:
+    """None while the job is still running.
 
-    tail = _tail(err_log)
-    code = proc.returncode if proc.returncode is not None else -1
+    The wall-clock watchdog lives here because this is the one function
+    called about a job on every tick.
+    """
+    if running.proc.poll() is None:
+        if time.monotonic() < running.deadline:
+            return None
+        _kill_group(running.proc)
+        return _result(running, timed_out=True)
+    return _result(running, timed_out=False)
+
+
+def kill_job(running: RunningJob) -> JobResult:
+    """Stop a live job now. Used when the runner is shutting down."""
+    if running.proc.poll() is None:
+        _kill_group(running.proc)
+    return _result(running, timed_out=False)
+
+
+def _result(running: RunningJob, timed_out: bool) -> JobResult:
+    for fh in (running.out_fh, running.err_fh):
+        if not fh.closed:
+            fh.close()  # flush before reading the tail back
+    tail = _tail(running.err_log)
+    code = running.proc.returncode if running.proc.returncode is not None else -1
     return JobResult(exit_code=code, timed_out=timed_out,
-                     oom=looks_like_oom(tail), stderr_tail=tail, pid=proc.pid)
+                     oom=looks_like_oom(tail), stderr_tail=tail)
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
     """SIGTERM the group, then SIGKILL what survives. A trainer's dataloader
-    workers must not outlive it holding VRAM."""
+    workers must not outlive it holding VRAM.
+
+    This does block, for up to the two grace periods. That is deliberate: a
+    job being killed is not the moment to admit another one, and the runner
+    has nothing useful to do until the card is actually free.
+    """
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:
@@ -2227,13 +2331,13 @@ def _kill_group(proc: subprocess.Popen) -> None:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pytest tests/test_executor.py -v`
-Expected: 12 passed
+Expected: 14 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/gpuqueue/executor.py tests/test_executor.py
-git commit -m "feat: job executor with process-group timeout and OOM detection"
+git commit -m "feat: non-blocking job executor with process-group timeout and OOM detection"
 ```
 
 ---
@@ -2481,9 +2585,13 @@ git commit -m "feat: reaper for dead claims, orphan CUDA procs and requeue-once"
 
 **Interfaces:**
 - Consumes: everything above.
-- Produces: `Runner(cfg: RunnerConfig)` with attributes `queue`, and methods `tick() -> None` (one full cycle: reap, drain completions, admit), `admit() -> list[str]`, `drain_completions() -> list[str]`, `run_forever() -> None`, `stop() -> None`, `wait_idle(timeout: float = 30) -> bool` (test helper: block until no jobs are in flight). `cli_runner.main(argv=None) -> int` with `--config`, `--once`.
+- Produces: `Runner(cfg: RunnerConfig)` with attributes `queue`, `cfg`, `active: dict[str, Active]`, and methods `tick() -> None` (one full cycle: reap, collect, admit), `admit() -> list[str]`, `collect() -> list[str]`, `run_forever() -> None`, `stop() -> None`, `shutdown() -> None`. Dataclass `Active(running: RunningJob, project: ProjectConfig, workdir: Path, claim_cm: object | None)`. `cli_runner.main(argv=None) -> int` with `--config`, `--once`.
+
+**The runner is single-threaded.** `tick()` is one non-blocking pass and the only way anything happens; `run_forever()` is a sleep around it. Concurrency comes from `Popen`, not from threads, so there is no lock anywhere in this module and no state shared between a worker and the loop. Everything the tests drive, they drive by calling `tick()` — which means the daemon's real control flow is what is under test, not a threaded approximation of it.
 
 Admission rules: at most `cfg.cpu_slots` CPU jobs in flight; at most **one** GPU job in flight, run under `gpu_claim`. Pending jobs are considered in submission order (`submitted_at`, then id). A job whose `project` is not in config is failed immediately with a legible error rather than left pending forever.
+
+Ordering within `admit()` is load-bearing: take the card *before* the pending→running rename. The claim is non-blocking (`wait=False`) — a blocking claim in a single-threaded loop would freeze the CPU lane behind whoever holds the card — so a busy card means "leave it pending, try next tick", and a job that never made it to `running/` needs no unwinding. If the rename then loses to another process, the claim is released again.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2491,6 +2599,7 @@ Admission rules: at most `cfg.cpu_slots` CPU jobs in flight; at most **one** GPU
 # tests/test_runner.py
 import json
 import threading
+import time
 import pytest
 from pathlib import Path
 from gpuqueue import runner as rn
@@ -2530,23 +2639,34 @@ def submit(r, sha, job_id, cmd, lane="cpu", artifacts=(), timeout_s=30):
         id=job_id, lane=lane, project="p", commit=sha, branch="main",
         cmd=list(cmd), artifacts=list(artifacts), timeout_s=timeout_s)))
 
+def drain(r, limit=30.0):
+    """Tick until nothing is pending or running — what run_forever does,
+    without the sleep."""
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        r.tick()
+        if not r.active and not r.queue.list_state("pending"):
+            return True
+        time.sleep(0.02)
+    raise AssertionError("runner did not drain the queue in time")
+
 def test_runs_a_cpu_job_to_done(env):
     r, sha = env
     submit(r, sha, "j1", ["sh", "-c", "echo hi"])
-    r.tick(); assert r.wait_idle(); r.tick()
+    drain(r)
     assert (r.queue.root / "done" / "j1.json").exists()
 
 def test_job_runs_in_a_worktree_at_the_pinned_commit(env):
     r, sha = env
     submit(r, sha, "j1", ["sh", "-c", "cat a.txt"])
-    r.tick(); assert r.wait_idle(); r.tick()
+    drain(r)
     out, _ = r.queue.log_paths("j1")
     assert out.read_text().strip() == "one"
 
 def test_failing_job_lands_in_failed_with_stderr_tail(env):
     r, sha = env
     submit(r, sha, "j1", ["sh", "-c", "echo bad >&2; exit 4"])
-    r.tick(); assert r.wait_idle(); r.tick()
+    drain(r)
     body = json.loads((r.queue.root / "failed" / "j1.json").read_text())
     assert body["exit_code"] == 4 and "bad" in body["error"]
 
@@ -2554,9 +2674,9 @@ def test_cpu_slots_are_respected(env):
     r, sha = env
     for i in range(4):
         submit(r, sha, f"j{i}", ["sleep", "5"])
-    admitted = r.admit()
-    assert len(admitted) == 2
-    r.stop()
+    assert len(r.admit()) == 2
+    assert r.admit() == []
+    r.shutdown()
 
 def test_only_one_gpu_job_runs_at_a_time(env):
     r, sha = env
@@ -2564,22 +2684,38 @@ def test_only_one_gpu_job_runs_at_a_time(env):
     submit(r, sha, "g2", ["sleep", "5"], lane="gpu")
     assert len(r.admit()) == 1
     assert r.admit() == []
-    r.stop()
+    r.shutdown()
 
 def test_gpu_and_cpu_lanes_run_concurrently(env):
     r, sha = env
     submit(r, sha, "g1", ["sleep", "5"], lane="gpu")
     submit(r, sha, "c1", ["sleep", "5"], lane="cpu")
     assert sorted(r.admit()) == ["c1", "g1"]
-    r.stop()
+    r.shutdown()
 
 def test_gpu_job_holds_a_claim_file_while_running(env, tmp_path):
     r, sha = env
     submit(r, sha, "g1", ["sleep", "5"], lane="gpu")
     r.admit()
     assert list((tmp_path / "claims").glob("*.lock.json"))
-    r.stop()
-    assert r.wait_idle()
+    r.shutdown()
+
+def test_gpu_claim_is_released_when_the_job_ends(env, tmp_path):
+    r, sha = env
+    submit(r, sha, "g1", ["true"], lane="gpu")
+    drain(r)
+    assert list((tmp_path / "claims").glob("*.lock.json")) == []
+
+def test_a_busy_card_leaves_the_job_pending_not_failed(env, tmp_path):
+    """An outside gpu-claim holder must not consume the queued job."""
+    from gpuqueue.claim import gpu_claim
+    r, sha = env
+    submit(r, sha, "g1", ["true"], lane="gpu")
+    with gpu_claim(key="test-uuid", owner="outsider", directory=tmp_path / "claims"):
+        assert r.admit() == []
+        assert (r.queue.root / "pending" / "g1.json").exists()
+    drain(r)
+    assert (r.queue.root / "done" / "g1.json").exists()
 
 def test_running_job_records_its_pid(env):
     r, sha = env
@@ -2587,12 +2723,12 @@ def test_running_job_records_its_pid(env):
     r.admit()
     body = json.loads((r.queue.root / "running" / "j1.json").read_text())
     assert body["pid"] > 0
-    r.stop()
+    r.shutdown()
 
 def test_timeout_marks_failed_and_does_not_retry(env):
     r, sha = env
     submit(r, sha, "j1", ["sleep", "30"], timeout_s=1)
-    r.tick(); assert r.wait_idle(timeout=20); r.tick()
+    drain(r, limit=60)
     body = json.loads((r.queue.root / "failed" / "j1.json").read_text())
     assert "timeout" in body["error"].lower()
     assert body["attempts"] == 0
@@ -2601,20 +2737,20 @@ def test_artifacts_are_committed_by_the_main_loop(env):
     r, sha = env
     submit(r, sha, "j1", ["sh", "-c", "mkdir -p runs && echo '{}' > runs/s.json"],
            artifacts=["runs/s.json"])
-    r.tick(); assert r.wait_idle(); r.tick()
+    drain(r)
     assert (r.cfg.projects["p"].checkout / "runs" / "s.json").exists()
 
 def test_missing_artifact_fails_the_job(env):
     r, sha = env
     submit(r, sha, "j1", ["true"], artifacts=["runs/never.json"])
-    r.tick(); assert r.wait_idle(); r.tick()
+    drain(r)
     body = json.loads((r.queue.root / "failed" / "j1.json").read_text())
     assert "never.json" in body["error"]
 
 def test_worktree_removed_after_job(env):
     r, sha = env
     submit(r, sha, "j1", ["true"])
-    r.tick(); assert r.wait_idle(); r.tick()
+    drain(r)
     assert not r.queue.work_dir("j1").exists()
 
 def test_unknown_project_fails_fast(env):
@@ -2626,19 +2762,36 @@ def test_unknown_project_fails_fast(env):
     body = json.loads((r.queue.root / "failed" / "j1.json").read_text())
     assert "nope" in body["error"]
 
-def test_worker_threads_never_call_git(env, monkeypatch):
-    """The one invariant that keeps a shared checkout from corrupting."""
+def test_unstartable_command_fails_the_job(env):
     r, sha = env
-    main_thread = threading.current_thread().ident
-    real_git = rn.git_ops.git
-    def guarded(args, cwd=None, check=True):
-        assert threading.current_thread().ident == main_thread, \
-            f"git {args} called off the main loop"
-        return real_git(args, cwd=cwd, check=check)
-    monkeypatch.setattr(rn.git_ops, "git", guarded)
-    submit(r, sha, "j1", ["true"])
-    r.tick(); assert r.wait_idle(); r.tick()
-    assert (r.queue.root / "done" / "j1.json").exists()
+    submit(r, sha, "j1", ["definitely-not-a-real-binary"])
+    drain(r)
+    body = json.loads((r.queue.root / "failed" / "j1.json").read_text())
+    assert "definitely-not-a-real-binary" in body["error"]
+
+def test_shutdown_leaves_killed_jobs_for_the_reaper(env):
+    """Graceful stop does not decide the job's fate — it clears the pid and
+    leaves it in running/, which is exactly the state the reaper already
+    knows how to requeue once."""
+    r, sha = env
+    submit(r, sha, "j1", ["sleep", "30"])
+    r.admit()
+    r.shutdown()
+    body = json.loads((r.queue.root / "running" / "j1.json").read_text())
+    assert body["pid"] is None
+    assert r.active == {}
+
+def test_the_runner_spawns_no_threads(env):
+    """Concurrency is Popen, not threads. A thread here would put a worker
+    and the loop on the same queue files and the same JobSpec objects."""
+    r, sha = env
+    before = threading.active_count()
+    for i in range(3):
+        submit(r, sha, f"j{i}", ["sh", "-c", "sleep 0.2; echo ok"])
+    r.tick()
+    assert threading.active_count() == before
+    drain(r)
+    assert threading.active_count() == before
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -2652,13 +2805,20 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'gpuqueue.runner'`
 # src/gpuqueue/runner.py
 """The sole launcher of queued work on this box.
 
-The main loop reaps, admits, and does every git operation. Worker threads
-run subprocesses and write files. Nothing else.
+One thread, one loop. `tick()` reaps, collects what has finished, and admits
+what the lanes allow; `run_forever` is a sleep around it. Concurrency is
+`Popen`, not threads — several jobs run at once because they are separate
+processes, and the runner supervises them by polling.
+
+That is why there is no lock in this file. A thread per job would put a
+worker and this loop on the same queue files, the same lane counters and the
+same JobSpec objects; single-threaded, none of that state is shared, and
+every git call is trivially serialized because there is only one caller.
 """
 from __future__ import annotations
 
+import logging
 import shutil
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -2666,19 +2826,23 @@ from pathlib import Path
 from . import git_ops
 from .claim import gpu_claim, ClaimBusy
 from .config import RunnerConfig, ProjectConfig
-from .executor import run_job, JobResult
+from .executor import (start_job, poll_job, kill_job, JobResult, RunningJob,
+                       StartFailed)
 from .gpuid import gpu_key, GpuIdError
 from .preflight import preflight, PreflightFailed
 from .queue import QueueRoot
 from .reaper import reap
 from .spec import JobSpec
 
+log = logging.getLogger("gpuqueue.runner")
+
 
 @dataclass
-class Completion:
-    spec: JobSpec
-    result: JobResult
-    error: str | None = None
+class Active:
+    running: RunningJob
+    project: ProjectConfig
+    workdir: Path
+    claim_cm: object | None = None  # entered gpu_claim, released on settle
 
 
 class Runner:
@@ -2686,67 +2850,138 @@ class Runner:
         self.cfg = cfg
         self.queue = QueueRoot(cfg.queue_root)
         self.queue.ensure_dirs()
-        self._lock = threading.Lock()
-        self._inflight: dict[str, threading.Thread] = {}
-        self._lanes = {"cpu": 0, "gpu": 0}
-        self._completions: list[Completion] = []
-        self._stop = threading.Event()
+        self.active: dict[str, Active] = {}
+        self._stopping = False
+        self._reap_due = True  # on start, then after every completion
 
     # --- lifecycle ----------------------------------------------------
     def run_forever(self) -> None:
-        while not self._stop.is_set():
+        while not self._stopping:
             self.tick()
-            self._stop.wait(self.cfg.poll_interval_s)
+            if self._stopping:
+                break
+            time.sleep(self.cfg.poll_interval_s)
+        self.shutdown()
 
     def stop(self) -> None:
-        self._stop.set()
+        """Signal-handler safe: sets a flag, does no work."""
+        self._stopping = True
 
     def tick(self) -> None:
-        with self._lock:
-            active = set(self._inflight)
-        reap(self.queue, self.cfg, active_ids=active)
-        self.drain_completions()
+        if self._reap_due:
+            reap(self.queue, self.cfg, active_ids=set(self.active))
+            self._reap_due = False
+        self.collect()
         self.admit()
 
-    def wait_idle(self, timeout: float = 30) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            with self._lock:
-                threads = list(self._inflight.values())
-            if not threads:
-                return True
-            threads[0].join(timeout=0.1)
-        return False
+    def shutdown(self) -> None:
+        """Kill what is running and leave it in running/ with no pid.
+
+        Deciding the fate of an interrupted job is the reaper's business, and
+        it already has the rule: requeue once, then fail. Duplicating that
+        here would give a job two different retry policies depending on how
+        the runner died.
+        """
+        for job_id, active in list(self.active.items()):
+            kill_job(active.running)
+            self._release_card(active)
+            self._remove_worktree(active)
+            spec = active.running.spec
+            spec.pid = None
+            self.queue.update(spec)
+            self.active.pop(job_id, None)
+            log.info("stopped %s for shutdown; left for the reaper", job_id)
 
     # --- admission ----------------------------------------------------
     def _capacity(self, lane: str) -> int:
         limit = self.cfg.cpu_slots if lane == "cpu" else 1
-        return limit - self._lanes[lane]
+        in_lane = sum(1 for a in self.active.values()
+                      if a.running.spec.lane == lane)
+        return limit - in_lane
 
     def admit(self) -> list[str]:
+        if self._stopping:
+            return []
         pending = sorted(self.queue.list_state("pending"),
                          key=lambda s: (s.submitted_at, s.id))
         started = []
         for spec in pending:
             project = self.cfg.projects.get(spec.project)
             if project is None:
-                self._fail_now(spec, f"unknown project {spec.project!r}; "
-                                     "declare it in the runner config")
+                self._fail_pending(spec, f"unknown project {spec.project!r}; "
+                                         "declare it in the runner config")
                 continue
-            with self._lock:
-                if self._capacity(spec.lane) <= 0:
+            if self._capacity(spec.lane) <= 0:
+                continue
+
+            # Take the card before the rename: a job that never reached
+            # running/ needs no unwinding if the card is busy.
+            claim_cm = None
+            if spec.lane == "gpu":
+                claim_cm = self._take_card(spec)
+                if claim_cm is None:
                     continue
+
             claimed = self.queue.claim(spec.id)
-            if claimed is None:
+            if claimed is None:  # cancelled, or another process won the rename
+                self._exit_claim(claim_cm)
                 continue
-            try:
-                workdir = self._prepare_workdir(claimed, project)  # main-loop git
-            except Exception as e:
-                self._fail_now_running(claimed, f"checkout failed: {e}")
-                continue
-            self._dispatch(claimed, project, workdir)
-            started.append(claimed.id)
+
+            if self._launch(claimed, project, claim_cm):
+                started.append(claimed.id)
         return started
+
+    def _take_card(self, spec: JobSpec):
+        """Enter a gpu_claim by hand so it can be held across ticks.
+
+        Non-blocking on purpose: `wait=True` in a single-threaded loop would
+        stall the CPU lane behind whoever holds the card.
+        """
+        try:
+            preflight()
+        except PreflightFailed as e:
+            log.warning("%s waiting: %s", spec.id, e)
+            return None
+        try:
+            key = gpu_key()
+        except GpuIdError as e:
+            # No card will appear on a box that has none; do not queue forever.
+            self._fail_pending(spec, f"no usable GPU: {e}")
+            return None
+        cm = gpu_claim(key=key, owner=f"gpuq:{spec.id}", cmd=spec.cmd,
+                       wait=False, directory=self.cfg.claim_dir)
+        try:
+            cm.__enter__()
+        except ClaimBusy as e:
+            log.info("%s waiting: %s", spec.id, e)
+            return None
+        return cm
+
+    def _launch(self, spec: JobSpec, project: ProjectConfig, claim_cm) -> bool:
+        try:
+            workdir = self._prepare_workdir(spec, project)  # git, on the loop
+        except Exception as e:
+            self._exit_claim(claim_cm)
+            self._fail_running(spec, f"checkout failed: {e}")
+            return False
+        out_log, err_log = self.queue.log_paths(spec.id)
+        try:
+            running = start_job(
+                spec, workdir, out_log, err_log, project=project,
+                extra_env={"GPUQ_JOB_ID": spec.id,
+                           "GPUQ_QUEUE_ROOT": str(self.queue.root)})
+        except StartFailed as e:
+            self._exit_claim(claim_cm)
+            self._remove_worktree_at(project, workdir)
+            self._fail_running(spec, str(e))
+            return False
+
+        spec.pid = running.pid
+        self.queue.update(spec)  # the reaper reads this to tell live from dead
+        self.active[spec.id] = Active(running=running, project=project,
+                                      workdir=workdir, claim_cm=claim_cm)
+        log.info("started %s (%s lane, pid %d)", spec.id, spec.lane, running.pid)
+        return True
 
     def _prepare_workdir(self, spec: JobSpec, project: ProjectConfig) -> Path:
         checkout = git_ops.ensure_checkout(project)
@@ -2754,92 +2989,41 @@ class Runner:
         return git_ops.add_worktree(checkout, self.queue.work_dir(spec.id),
                                     spec.commit)
 
-    def _dispatch(self, spec: JobSpec, project: ProjectConfig,
-                  workdir: Path) -> None:
-        with self._lock:
-            self._lanes[spec.lane] += 1
-        t = threading.Thread(target=self._worker, args=(spec, project, workdir),
-                             name=f"job-{spec.id}", daemon=True)
-        with self._lock:
-            self._inflight[spec.id] = t
-        t.start()
-        # The worker records its pid via on_start; wait briefly so callers
-        # (and the reaper) see a pid rather than an apparently dead job.
-        for _ in range(200):
-            if self.queue.find(spec.id) and (self.queue.find(spec.id)[1].pid
-                                             or self._stop.is_set()):
-                break
-            time.sleep(0.005)
-
-    # --- worker (no git, ever) ----------------------------------------
-    def _worker(self, spec: JobSpec, project: ProjectConfig,
-                workdir: Path) -> None:
-        out_log, err_log = self.queue.log_paths(spec.id)
-        env = {"GPUQ_JOB_ID": spec.id, "GPUQ_QUEUE_ROOT": str(self.queue.root)}
-
-        def on_start(pid: int) -> None:
-            spec.pid = pid
-            self.queue._write(self.queue.path_for("running", spec.id), spec)
-
-        error = None
-        try:
-            if spec.lane == "gpu":
-                try:
-                    preflight()
-                except PreflightFailed as e:
-                    raise RuntimeError(f"preflight refused to start: {e}")
-                with gpu_claim(key=gpu_key(), owner=f"gpuq:{spec.id}",
-                               cmd=spec.cmd, wait=True,
-                               directory=self.cfg.claim_dir):
-                    result = run_job(spec, workdir, out_log, err_log,
-                                     project=project, on_start=on_start,
-                                     extra_env=env)
-            else:
-                result = run_job(spec, workdir, out_log, err_log,
-                                 project=project, on_start=on_start,
-                                 extra_env=env)
-        except (ClaimBusy, GpuIdError, RuntimeError) as e:
-            result = JobResult(exit_code=-1, timed_out=False, oom=False,
-                               stderr_tail="", pid=None)
-            error = str(e)
-
-        with self._lock:
-            self._lanes[spec.lane] -= 1
-            self._inflight.pop(spec.id, None)
-            self._completions.append(Completion(spec, result, error))
-
-    # --- completion (main loop: artifacts, git, state) -----------------
-    def drain_completions(self) -> list[str]:
-        with self._lock:
-            batch, self._completions = self._completions, []
+    # --- collection ---------------------------------------------------
+    def collect(self) -> list[str]:
         finished = []
-        for c in batch:
-            self._settle(c)
-            finished.append(c.spec.id)
+        for job_id, active in list(self.active.items()):
+            result = poll_job(active.running)
+            if result is None:
+                continue
+            self.active.pop(job_id, None)
+            self._settle(active, result)
+            finished.append(job_id)
+        if finished:
+            self._reap_due = True  # design: reap between jobs
         return finished
 
-    def _settle(self, c: Completion) -> None:
-        spec, result = c.spec, c.result
-        project = self.cfg.projects.get(spec.project)
-        workdir = self.queue.work_dir(spec.id)
-        spec.exit_code = result.exit_code
-        ok = c.error is None and result.exit_code == 0 and not result.timed_out
+    def _settle(self, active: Active, result: JobResult) -> None:
+        spec = active.running.spec
+        # Free the card before the git work: artifact commits can take a
+        # while and nothing about them needs the GPU.
+        self._release_card(active)
 
-        if ok and project:
+        spec.pid = None
+        spec.exit_code = result.exit_code
+        ok = result.exit_code == 0 and not result.timed_out
+        if ok:
             try:
-                self._collect_artifacts(spec, project, workdir)
+                self._collect_artifacts(spec, active.project, active.workdir)
             except Exception as e:
                 ok = False
                 spec.error = str(e)
         if not ok and spec.error is None:
-            spec.error = self._describe_failure(c)
+            spec.error = self._describe_failure(spec, result)
 
-        if project:
-            try:
-                git_ops.remove_worktree(Path(project.checkout), workdir)
-            except Exception:
-                shutil.rmtree(workdir, ignore_errors=True)
+        self._remove_worktree(active)
         self.queue.finish(spec, ok=ok)
+        log.info("%s %s", spec.id, "done" if ok else f"failed: {spec.error}")
 
     def _collect_artifacts(self, spec: JobSpec, project: ProjectConfig,
                            workdir: Path) -> None:
@@ -2856,27 +3040,47 @@ class Runner:
             git_ops.commit_artifacts(project, spec.branch, srcs, rels,
                                      f"artifacts: {spec.id}")
 
-    def _describe_failure(self, c: Completion) -> str:
-        if c.error:
-            return c.error
-        if c.result.timed_out:
-            return (f"timeout after {c.spec.timeout_s}s; killed. A hung job "
+    def _describe_failure(self, spec: JobSpec, result: JobResult) -> str:
+        if result.timed_out:
+            return (f"timeout after {spec.timeout_s}s; killed. A hung job "
                     "is a bug, not a transient — not retried.")
-        if c.result.oom:
+        if result.oom:
             return ("CUDA out of memory — a configuration error, not a "
-                    f"transient; not retried.\n{c.result.stderr_tail}")
-        return f"exit {c.result.exit_code}\n{c.result.stderr_tail}"
+                    f"transient; not retried.\n{result.stderr_tail}")
+        return f"exit {result.exit_code}\n{result.stderr_tail}"
+
+    # --- teardown helpers ---------------------------------------------
+    def _release_card(self, active: Active) -> None:
+        self._exit_claim(active.claim_cm)
+        active.claim_cm = None
+
+    @staticmethod
+    def _exit_claim(claim_cm) -> None:
+        if claim_cm is not None:
+            claim_cm.__exit__(None, None, None)
+
+    def _remove_worktree(self, active: Active) -> None:
+        self._remove_worktree_at(active.project, active.workdir)
+
+    @staticmethod
+    def _remove_worktree_at(project: ProjectConfig, workdir: Path) -> None:
+        try:
+            git_ops.remove_worktree(Path(project.checkout), workdir)
+        except Exception:
+            shutil.rmtree(workdir, ignore_errors=True)
 
     # --- failure helpers ----------------------------------------------
-    def _fail_now(self, spec: JobSpec, message: str) -> None:
+    def _fail_pending(self, spec: JobSpec, message: str) -> None:
         claimed = self.queue.claim(spec.id)
         if claimed:
-            self._fail_now_running(claimed, message)
+            self._fail_running(claimed, message)
 
-    def _fail_now_running(self, spec: JobSpec, message: str) -> None:
+    def _fail_running(self, spec: JobSpec, message: str) -> None:
         spec.error = message
         spec.exit_code = -1
+        spec.pid = None
         self.queue.finish(spec, ok=False)
+        log.warning("%s failed: %s", spec.id, message)
 ```
 
 ```python
@@ -2926,7 +3130,7 @@ def main(argv: list[str] | None = None) -> int:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pytest tests/test_runner.py -v`
-Expected: 14 passed
+Expected: 18 passed
 
 - [ ] **Step 5: Run the whole suite**
 
@@ -2937,7 +3141,7 @@ Expected: all tests pass. Fix any cross-module regressions before committing.
 
 ```bash
 git add src/gpuqueue/runner.py src/gpuqueue/cli_runner.py tests/test_runner.py
-git commit -m "feat: runner main loop with lane admission and main-loop-only git"
+git commit -m "feat: single-threaded runner loop with lane admission and serialized git"
 ```
 
 ---
@@ -3050,6 +3254,13 @@ say "claim dir:   $GPU_CLAIM_DIR"
 say "config:      $GPUQ_CONFIG"
 
 # 1. install the package
+# Check the interpreter first: pip's requires-python failure names a version
+# but not what to do about it, and this runs on boxes nobody built by hand.
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || {
+  say "bootstrap: need Python 3.11+ (tomllib); found $(python3 -V 2>&1)"
+  exit 1
+}
+
 if [ "$DRY_RUN" -eq 1 ]; then
   say "would: pip install -e $REPO_DIR"
 else
@@ -3189,12 +3400,12 @@ git commit -m "feat: idempotent bootstrap and shipped supervisor program file"
 | Queue directory tree, atomic rename | 2 |
 | Job spec fields, pinned `commit` | 1 |
 | `dedupe_key` idempotent resubmission | 2, 3 |
-| Runner loop, workers never touch git | 9, 12 (invariant asserted by `test_worker_threads_never_call_git`) |
+| Runner loop, workers never touch git | 9, 12 (single-threaded by construction; asserted by `test_the_runner_spawns_no_threads`) |
 | Per-project config | 8 |
 | Reaper: dead claims, orphan CUDA, `.part`, requeue-once | 11 |
-| Wall-clock watchdog | 10, 12 |
-| Lock path / key derivation / claim file | 4, 5 |
-| Preflight refuses on foreign processes | 6, 7 |
+| Wall-clock watchdog | 10 (`poll_job`), driven by 12 |
+| Lock path / key derivation / claim file | 4, 5 — derivation is `nvidia-smi` here, normalized so a torch-based implementation of the protocol takes the same lock (design gap 2) |
+| Preflight refuses on foreign processes | 6, 7 (`gpu-claim`), 12 (queued GPU jobs, in `_take_card`) |
 | Failure table (non-zero, runner death, timeout, OOM, duplicate) | 2, 10, 11, 12 |
 | Bootstrap, shipped supervisor config, one host variable | 13 |
 | Not in scope (multi-GPU, multi-host, durable storage, auth) | no tasks, correctly |
@@ -3204,3 +3415,10 @@ git commit -m "feat: idempotent bootstrap and shipped supervisor program file"
 **Known adjustments an implementer will hit:**
 - Task 3 Step 3 notes the `--lane` `choices=` conflict with `test_submit_invalid_lane_exits_nonzero`; the resolution (drop `choices=`) is stated there.
 - `test_dedupe_prints_existing_id_for_pending` in Task 3 relies on generated ids; if it proves brittle, pass explicit `--id j1` / `--id j2` and assert the printed value equals `j1` both times.
+- Task 12's `test_a_busy_card_leaves_the_job_pending_not_failed` takes the lock from the test process itself. `flock` is per-open-file-description, not per-process, so this genuinely excludes — but if it ever passes vacuously, promote it to the subprocess form used in `tests/test_claim.py`.
+- A held GPU claim is entered and exited by hand (`cm.__enter__()` / `cm.__exit__()`), because the claim outlives the function that takes it. Every path that abandons a job — busy card, failed checkout, unstartable command, shutdown — must go through `_exit_claim`, or the card stays locked by a runner that is no longer using it.
+
+**Rejected alternatives, so they are not re-proposed:**
+- *A thread per job.* Obvious, and wrong here: it puts a worker and the loop on the same queue files, lane counters and `JobSpec` objects, then needs a lock around each and a handshake so the pid lands before the reaper looks. `Popen` already provides the concurrency; polling it costs one `tick()`.
+- *Importing torch for GPU identity, even guarded.* Costs seconds of import and a CUDA context in the daemon that should never touch the card, and excludes JAX and TensorFlow users from a lock that is supposed to be host-wide. `normalize_gpu_uuid` gets the interoperability without the import.
+- *A shared checkout with `git checkout` per job.* Two concurrent jobs at different pinned commits rewrite the tree under each other mid-run — see design gap 1. Per-job worktrees are not an optimization; they are what makes `commit` mean anything.
