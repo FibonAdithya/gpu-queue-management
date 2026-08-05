@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import git_ops
+from .bugreport import CallerError
 from .claim import gpu_claim, ClaimBusy
 from .config import RunnerConfig, ProjectConfig
 from .executor import (start_job, poll_job, kill_job, JobResult, RunningJob,
@@ -264,7 +265,10 @@ class Runner:
         for rel in spec.artifacts:
             src = workdir / rel
             if not src.exists():
-                raise RuntimeError(f"declared artifact not produced: {rel}")
+                # Not a gpuq bug: the job was asked for this file and did
+                # not produce it. Typed so the classifier does not read the
+                # gpuq traceback around it as gpuq's fault.
+                raise CallerError(f"declared artifact not produced: {rel}")
             srcs.append(src)
             rels.append(rel)
         if project.commit_artifacts:

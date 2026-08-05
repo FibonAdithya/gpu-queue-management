@@ -25,7 +25,16 @@ _OOM = re.compile(r"cuda out of memory|outofmemoryerror|cublas_status_alloc_fail
 
 
 class StartFailed(RuntimeError):
-    """The job's command could not be executed at all."""
+    """The job's command could not be executed at all.
+
+    Carries the OSError's errno, because the message alone cannot tell
+    "the binary you asked for is not there" (the caller's mistake) from
+    "gpuq handed Popen a working directory that does not exist" (ours).
+    """
+
+    def __init__(self, message: str, errno: int | None = None):
+        super().__init__(message)
+        self.errno = errno
 
 
 def looks_like_oom(text: str) -> bool:
@@ -90,7 +99,8 @@ def start_job(spec: JobSpec, workdir: Path, out_log: Path, err_log: Path,
         fe.write(f"{e}\n".encode())
         fo.close()
         fe.close()
-        raise StartFailed(f"cannot execute {spec.cmd[0]!r}: {e}") from e
+        raise StartFailed(f"cannot execute {spec.cmd[0]!r}: {e}",
+                          errno=e.errno) from e
     return RunningJob(spec=spec, proc=proc, out_log=out_log, err_log=err_log,
                       out_fh=fo, err_fh=fe,
                       deadline=time.monotonic() + spec.timeout_s)

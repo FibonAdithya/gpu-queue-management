@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import errno as _errno
 import hashlib
+import json
+import re
 import traceback
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .executor import StartFailed
@@ -72,3 +76,102 @@ def signature(exc: BaseException, phase: str) -> str:
 
 def _is_gpuqueue_frame(filename: str) -> bool:
     return Path(filename).parent.name == "gpuqueue"
+
+
+_OCCURRENCES = re.compile(r"^occurrences: (\d+)$", re.MULTILINE)
+_LAST_SEEN = re.compile(r"^last seen: .*$", re.MULTILINE)
+
+_PREAMBLE = (
+    "gpuq's own code raised this. Filed automatically by the runner on the "
+    "box; **no agent wrote any part of this issue** and no one has judged "
+    "the blame — the classifier only knows the exception came out of "
+    "`gpuqueue`'s own stack.\n"
+)
+
+
+@dataclass
+class BugReport:
+    sig: str
+    phase: str
+    exc_type: str
+    message: str
+    traceback_text: str
+    queue_counts: dict[str, int] = field(default_factory=dict)
+    job: dict | None = None
+    gpuq_commit: str = "unknown"
+    occurred_at: str = ""
+
+
+def build_report(exc: BaseException, phase: str, *, spec=None,
+                 queue_counts: dict[str, int] | None = None,
+                 gpuq_commit: str = "unknown",
+                 occurred_at: str | None = None) -> BugReport:
+    return BugReport(
+        sig=signature(exc, phase),
+        phase=phase,
+        exc_type=type(exc).__name__,
+        message=str(exc),
+        traceback_text="".join(traceback.format_exception(
+            type(exc), exc, exc.__traceback__)),
+        queue_counts=dict(queue_counts or {}),
+        job=spec.to_dict() if spec is not None else None,
+        gpuq_commit=gpuq_commit,
+        occurred_at=occurred_at or datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+
+def issue_title(report: BugReport) -> str:
+    first_line = report.message.strip().splitlines()[0] if report.message else ""
+    return f"[gpuq] {report.phase}: {report.exc_type}: {first_line}"[:200] \
+           + f" [{report.sig}]"
+
+
+def issue_body(report: BugReport) -> str:
+    """The issue body *is* the prompt, so it carries facts and nothing else."""
+    counts = ", ".join(f"{state} {n}"
+                       for state, n in sorted(report.queue_counts.items())) \
+        or "not recorded"
+    job = json.dumps(report.job, indent=2) if report.job else \
+        "no job — this failure was not attributable to one queued job"
+    return "\n".join([
+        _PREAMBLE,
+        f"sig: {report.sig}",
+        f"phase: {report.phase}",
+        f"gpuq commit: {report.gpuq_commit}",
+        "occurrences: 1",
+        f"first seen: {report.occurred_at}",
+        f"last seen: {report.occurred_at}",
+        "",
+        "## Traceback",
+        "",
+        "```",
+        report.traceback_text.rstrip(),
+        "```",
+        "",
+        "## JobSpec",
+        "",
+        "```json",
+        job,
+        "```",
+        "",
+        "## Queue state at the time",
+        "",
+        counts,
+        "",
+    ])
+
+
+def bump_body(body: str, occurred_at: str) -> str:
+    """Record a recurrence in an existing issue body.
+
+    Returns the body untouched if it does not carry the lines we wrote --
+    an owner may have rewritten it by hand, and mangling that is worse than
+    losing a count.
+    """
+    match = _OCCURRENCES.search(body)
+    if not match:
+        return body
+    body = _OCCURRENCES.sub(f"occurrences: {int(match.group(1)) + 1}", body,
+                            count=1)
+    return _LAST_SEEN.sub(f"last seen: {occurred_at}", body, count=1)

@@ -118,3 +118,51 @@ def test_a_missing_gh_binary_raises_gh_error(monkeypatch, cfg):
 def test_gpuq_commit_is_a_short_sha_or_unknown():
     got = bugfiler.gpuq_commit()
     assert got == "unknown" or (7 <= len(got) <= 12 and got.isalnum())
+
+
+from datetime import datetime, timedelta, timezone
+
+NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+
+
+def test_a_fresh_box_may_dispatch(cfg):
+    assert bugfiler.may_dispatch(cfg, NOW) is True
+
+
+def test_three_dispatches_in_a_day_close_the_gate(cfg):
+    for _ in range(3):
+        bugfiler.record_dispatch(cfg, NOW)
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 3
+    assert bugfiler.may_dispatch(cfg, NOW) is False
+
+
+def test_the_window_rolls(cfg):
+    bugfiler.record_dispatch(cfg, NOW - timedelta(hours=25))
+    bugfiler.record_dispatch(cfg, NOW - timedelta(hours=23))
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 1
+    assert bugfiler.may_dispatch(cfg, NOW) is True
+
+
+def test_old_entries_are_pruned_from_the_file(cfg):
+    bugfiler.record_dispatch(cfg, NOW - timedelta(days=9))
+    bugfiler.record_dispatch(cfg, NOW)
+    assert len(json.loads(cfg.state_file.read_text())["dispatches"]) == 1
+
+
+def test_a_corrupt_state_file_does_not_stop_filing(cfg):
+    """The state file is a budget guard, not queue state. If it is
+    unreadable, fail towards filing -- evidence is never lost."""
+    cfg.state_file.write_text("{ not json")
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 0
+    assert bugfiler.may_dispatch(cfg, NOW) is True
+
+
+def test_the_state_file_is_created_with_its_parents(tmp_path, cfg):
+    cfg.state_file = tmp_path / "deep" / "nested" / "autofix.json"
+    bugfiler.record_dispatch(cfg, NOW)
+    assert cfg.state_file.exists()
+
+
+def test_a_cap_of_zero_never_dispatches(cfg):
+    cfg.max_dispatches_per_day = 0
+    assert bugfiler.may_dispatch(cfg, NOW) is False

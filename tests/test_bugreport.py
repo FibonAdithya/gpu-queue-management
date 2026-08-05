@@ -1,8 +1,15 @@
 import errno
+import hashlib
+from pathlib import Path
+
 import pytest
-from gpuqueue.bugreport import CallerError, is_gpuq_fault, PHASES
+from gpuqueue.bugreport import (CallerError, is_gpuq_fault, PHASES,
+                                signature, build_report, issue_title,
+                                issue_body, bump_body)
 from gpuqueue.executor import StartFailed
 from gpuqueue.git_ops import GitError
+from gpuqueue import git_ops
+from gpuqueue.spec import JobSpec
 
 
 def _raised(exc):
@@ -57,11 +64,6 @@ def test_the_designed_phases_exist():
                       "reap", "admit")
 
 
-from pathlib import Path
-from gpuqueue.bugreport import signature
-from gpuqueue import git_ops
-
-
 def _git_failure():
     """A real traceback with real gpuqueue frames in it."""
     try:
@@ -99,7 +101,6 @@ def test_the_signature_is_frame_names_not_line_numbers():
     own frame is outside the package and dropped -- so the payload is
     phase, exception type and that one name.
     """
-    import hashlib
     expected = hashlib.sha256(b"checkout|GitError|git").hexdigest()[:12]
     assert signature(_git_failure(), "checkout") == expected
 
@@ -123,3 +124,86 @@ def test_frames_outside_gpuqueue_are_ignored():
 def test_an_unknown_phase_is_rejected():
     with pytest.raises(ValueError, match="phase"):
         signature(_raised(RuntimeError("x")), "nonsense")
+
+
+def _spec():
+    return JobSpec(id="j1", lane="gpu", project="p", commit="deadbeef",
+                   branch="main", cmd=["python", "train.py"])
+
+
+def _report():
+    return build_report(_git_failure(), "checkout", spec=_spec(),
+                        queue_counts={"pending": 3, "running": 1,
+                                      "done": 40, "failed": 2},
+                        gpuq_commit="96f0b57",
+                        occurred_at="2026-08-05T12:00:00Z")
+
+
+def test_the_title_names_the_phase_and_the_exception():
+    title = issue_title(_report())
+    assert "checkout" in title and "GitError" in title
+
+
+def test_the_title_carries_the_signature_so_a_human_can_match_it():
+    r = _report()
+    assert r.sig in issue_title(r)
+
+
+def test_the_body_carries_the_signature_line_verbatim():
+    """bugfiler greps for this exact string; gh search alone is fuzzy."""
+    r = _report()
+    assert f"sig: {r.sig}" in issue_body(r)
+
+
+def test_the_body_carries_the_traceback():
+    assert "Traceback (most recent call last)" in issue_body(_report())
+
+
+def test_the_body_carries_the_jobspec_as_json():
+    body = issue_body(_report())
+    assert '"id": "j1"' in body and '"project": "p"' in body
+
+
+def test_the_body_carries_queue_state_and_the_gpuq_commit():
+    body = issue_body(_report())
+    assert "pending 3" in body and "96f0b57" in body
+
+
+def test_the_body_starts_at_one_occurrence():
+    body = issue_body(_report())
+    assert "occurrences: 1" in body
+    assert "first seen: 2026-08-05T12:00:00Z" in body
+    assert "last seen: 2026-08-05T12:00:00Z" in body
+
+
+def test_the_body_says_no_agent_wrote_it():
+    """The auto path carries no prose from any agent, and the reader of the
+    issue -- human or model -- must be able to tell."""
+    assert "no agent" in issue_body(_report()).lower()
+
+
+def test_a_report_with_no_job_still_renders():
+    """Reaper and admit failures have no one job to blame."""
+    r = build_report(_git_failure(), "reap", queue_counts={},
+                     occurred_at="2026-08-05T12:00:00Z")
+    assert "no job" in issue_body(r).lower()
+
+
+def test_bump_increments_the_count_and_moves_last_seen():
+    body = issue_body(_report())
+    bumped = bump_body(body, "2026-08-06T09:00:00Z")
+    assert "occurrences: 2" in bumped
+    assert "first seen: 2026-08-05T12:00:00Z" in bumped
+    assert "last seen: 2026-08-06T09:00:00Z" in bumped
+
+
+def test_bump_is_repeatable():
+    body = issue_body(_report())
+    for _ in range(3):
+        body = bump_body(body, "2026-08-06T09:00:00Z")
+    assert "occurrences: 4" in body
+
+
+def test_bump_leaves_a_body_it_does_not_recognise_alone():
+    """An owner may have rewritten the body by hand. Never mangle it."""
+    assert bump_body("hand written", "2026-08-06T09:00:00Z") == "hand written"

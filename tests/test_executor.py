@@ -1,3 +1,4 @@
+import errno
 import os
 import time
 from pathlib import Path
@@ -123,3 +124,19 @@ def test_oom_flag_set_from_stderr(tmp_path):
     r = finish(start_job(mkspec(["sh", "-c", "echo 'CUDA out of memory' >&2; exit 1"]),
                          tmp_path, out, err))
     assert r.oom is True
+
+
+def test_start_failed_carries_the_errno(tmp_path):
+    """Classification needs to tell 'your binary does not exist' from
+    'gpuq handed Popen something broken', and the message alone cannot."""
+    from gpuqueue.executor import start_job
+    from gpuqueue.spec import JobSpec
+    spec = JobSpec(id="j1", lane="cpu", project="p", commit="x",
+                   branch="main", cmd=["definitely-not-a-real-binary"])
+    with pytest.raises(StartFailed) as caught:
+        start_job(spec, tmp_path, tmp_path / "o.log", tmp_path / "e.log")
+    assert caught.value.errno == errno.ENOENT
+
+
+def test_start_failed_defaults_to_no_errno():
+    assert StartFailed("hand made").errno is None

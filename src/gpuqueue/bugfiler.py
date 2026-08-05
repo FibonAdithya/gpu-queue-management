@@ -105,3 +105,49 @@ def gpuq_commit() -> str:
     except Exception:
         return "unknown"
     return proc.stdout.strip() if proc.returncode == 0 else "unknown"
+
+
+_PRUNE_AFTER = timedelta(days=2)
+
+
+def _load_dispatches(cfg: AutofixConfig) -> list[datetime]:
+    """Timestamps of past auto-dispatches. Unreadable means empty.
+
+    This file guards a budget, not queue state. Refusing to file because we
+    cannot read it would lose evidence to protect a counter, which is the
+    wrong way round.
+    """
+    try:
+        raw = json.loads(Path(cfg.state_file).read_text())["dispatches"]
+    except Exception:
+        return []
+    out = []
+    for stamp in raw:
+        try:
+            out.append(datetime.fromisoformat(stamp))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _save_dispatches(cfg: AutofixConfig, stamps: list[datetime]) -> None:
+    path = Path(cfg.state_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.part")
+    tmp.write_text(json.dumps(
+        {"dispatches": [s.isoformat() for s in stamps]}, indent=2) + "\n")
+    os.rename(tmp, path)
+
+
+def dispatches_in_last_day(cfg: AutofixConfig, now: datetime) -> int:
+    cutoff = now - timedelta(days=1)
+    return sum(1 for s in _load_dispatches(cfg) if s > cutoff)
+
+
+def may_dispatch(cfg: AutofixConfig, now: datetime) -> bool:
+    return dispatches_in_last_day(cfg, now) < cfg.max_dispatches_per_day
+
+
+def record_dispatch(cfg: AutofixConfig, now: datetime) -> None:
+    kept = [s for s in _load_dispatches(cfg) if s > now - _PRUNE_AFTER]
+    _save_dispatches(cfg, [*kept, now])

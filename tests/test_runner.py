@@ -253,3 +253,17 @@ def test_the_cuda_sweep_runs_again_once_the_interval_passes(env, monkeypatch):
     r.cfg.orphan_cuda_interval_s = 0    # everything is always due
     r.tick(); r.tick()
     assert calls == [True, True]
+
+def test_a_missing_artifact_raises_caller_error_not_a_gpuq_bug(env):
+    """A declared artifact the job never produced is the caller's mistake
+    wearing a gpuq traceback -- the one case the classifier cannot infer."""
+    from gpuqueue.bugreport import CallerError, is_gpuq_fault
+    r, sha = env
+    project = r.cfg.projects["p"]
+    with pytest.raises(CallerError) as caught:
+        r._collect_artifacts(
+            JobSpec(id="j1", lane="cpu", project="p", commit=sha,
+                    branch="main", cmd=["true"], artifacts=["runs/never.json"]),
+            project, r.queue.work_dir("j1"))
+    assert "never.json" in str(caught.value)
+    assert is_gpuq_fault(caught.value) is False
