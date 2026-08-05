@@ -545,7 +545,7 @@ class QueueRoot:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pytest tests/test_queue.py -v`
-Expected: 16 passed
+Expected: 17 passed
 
 - [ ] **Step 5: Commit**
 
