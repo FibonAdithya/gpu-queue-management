@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import bugfiler
 from . import git_ops
-from .bugreport import CallerError
+from .bugreport import CallerError, signature
 from .claim import gpu_claim, ClaimBusy
 from .config import RunnerConfig, ProjectConfig
 from .executor import (start_job, poll_job, kill_job, JobResult, RunningJob,
@@ -52,6 +52,9 @@ class Runner:
         self._stopping = False
         # None means "never swept", so the first tick does a full one.
         self._last_cuda_sweep: float | None = None
+        # signature -> time.monotonic() of the last report. See the
+        # cooldown check in _report_bug for why this exists.
+        self._report_cooldowns: dict[str, float] = {}
 
     # --- lifecycle ----------------------------------------------------
     def run_forever(self) -> None:
@@ -126,6 +129,28 @@ class Runner:
         if not self.cfg.autofix.enabled:
             return
         try:
+            # Computed before any I/O, and inside this try: signature()
+            # raises ValueError on a phase outside PHASES, and this
+            # function must never raise. `admit()` can reach here once per
+            # pending job in a single tick with none of them entering
+            # `self.active` (a failed `_launch` never does), so without a
+            # cooldown a broken git_ops with 20 queued jobs means 20 calls
+            # into file_bug -- up to three `gh` subprocesses at 30s each --
+            # before admit() returns. That stalls `poll_job` for the same
+            # window, so a running job's deadline goes unenforced and a
+            # timed-out job is never killed: worse than a crash, since
+            # supervisor restarts a crashed runner in seconds.
+            #
+            # Suppressed occurrences lose their issue comment and
+            # occurrence bump -- that is a deliberate, correct trade.
+            # Recurrence counting on the issue is a nice-to-have; not
+            # stalling the reaper is not. Do not "fix" this back.
+            sig = signature(exc, phase)
+            now = time.monotonic()
+            last = self._report_cooldowns.get(sig)
+            if last is not None and now - last < self.cfg.autofix.report_cooldown_s:
+                return
+            self._report_cooldowns[sig] = now
             counts = {s: len(self.queue.list_state(s)) for s in STATES}
             outcome = bugfiler.file_bug(self.cfg.autofix, exc, phase,
                                         spec=spec, queue_counts=counts)

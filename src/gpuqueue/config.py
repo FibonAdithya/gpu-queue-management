@@ -44,6 +44,17 @@ class AutofixConfig:
     max_dispatches_per_day: int = 3
     closed_lookback_days: int = 30
     state_file: Path | None = None     # defaults to <queue_root>/autofix.json
+    # Per-signature cooldown, in-process, before `Runner._report_bug` will
+    # call `file_bug` again for the same bug. `admit()` can attempt every
+    # pending job in one tick, and a failed `_launch` never enters
+    # `self.active`, so a broken `git_ops` on a box with 20 queued jobs
+    # would otherwise call `file_bug` -- up to three `gh` subprocesses at
+    # 30s each -- once per pending job, stalling `admit` for tens of
+    # minutes with `poll_job` never running in between. 900s (15 minutes)
+    # bounds that to a handful of `gh` round trips per bug per tick cycle,
+    # while still refreshing the issue's occurrence count and comment at a
+    # human-relevant cadence if the bug persists.
+    report_cooldown_s: float = 900.0
 
 
 @dataclass
@@ -117,6 +128,7 @@ def load_config(path: Path) -> RunnerConfig:
         closed_lookback_days=int(a.get("closed_lookback_days", 30)),
         state_file=Path(state_file) if state_file
                    else Path(root) / "autofix.json",
+        report_cooldown_s=float(a.get("report_cooldown_s", 900.0)),
     )
 
     return RunnerConfig(

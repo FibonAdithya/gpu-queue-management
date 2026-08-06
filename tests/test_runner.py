@@ -415,3 +415,36 @@ def test_filing_is_skipped_entirely_when_autofix_is_off(env, filed):
     submit(r, sha, "j1", ["true"], artifacts=["runs/never.json"])
     drain(r)
     assert filed == []
+
+
+def test_a_cooldown_bounds_gh_calls_when_every_pending_job_fails_the_same_way(
+        env, filed, monkeypatch):
+    """admit() attempts every pending job in one tick, and a job that never
+    reaches self.active (a failed _launch) never shrinks capacity, so a
+    broken git_ops with many queued jobs would otherwise call file_bug --
+    up to three `gh` subprocesses at 30s each -- once per job in the same
+    tick. That would stall poll_job for the whole window and leave running
+    jobs' deadlines unenforced. The in-process per-signature cooldown must
+    keep one admit() call down to a single file_bug call for one bug."""
+    r, sha = env
+    _enable(r)
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: (_ for _ in ()).throw(
+                            rn.git_ops.GitError("worktree add failed")))
+    for i in range(5):
+        submit(r, sha, f"j{i}", ["true"])
+    r.admit()
+    assert len(filed) == 1
+
+
+def test_the_cooldown_expires_and_reports_again(env, filed, monkeypatch):
+    r, sha = env
+    _enable(r)
+    r.cfg.autofix.report_cooldown_s = 0
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: (_ for _ in ()).throw(
+                            rn.git_ops.GitError("worktree add failed")))
+    for i in range(3):
+        submit(r, sha, f"j{i}", ["true"])
+    r.admit()
+    assert len(filed) == 3
