@@ -215,10 +215,15 @@ def ensure_labels(cfg: AutofixConfig) -> None:
 
 
 def _create_issue(cfg: AutofixConfig, title: str, body: str,
-                  label: str) -> int | None:
+                  labels: str | list[str]) -> int | None:
     ensure_labels(cfg)
+    if isinstance(labels, str):
+        labels = [labels]
+    label_args = []
+    for label in labels:
+        label_args += ["--label", label]
     out = _gh(cfg, ["issue", "create", "--repo", cfg.repo, "--title", title,
-                    "--label", label, "--body-file", "-"], stdin=body)
+                    *label_args, "--body-file", "-"], stdin=body)
     match = _ISSUE_NUMBER.search(out or "")
     return int(match.group(1)) if match else None
 
@@ -293,8 +298,12 @@ def file_bug(cfg: AutofixConfig, exc: BaseException, phase: str, *,
             log.warning("autofix: could not record a dispatch, filing "
                         "throttled instead: %s", e)
             throttled = True
-    label = THROTTLED_LABEL if throttled else AUTO_LABEL
-    _create_issue(cfg, issue_title(report), body, label)
+    # Both labels when throttled: AUTO_LABEL alone would make a
+    # `label:gpuq-auto` triage query miss every throttled bug, since the
+    # bug is structural evidence just the same as a dispatched one -- it
+    # was only the budget, not the classification, that held it back.
+    labels = [AUTO_LABEL, THROTTLED_LABEL] if throttled else [AUTO_LABEL]
+    _create_issue(cfg, issue_title(report), body, labels)
     if throttled:
         # Evidence is never lost; budget cannot run away.
         log.warning("autofix throttled: filed %s with no run", report.sig)

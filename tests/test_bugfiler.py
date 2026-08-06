@@ -227,6 +227,11 @@ def _created(gh):
     return None, None
 
 
+def _labels(args):
+    """Every --label value passed to `gh issue create`, in order."""
+    return [args[i + 1] for i, a in enumerate(args) if a == "--label"]
+
+
 def test_a_disabled_config_does_nothing(gh, cfg):
     cfg.enabled = False
     assert bugfiler.file_bug(cfg, _boom(), "checkout") == "disabled"
@@ -250,7 +255,7 @@ def test_a_gpuq_fault_files_an_issue(gh, cfg):
 def test_a_filed_issue_carries_the_auto_label(gh, cfg):
     bugfiler.file_bug(cfg, _boom(), "checkout")
     args, _ = _created(gh)
-    assert args[args.index("--label") + 1] == bugfiler.AUTO_LABEL
+    assert _labels(args) == [bugfiler.AUTO_LABEL]
 
 
 def test_a_filed_issue_records_a_dispatch(gh, cfg):
@@ -274,9 +279,9 @@ def test_a_dispatch_is_recorded_before_the_issue_is_created(gh, cfg,
         order.append("record_dispatch")
         return real_record(cfg, now)
 
-    def spy_create(cfg, title, body, label):
+    def spy_create(cfg, title, body, labels):
         order.append("create_issue")
-        return real_create(cfg, title, body, label)
+        return real_create(cfg, title, body, labels)
 
     monkeypatch.setattr(bugfiler, "record_dispatch", spy_record)
     monkeypatch.setattr(bugfiler, "_create_issue", spy_create)
@@ -298,7 +303,10 @@ def test_an_unwritable_state_file_files_throttled_instead_of_dispatching(
     assert outcome == "filed-throttled"
     args, _ = _created(gh)
     assert args is not None  # evidence still files
-    assert args[args.index("--label") + 1] == bugfiler.THROTTLED_LABEL
+    # Both labels: AUTO_LABEL too, or a `label:gpuq-auto` triage query
+    # misses this bug entirely even though it is the same structural
+    # evidence as a dispatched one -- only the budget held it back.
+    assert set(_labels(args)) == {bugfiler.AUTO_LABEL, bugfiler.THROTTLED_LABEL}
 
 
 def test_a_missing_state_file_path_files_throttled_rather_than_crashing(
@@ -311,7 +319,7 @@ def test_a_missing_state_file_path_files_throttled_rather_than_crashing(
     assert outcome == "filed-throttled"
     args, _ = _created(gh)
     assert args is not None
-    assert args[args.index("--label") + 1] == bugfiler.THROTTLED_LABEL
+    assert set(_labels(args)) == {bugfiler.AUTO_LABEL, bugfiler.THROTTLED_LABEL}
 
 
 def test_an_existing_open_issue_is_commented_not_refiled(gh, cfg):
@@ -367,7 +375,7 @@ def test_past_the_cap_the_issue_still_files_but_is_labelled_throttled(gh, cfg):
     assert bugfiler.file_bug(cfg, _boom(), "checkout", now=NOW) \
         == "filed-throttled"
     args, _ = _created(gh)
-    assert args[args.index("--label") + 1] == bugfiler.THROTTLED_LABEL
+    assert set(_labels(args)) == {bugfiler.AUTO_LABEL, bugfiler.THROTTLED_LABEL}
 
 
 def test_a_throttled_file_does_not_record_a_dispatch(gh, cfg):
