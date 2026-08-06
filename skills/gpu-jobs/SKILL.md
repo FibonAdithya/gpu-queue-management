@@ -63,6 +63,24 @@ A job that fails on CUDA out-of-memory is reported as such and is never
 retried: it is a configuration problem, not a transient. Make the model or
 the batch smaller.
 
+## When gpuq itself is broken
+
+If the *queue* misbehaves — `gpuq submit` errors, `gpuq wait` never returns,
+`gpuq show` disagrees with reality — report it:
+
+```bash
+gpuq bug "gpuq wait never returns for a cancelled job" --body "$(cat <<'EOF'
+What I ran, what I expected, what happened, and the exact output.
+EOF
+)"
+```
+
+This does not fix anything by itself and it does not dispatch a run. It files
+an issue for the owner, who decides. Do **not** use it for your own job
+failing: a CUDA OOM, a timeout, a non-zero exit, or a declared artifact your
+script did not write are your bugs, and the runner already tells you so. When
+the runner's own code raises, it files without being asked.
+
 ## Do not
 
 - Run GPU work directly. `gpu-claim -- <cmd>` if you truly must run

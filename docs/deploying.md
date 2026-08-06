@@ -205,6 +205,61 @@ ssh $BOX 'cd /workspace/checkouts/myproject && git push --dry-run origin HEAD'
 # expect: ERROR: Write access to repository not granted
 ```
 
+### Letting gpuq file bugs against itself
+
+Optional, and off unless you add `[autofix]` to the config. When gpuq's own
+code raises — a bad worktree, a `git_ops` failure — the runner files a GitHub
+issue carrying the traceback, and a workflow opens a PR against it. Caller
+faults never file: an OOM, a timeout, a plain `exit N`, or a declared
+artifact your job did not produce are your problem, not the queue's.
+
+Three things to set up, once:
+
+1. **A fine-grained PAT**, on github.com → Settings → Developer settings →
+   Fine-grained tokens. Scope it to this repository alone, and give it
+   `Issues: Read and write` and nothing else. Explicitly **not** `Contents` —
+   anyone who can queue a job on this box can use this key, and the whole
+   argument for autofix being safe is that its worst case is issue spam,
+   exactly the argument made for the results key above.
+
+   Confirm it cannot push:
+
+   ```bash
+   GH_TOKEN=<the-pat> gh api -X PUT \
+     repos/<owner>/gpu-queue-management/contents/probe.txt \
+     -f message=probe -f content=eA== 2>&1 | head -3
+   # expect: HTTP 403 — Resource not accessible by personal access token
+   ```
+
+2. **Export it where supervisord can see it**, so the runner inherits it.
+   It is deliberately not written into `supervisor/gpuq-runner.conf` itself:
+   that file is world-readable and lands in `/etc`, and `%(ENV_X)s`
+   references there fail supervisord's config *parse* — not just the
+   substitution — if the variable is unset anywhere in supervisord's own
+   environment, which would stop the runner starting on every box that has
+   never heard of autofix. Exporting it one level up avoids both problems:
+
+   ```bash
+   echo 'export GPUQ_GITHUB_TOKEN=<the-pat>' >> /etc/default/supervisor
+   supervisorctl restart gpuq-runner
+   ```
+
+3. **The OAuth token for the Action**, from `claude setup-token` on your own
+   machine, stored as the repository secret `CLAUDE_CODE_OAUTH_TOKEN`. It
+   draws on your Max subscription. It lives only as a repo secret and never
+   goes near the box.
+
+The runner creates the labels it needs (`gpuq-auto`, `gpuq-reported`,
+`throttled`, `fix-me`) the first time it files.
+
+**The off switch** is a repository variable, not a commit: set
+`GPUQ_AUTOFIX` to `off` under Settings → Secrets and variables → Actions →
+Variables. Filing continues; dispatching stops. It can be flipped from the
+GitHub mobile web UI.
+
+**Branch protection on `main`** is what makes this safe to leave on. The
+Action opens PRs; you merge them.
+
 ## 5. Verify
 
 ```bash

@@ -33,3 +33,24 @@ commit_artifacts = true
 # results_remote   = "git@github.com:you/your-results.git"
 # results_checkout = "/workspace/checkouts/your-results"
 # results_branch   = "main"
+
+# When gpuq's own code raises, file a GitHub issue carrying the traceback so
+# a headless Claude Code run can open a PR against it. Off by default:
+# turning it on means this box holds a GitHub token, which is not something
+# a config should inherit by accident.
+#
+# The token must be a fine-grained PAT scoped to `issues: write` on this
+# repository and NOT `contents`. Anyone who can queue a job here can use it,
+# exactly as with the results key above — the difference is that its worst
+# case is issue spam rather than a push.
+# [autofix]
+# enabled = true
+# repo    = "you/gpu-queue-management"
+# The environment variable holding the PAT. Named rather than GH_TOKEN so an
+# issues-only key is not inherited by every other tool on the box.
+# token_env = "GPUQ_GITHUB_TOKEN"
+# Auto-dispatches per rolling 24h. Past the cap the issue still files,
+# labelled `throttled`, with no run: evidence is never lost, budget cannot
+# run away.
+# max_dispatches_per_day = 3
+# closed_lookback_days = 30

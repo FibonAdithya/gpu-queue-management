@@ -29,6 +29,7 @@ same box should get scheduling without reimplementing it.
 | `gpuq` | Submit, list, inspect and cancel jobs. |
 | `gpuq-runner` | Supervisor-managed daemon. Admits CPU jobs concurrently and GPU jobs one at a time, reaps dead claims, commits artifacts. |
 | `bootstrap.sh` | Takes a bare box to a working runner, idempotently. |
+| `bugreport.py` / `bugfiler.py` | When gpuq's own code raises, file a GitHub issue carrying the traceback and a dedup signature so a headless Claude Code run can open a PR against it. Off unless configured; see `docs/specs/2026-08-05-autofix-design.md`. |
 
 ## Status
 
