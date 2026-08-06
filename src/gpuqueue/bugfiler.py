@@ -87,8 +87,15 @@ def find_open_issue(cfg: AutofixConfig, sig: str) -> dict | None:
 
 def find_open_pr(cfg: AutofixConfig, sig: str) -> int | None:
     """A bug that fails every job must not spawn one fix run per job. This
-    is the lookup that prevents that."""
-    rows = _exact(_search(cfg, "pr", "open", f"{sig} in:body"), sig)
+    is the lookup that prevents that.
+
+    Matches the other two lookups: the workflow prompt tells the fixer to
+    copy the issue's `sig: <hex>` line verbatim into the PR body, so
+    searching for exactly that line (not just the bare hex, which could
+    appear anywhere in a PR unrelated to this bug) is what makes this
+    lookup precise rather than a coincidence of gh's full-text search.
+    """
+    rows = _exact(_search(cfg, "pr", "open", f"sig: {sig} in:body"), sig)
     return rows[0]["number"] if rows else None
 
 

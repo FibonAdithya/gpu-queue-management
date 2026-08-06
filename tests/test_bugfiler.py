@@ -57,6 +57,28 @@ def test_an_open_pr_referencing_the_signature_is_found(gh, cfg):
     assert bugfiler.find_open_pr(cfg, "abc123abc123") == 12
 
 
+def test_the_pr_lookup_searches_for_the_sig_line_like_the_other_lookups(
+        gh, cfg):
+    """The workflow prompt tells the fixer to copy `sig: <hex>` verbatim
+    into the PR body -- it never mentions a bare hex anywhere else -- so
+    the search query must look for that literal line, exactly like
+    find_open_issue and find_recent_closed do, or production PRs (which
+    only ever carry the prefixed line) can never match."""
+    bugfiler.find_open_pr(cfg, "abc123abc123")
+    args, _ = gh.calls[-1]
+    search = args[args.index("--search") + 1]
+    assert search == "sig: abc123abc123 in:body"
+
+
+def test_a_pr_with_the_bare_hex_but_no_sig_prefix_is_rejected(gh, cfg):
+    """A PR that happens to mention the hex some other way -- not the
+    literal `sig: <hex>` line the fixer is told to copy -- must not be
+    treated as already addressing this bug."""
+    gh.replies[("pr", "list")] = json.dumps(
+        [{"number": 12, "body": "relates to abc123abc123 somehow"}])
+    assert bugfiler.find_open_pr(cfg, "abc123abc123") is None
+
+
 def test_a_recently_closed_issue_is_found(gh, cfg):
     gh.replies[("issue", "list")] = json.dumps(
         [{"number": 3, "body": "sig: abc123abc123"}])

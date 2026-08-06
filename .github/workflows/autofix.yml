@@ -85,6 +85,14 @@ jobs:
             5. One root cause per PR. If you find a second bug, mention it
                in the PR body and leave it.
 
+            6. Copy the `sig: <hex>` line from the issue body verbatim into
+               your PR body (its own line, unchanged). The box that filed
+               this issue searches open PRs for that exact line to tell
+               whether a bug already has a fix in flight, so it does not
+               start a second run against the same bug while yours is
+               still open. Without that line, the box cannot tell your PR
+               apart from an unrelated one and will keep dispatching.
+
             Read `docs/specs/2026-08-05-autofix-design.md` for why this
             system exists and `docs/design.md` for how the queue works.
             Open a PR against `main`; do not merge it.
