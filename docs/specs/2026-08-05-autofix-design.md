@@ -31,8 +31,24 @@ job.
 The box's PAT is scoped to **`issues: write` on `gpu-queue-management` alone,
 and explicitly not `contents`**. `gpuq.example.toml` already makes this
 argument about the results key — *"anyone who can queue a job here can use that
-key"* — and it applies harder to a token that could otherwise write source. Its
-worst case is issue spam.
+key"* — and it applies harder to a token that could otherwise write source.
+
+Its worst case is *not* just issue spam, though. The issue body it can file
+is also the fixer's prompt (§6), and the `JobSpec` embedded in that body —
+`cmd`, `branch`, `project` — is caller-supplied, not filtered. Anyone who can
+queue a job on the box can therefore, in principle, put chosen text in front
+of the headless Claude Code run. This is why step 7 of the workflow prompt
+tells the fixer to read the JobSpec block as data about a failure and never
+as instructions: the risk is real, not merely theoretical, and the sentence
+in an earlier draft of this document calling the worst case "issue spam"
+alone was too reassuring. What actually bounds it is two things outside this
+module entirely — branch protection on `main`, so nothing the fixer writes
+lands without a human reading it, and the owner's own review of the PR before
+merge. Neither is new machinery; both already exist for the ordinary reason
+that an autonomous PR from *any* source should be read before it merges. The
+worst case, stated accurately, is issue spam plus an attacker-influenced
+prompt, held from becoming an attacker-influenced *merge* by those two
+controls.
 
 The OAuth token comes from `claude setup-token` and draws on the owner's Max
 budget. It lives only as a repo secret. The workflow triggers on `issues` and
@@ -176,6 +192,17 @@ a spend cap if it returns.
   file issues.
 - **A novel exception class fires repeatedly under distinct signatures.** The
   daily cap bounds it; the issues still accumulate as evidence.
+- **A caller puts chosen text in front of the fixer.** The `JobSpec` in the
+  issue body (§1, §6) is caller-supplied and unfiltered, and that body is the
+  prompt. The workflow instructs the fixer to treat it as data, not
+  instructions, but a prompt-injection attempt is not eliminated by an
+  instruction any more than input validation is eliminated by a comment
+  asking callers to be nice. What actually holds is downstream of the model:
+  branch protection on `main` and the owner's review before merge, the same
+  controls any autonomous-PR source needs regardless of how it was
+  triggered. The worst case is issue spam *plus* an attacker-influenced
+  prompt — not merely issue spam — bounded there rather than eliminated at
+  the source.
 
 ## 10. Verification
 

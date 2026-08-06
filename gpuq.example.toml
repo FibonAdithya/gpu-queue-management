@@ -54,3 +54,14 @@ commit_artifacts = true
 # run away.
 # max_dispatches_per_day = 3
 # closed_lookback_days = 30
+# Where the dispatch-budget counter lives. Defaults to <queue root>/autofix.json
+# and rarely needs setting by hand.
+# state_file = "/workspace/queue/autofix.json"
+# Seconds a signature must cool down before the runner will call `gh` for it
+# again. A broken git_ops can hand admit() the same failure once per pending
+# job in a single tick; without this, that is several gh subprocesses at 30s
+# each before admit() returns, stalling the poll of every running job for as
+# long as it takes. 900s (15 minutes) keeps that to a handful of calls per
+# bug per tick cycle while still refreshing occurrence counts at a
+# human-relevant pace.
+# report_cooldown_s = 900.0

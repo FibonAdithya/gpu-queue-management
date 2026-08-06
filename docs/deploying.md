@@ -252,10 +252,21 @@ Three things to set up, once:
 The runner creates the labels it needs (`gpuq-auto`, `gpuq-reported`,
 `throttled`, `fix-me`) the first time it files.
 
+A bug filed past the daily dispatch cap carries **both** `gpuq-auto` and
+`throttled`, so it still turns up in a `label:gpuq-auto` triage query even
+though no run happened for it. That second label is also why the workflow
+will not pick it up just because you add `fix-me`: the gate skips anything
+labelled `throttled` regardless of what else is on the issue. To dispatch a
+throttled bug by hand, **remove `throttled` first, then add `fix-me`** — in
+that order, since adding `fix-me` while `throttled` is still present does
+nothing.
+
 **The off switch** is a repository variable, not a commit: set
-`GPUQ_AUTOFIX` to `off` under Settings → Secrets and variables → Actions →
-Variables. Filing continues; dispatching stops. It can be flipped from the
-GitHub mobile web UI.
+`GPUQ_AUTOFIX` to `off` (also accepted: `false`, `no`, `disabled`, `0`, any
+case) under Settings → Secrets and variables → Actions → Variables. Filing
+continues; dispatching stops. It can be flipped from the GitHub mobile web
+UI. Leaving the variable unset is the default state of every repo and keeps
+autofix on, exactly as before this variable was ever set.
 
 **Branch protection on `main`** is what makes this safe to leave on. The
 Action opens PRs; you merge them.
