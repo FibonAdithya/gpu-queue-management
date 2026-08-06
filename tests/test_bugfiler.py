@@ -236,6 +236,62 @@ def test_a_filed_issue_records_a_dispatch(gh, cfg):
     assert bugfiler.dispatches_in_last_day(cfg, NOW) == 1
 
 
+def test_a_dispatch_is_recorded_before_the_issue_is_created(gh, cfg,
+                                                             monkeypatch):
+    """The survivable failure must go second. If record_dispatch runs after
+    _create_issue and then fails, a run has already been authorised (the
+    issue exists with gpuq-auto) and the budget was never debited -- an
+    unwritable state file would silently remove the cap forever. Recording
+    first means a failure there can still fall back to filing throttled
+    with nothing authorised."""
+    order = []
+    real_record = bugfiler.record_dispatch
+    real_create = bugfiler._create_issue
+
+    def spy_record(cfg, now):
+        order.append("record_dispatch")
+        return real_record(cfg, now)
+
+    def spy_create(cfg, title, body, label):
+        order.append("create_issue")
+        return real_create(cfg, title, body, label)
+
+    monkeypatch.setattr(bugfiler, "record_dispatch", spy_record)
+    monkeypatch.setattr(bugfiler, "_create_issue", spy_create)
+    bugfiler.file_bug(cfg, _boom(), "checkout", now=NOW)
+    assert order == ["record_dispatch", "create_issue"]
+
+
+def test_an_unwritable_state_file_files_throttled_instead_of_dispatching(
+        gh, cfg, monkeypatch):
+    """A broken counter must degrade to no-dispatch, never to
+    infinite-dispatch. Evidence (the issue) is still filed either way --
+    what must not happen is the run being authorised while the budget
+    silently stops moving."""
+    def boom(cfg, now):
+        raise OSError("state dir is not writable")
+
+    monkeypatch.setattr(bugfiler, "record_dispatch", boom)
+    outcome = bugfiler.file_bug(cfg, _boom(), "checkout", now=NOW)
+    assert outcome == "filed-throttled"
+    args, _ = _created(gh)
+    assert args is not None  # evidence still files
+    assert args[args.index("--label") + 1] == bugfiler.THROTTLED_LABEL
+
+
+def test_a_missing_state_file_path_files_throttled_rather_than_crashing(
+        gh, cfg):
+    """Path(None) raises TypeError. A config with autofix enabled but no
+    state_file (exactly what tests/test_runner.py::_enable builds) must
+    still file the issue, just without a working dispatch cap."""
+    cfg.state_file = None
+    outcome = bugfiler.file_bug(cfg, _boom(), "checkout", now=NOW)
+    assert outcome == "filed-throttled"
+    args, _ = _created(gh)
+    assert args is not None
+    assert args[args.index("--label") + 1] == bugfiler.THROTTLED_LABEL
+
+
 def test_an_existing_open_issue_is_commented_not_refiled(gh, cfg):
     sig_body = "sig: {sig}\noccurrences: 1\nfirst seen: x\nlast seen: x"
 

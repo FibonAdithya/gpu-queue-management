@@ -265,13 +265,35 @@ def file_bug(cfg: AutofixConfig, exc: BaseException, phase: str, *,
         body += (f"\nPreviously fixed in #{closed}; that fix did not hold.\n")
 
     throttled = not may_dispatch(cfg, now)
+    if not throttled:
+        # Record the dispatch *before* the issue exists, not after. This
+        # is a two-step operation that cannot be made atomic, so the
+        # survivable failure must go second: if `record_dispatch` raises
+        # (state_file's directory unwritable, disk full) before any issue
+        # exists, nothing has been authorised yet and we can still fall
+        # back to filing as throttled below. The old order created the
+        # issue first -- with the `gpuq-auto` label, already authorising a
+        # run -- and only then tried to debit the budget; if that write
+        # failed, the run was authorised and the budget never moved,
+        # i.e. an unwritable state file silently disabled the cap forever
+        # (verified: a mode-0500 state dir let five faults file five
+        # `gpuq-auto` issues in a row). A broken counter must degrade to
+        # no-dispatch, never to infinite-dispatch -- so on failure here we
+        # fall through and file as throttled instead of dispatching.
+        try:
+            record_dispatch(cfg, now)
+        except Exception as e:
+            log.warning("autofix: could not record a dispatch, filing "
+                        "throttled instead: %s", e)
+            throttled = True
     label = THROTTLED_LABEL if throttled else AUTO_LABEL
     _create_issue(cfg, issue_title(report), body, label)
     if throttled:
         # Evidence is never lost; budget cannot run away.
         log.warning("autofix throttled: filed %s with no run", report.sig)
         return "filed-throttled"
-    record_dispatch(cfg, now)
+    log.info("autofix dispatched: filed %s and recorded the dispatch",
+             report.sig)
     return "filed"
 
 
