@@ -207,3 +207,25 @@ def test_bump_is_repeatable():
 def test_bump_leaves_a_body_it_does_not_recognise_alone():
     """An owner may have rewritten the body by hand. Never mangle it."""
     assert bump_body("hand written", "2026-08-06T09:00:00Z") == "hand written"
+
+
+def test_every_module_in_the_package_is_recognised_as_a_gpuqueue_frame():
+    """`_is_gpuqueue_frame` recognises a package frame by checking that
+    `Path(filename).parent.name == "gpuqueue"` -- true today because the
+    package is flat, but silently false for any file a future subpackage
+    puts one directory deeper. That failure mode is quiet: frames just drop
+    out of the signature and the fingerprint gets weaker, not an error
+    anyone would notice. This test is cheap insurance, not a guarantee the
+    check is future-proof -- it exists so the day someone adds a
+    subpackage, the suite says so instead of the fingerprint degrading
+    unnoticed."""
+    import gpuqueue
+    from gpuqueue.bugreport import _is_gpuqueue_frame
+
+    pkg_dir = Path(gpuqueue.__file__).parent
+    modules = list(pkg_dir.glob("*.py"))
+    assert modules, "sanity check: the glob must actually find the package"
+    for module in modules:
+        assert _is_gpuqueue_frame(str(module)), (
+            f"{module} is not recognised as a gpuqueue frame -- "
+            "_is_gpuqueue_frame needs updating for the package layout")
