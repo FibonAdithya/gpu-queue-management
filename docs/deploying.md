@@ -230,6 +230,14 @@ Three things to set up, once:
    claim as "worst case is issue spam"; treat the PR the same way you would
    treat one from any other outside contributor.
 
+   One thing to know before pointing this at a **public** repo: the issue
+   body embeds the failing job's `JobSpec`, which includes its `cmd`
+   verbatim. A `JobSpec` has no environment field, so nothing is copied out
+   of the box's environment by construction — but a job submitted with a
+   secret in its command line publishes that secret. Pass credentials
+   through the environment, never as an argument, on any box filing into a
+   repo that is not private.
+
    Confirm it cannot push:
 
    ```bash

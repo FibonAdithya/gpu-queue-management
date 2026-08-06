@@ -6,7 +6,13 @@ name: autofix
 
 on:
   issues:
-    types: [opened, labeled]
+    # `unlabeled` is here for one case: taking `throttled` back off. The
+    # gate below rejects any issue still carrying it, and an owner
+    # overriding the throttle naturally reaches for `fix-me` first and
+    # removes `throttled` second -- which under `[opened, labeled]` alone
+    # ran nothing at all, because the `labeled` event fired while
+    # `throttled` was still on and no later event ever came.
+    types: [opened, labeled, unlabeled]
 
 permissions:
   contents: write
@@ -35,6 +41,10 @@ jobs:
             && contains(github.event.issue.labels.*.name, 'gpuq-auto'))
         || (github.event.action == 'labeled'
             && github.event.label.name == 'fix-me')
+        || (github.event.action == 'unlabeled'
+            && github.event.label.name == 'throttled'
+            && (contains(github.event.issue.labels.*.name, 'gpuq-auto')
+                || contains(github.event.issue.labels.*.name, 'fix-me')))
          )
     runs-on: ubuntu-latest
     timeout-minutes: 30

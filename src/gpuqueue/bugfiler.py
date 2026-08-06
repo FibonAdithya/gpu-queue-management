@@ -22,12 +22,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .bugreport import (build_report, bump_body, is_gpuq_fault, issue_body,
-                        issue_title)
+                        issue_title, last_seen)
 from .config import AutofixConfig
 
 log = logging.getLogger("gpuqueue.bugfiler")
 
 GH_TIMEOUT_S = 30
+
+# How stale an issue's `last seen` must be before a recurrence also posts a
+# comment. Not a config knob: it controls notification noise on GitHub, not
+# anything about how the box behaves, and there is no box-specific reason
+# to want it different. See the recurrence branch in `file_bug`.
+COMMENT_INTERVAL = timedelta(days=1)
 
 # The runner applies these; the workflow dispatches on them.
 AUTO_LABEL = "gpuq-auto"           # structural evidence, dispatches at once
@@ -113,6 +119,23 @@ def _exact(rows: list[dict], sig: str) -> list[dict]:
 # is the worst case rather than a missed fix-in-flight.
 
 
+# How many open `gpuq-auto` issues find_open_issue will look at. gh pages
+# this in hundreds, so a normal repo with a dozen open bugs still costs one
+# request; the cost only appears on a repo that has genuinely accumulated
+# hundreds, where correctness is worth a second round trip.
+#
+# It was 100, which was the one unbounded issue-spam path in a module whose
+# whole safety argument is "the worst case is issue spam". gh lists
+# newest-first, and nothing bounds the number of open auto-filed issues:
+# `max_dispatches_per_day` caps dispatches, not filings (a throttled bug
+# still files, with AUTO_LABEL), and `report_cooldown_s` is per-signature.
+# So an untriaged backlog past the limit pushed the oldest signatures out
+# of the window, and every recurrence of those bugs filed a fresh duplicate
+# -- forever, with no log line saying why. A cap cannot be removed
+# entirely, so the remaining one is loud: see the saturation warning below.
+_OPEN_ISSUE_LIMIT = 500
+
+
 def find_open_issue(cfg: AutofixConfig, sig: str) -> dict | None:
     """Is this bug already filed and open?
 
@@ -124,13 +147,22 @@ def find_open_issue(cfg: AutofixConfig, sig: str) -> dict | None:
     """
     out = _gh(cfg, ["issue", "list", "--repo", cfg.repo, "--state", "open",
                     "--label", AUTO_LABEL, "--json", "number,body",
-                    "--limit", "100"])
+                    "--limit", str(_OPEN_ISSUE_LIMIT)])
     try:
         rows = json.loads(out or "[]")
     except json.JSONDecodeError:
         rows = []
-    rows = _exact(rows, sig)
-    return rows[0] if rows else None
+    hits = _exact(rows, sig)
+    if not hits and len(rows) >= _OPEN_ISSUE_LIMIT:
+        # Past the limit this lookup is no longer a complete index of our
+        # own work, so "not found" stops meaning "never filed" and starts
+        # meaning "not in the newest N". The duplicate that follows is
+        # unavoidable here; being silent about why is not.
+        log.warning(
+            "autofix: %d open %s issues is at the lookup limit -- dedup may "
+            "miss older signatures and file duplicates. Close some.",
+            len(rows), AUTO_LABEL)
+    return hits[0] if hits else None
 
 
 def find_open_pr(cfg: AutofixConfig, sig: str) -> int | None:
@@ -252,7 +284,7 @@ def refund_dispatch(cfg: AutofixConfig, now: datetime) -> None:
 
 _ISSUE_NUMBER = re.compile(r"/issues/(\d+)")
 
-# Names of labels confirmed present, tracked one at a time rather than one
+# Labels confirmed present, tracked one at a time rather than one
 # all-or-nothing flag. `gh issue create --label` fails outright on a label
 # that does not exist, and a transient failure on a single label (an auth
 # hiccup, a rate limit) must not be remembered as success for the whole
@@ -260,7 +292,13 @@ _ISSUE_NUMBER = re.compile(r"/issues/(\d+)")
 # life raises GhError on a label gh never actually created, and since the
 # runner swallows GhError, filing silently stops for good. Only genuinely
 # confirmed labels are skipped; anything that failed is retried next call.
-_labels_ensured: set[str] = set()
+#
+# Keyed by (repo, label), not label alone: a label exists in a repository,
+# not in a process. Two AutofixConfigs with different `repo` values in one
+# interpreter -- tests, or a runner that grows a second project -- would
+# otherwise have labels confirmed against the first repo suppress creation
+# in the second, and `issue create --label` fails outright there.
+_labels_ensured: set[tuple[str, str]] = set()
 
 _LABEL_SPECS = (
     (AUTO_LABEL, "B60205", "filed by the gpuq runner from its own traceback"),
@@ -281,7 +319,8 @@ def ensure_labels(cfg: AutofixConfig) -> None:
     from treating "already exists" as the success it is instead.
     """
     for name, colour, desc in _LABEL_SPECS:
-        if name in _labels_ensured:
+        key = (cfg.repo or "", name)
+        if key in _labels_ensured:
             continue
         try:
             _gh(cfg, ["label", "create", name, "--repo", cfg.repo,
@@ -291,11 +330,11 @@ def ensure_labels(cfg: AutofixConfig) -> None:
                 # The steady state of every box after its first bug. Not a
                 # failure, and must not be retried four times per bug for
                 # the life of the process.
-                _labels_ensured.add(name)
+                _labels_ensured.add(key)
             else:
                 log.warning("could not ensure label %s: %s", name, e)
         else:
-            _labels_ensured.add(name)
+            _labels_ensured.add(key)
 
 
 def _create_issue(cfg: AutofixConfig, title: str, body: str,
@@ -326,6 +365,13 @@ def file_bug(cfg: AutofixConfig, exc: BaseException, phase: str, *,
         return "caller-fault"
 
     now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        # `now` is a public argument, and everything downstream of it is
+        # aware: _load_dispatches forces UTC on what it reads, so a naive
+        # one would raise on the comparison in dispatches_in_last_day and
+        # would never match itself in refund_dispatch. Normalise once,
+        # here, rather than defending in three places.
+        now = now.replace(tzinfo=timezone.utc)
     report = build_report(exc, phase, spec=spec, queue_counts=queue_counts,
                           gpuq_commit=gpuq_commit(),
                           occurred_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"))
@@ -333,12 +379,24 @@ def file_bug(cfg: AutofixConfig, exc: BaseException, phase: str, *,
     # 1. an open issue with this signature: record the recurrence, run nothing.
     existing = find_open_issue(cfg, report.sig)
     if existing:
-        _gh(cfg, ["issue", "comment", str(existing["number"]),
-                  "--repo", cfg.repo, "--body-file", "-"],
-            stdin=f"Seen again at {report.occurred_at} "
-                  f"(job {report.job['id'] if report.job else 'n/a'}).")
-        bumped = bump_body(existing.get("body") or "", report.occurred_at)
-        if bumped != (existing.get("body") or ""):
+        body = existing.get("body") or ""
+        # The body is bumped on every recurrence; the comment is not. A
+        # bug that keeps failing recurs every `report_cooldown_s` (15
+        # minutes by default) for as long as nobody triages it, which at
+        # one comment apiece buried the issue under ~96 comments a day and
+        # made the traceback that matters harder to reach, not easier.
+        # The count and `last seen` in the body carry the same information
+        # losslessly and in one place, so the comment's only real job is to
+        # put the issue back in someone's notifications -- worth doing
+        # daily, not four times an hour.
+        previous = last_seen(body)
+        if previous is None or now - previous >= COMMENT_INTERVAL:
+            _gh(cfg, ["issue", "comment", str(existing["number"]),
+                      "--repo", cfg.repo, "--body-file", "-"],
+                stdin=f"Seen again at {report.occurred_at} "
+                      f"(job {report.job['id'] if report.job else 'n/a'}).")
+        bumped = bump_body(body, report.occurred_at)
+        if bumped != body:
             _gh(cfg, ["issue", "edit", str(existing["number"]),
                       "--repo", cfg.repo, "--body-file", "-"], stdin=bumped)
         return "commented-issue"

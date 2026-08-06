@@ -23,7 +23,14 @@ from .executor import StartFailed
 # The phase a failure came out of. Part of the signature, so a git failure
 # during checkout and the same git failure during artifact collection are
 # two bugs rather than one.
-PHASES = ("preflight", "checkout", "execute", "artifacts", "reap", "admit")
+#
+# "execute" is a job that would not start; "collect" is the poll-and-finish
+# pass over jobs that did. They were one string once, which put two
+# unrelated failures under one word in the issue title -- the signature
+# told them apart by frame names, but the human reading the title could
+# not.
+PHASES = ("preflight", "checkout", "execute", "collect", "artifacts",
+          "reap", "admit")
 
 # StartFailed is genuinely ambiguous: gpuq raises it, but usually because
 # the caller's `-- command` names something that is not there. Only these
@@ -79,7 +86,7 @@ def _is_gpuqueue_frame(filename: str) -> bool:
 
 
 _OCCURRENCES = re.compile(r"^occurrences: (\d+)$", re.MULTILINE)
-_LAST_SEEN = re.compile(r"^last seen: .*$", re.MULTILINE)
+_LAST_SEEN = re.compile(r"^last seen: (.*)$", re.MULTILINE)
 
 _PREAMBLE = (
     "gpuq's own code raised this. Filed automatically by the runner on the "
@@ -121,10 +128,18 @@ def build_report(exc: BaseException, phase: str, *, spec=None,
     )
 
 
+# GitHub truncates a title past 256 characters. Bound the whole string
+# rather than just the message: the signature suffix is appended after the
+# slice, and it is the one part of the title that must survive intact --
+# it is what a human matches against `sig:` when triaging by eye.
+TITLE_MAX = 200
+
+
 def issue_title(report: BugReport) -> str:
     first_line = report.message.strip().splitlines()[0] if report.message else ""
-    return f"[gpuq] {report.phase}: {report.exc_type}: {first_line}"[:200] \
-           + f" [{report.sig}]"
+    suffix = f" [{report.sig}]"
+    head = f"[gpuq] {report.phase}: {report.exc_type}: {first_line}"
+    return head[:TITLE_MAX - len(suffix)] + suffix
 
 
 def issue_body(report: BugReport) -> str:
@@ -175,3 +190,22 @@ def bump_body(body: str, occurred_at: str) -> str:
     body = _OCCURRENCES.sub(f"occurrences: {int(match.group(1)) + 1}", body,
                             count=1)
     return _LAST_SEEN.sub(f"last seen: {occurred_at}", body, count=1)
+
+
+def last_seen(body: str) -> datetime | None:
+    """When this issue last recorded an occurrence, per its own body.
+
+    The body is the only durable record of that -- the filer holds no
+    per-issue state across restarts -- and it is what lets a recurrence
+    bump the count without also posting a comment every time. None when
+    the line is missing or unparseable, which the caller must read as "no
+    idea, so comment", not as "long ago".
+    """
+    match = _LAST_SEEN.search(body or "")
+    if not match:
+        return None
+    try:
+        when = datetime.strptime(match.group(1).strip(), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return when.replace(tzinfo=timezone.utc)

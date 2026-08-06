@@ -327,6 +327,23 @@ def test_a_reap_failure_files_a_bug_and_still_crashes_the_tick(env, filed,
     assert [c["phase"] for c in filed] == ["reap"]
 
 
+def test_a_collect_failure_files_under_collect_not_execute(env, filed,
+                                                           monkeypatch):
+    """`tick` wraps `collect` and `_launch` reports StartFailed, and both
+    said "execute" once -- so the issue title read the same for a job that
+    would not start and for the pass that finishes jobs which did. The
+    signature told them apart by frame names; the human reading the title
+    could not."""
+    r, sha = env
+    _enable(r)
+    monkeypatch.setattr(r, "collect",
+                        lambda: (_ for _ in ()).throw(
+                            RuntimeError("collect exploded")))
+    with pytest.raises(RuntimeError, match="collect exploded"):
+        r.tick()
+    assert [c["phase"] for c in filed] == ["collect"]
+
+
 def test_a_preflight_failure_files_only_the_inner_phase(env, filed,
                                                         monkeypatch):
     """`_take_card` already reports and re-raises a preflight exception

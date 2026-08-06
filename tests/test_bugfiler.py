@@ -604,3 +604,128 @@ def test_a_naive_timestamp_does_not_crash_the_comparison(cfg):
     cfg.state_file.write_text(json.dumps({"dispatches": [naive, aware]}))
     assert bugfiler.dispatches_in_last_day(cfg, NOW) == 2
     assert bugfiler.may_dispatch(cfg, NOW) is True
+
+
+def _sig_body(sig, last="a"):
+    return f"sig: {sig}\noccurrences: 1\nfirst seen: a\nlast seen: {last}"
+
+
+def test_a_backlog_at_the_lookup_limit_is_logged_not_silently_deduped_wrong(
+        gh, cfg, caplog):
+    """find_open_issue is the only thing standing between a recurring bug
+    and a fresh duplicate issue every time, and it reads a bounded list.
+    Nothing bounds the open-issue count on the other side:
+    max_dispatches_per_day caps dispatches rather than filings, and
+    report_cooldown_s is per-signature. Past the limit, "not found" stops
+    meaning "never filed" -- the duplicate is unavoidable there, but going
+    quiet about why is not.
+    """
+    rows = [{"number": n, "body": f"sig: {n:012d}"}
+            for n in range(bugfiler._OPEN_ISSUE_LIMIT)]
+    gh.replies[("issue", "list")] = json.dumps(rows)
+    with caplog.at_level("WARNING"):
+        assert bugfiler.find_open_issue(cfg, "abc123abc123") is None
+    assert "dedup may miss" in caplog.text
+
+
+def test_a_backlog_under_the_limit_warns_about_nothing(gh, cfg, caplog):
+    """The warning must mean something when it appears. A repo with a
+    handful of open bugs and a genuinely new signature is the normal case."""
+    gh.replies[("issue", "list")] = json.dumps(
+        [{"number": 1, "body": "sig: 999999999999"}])
+    with caplog.at_level("WARNING"):
+        assert bugfiler.find_open_issue(cfg, "abc123abc123") is None
+    assert caplog.text == ""
+
+
+def test_the_open_issue_lookup_asks_for_more_than_a_single_page(gh, cfg):
+    """gh pages this in hundreds, so a normal repo still costs one request
+    and only a real backlog pays for a second."""
+    bugfiler.find_open_issue(cfg, "abc123abc123")
+    args, _ = gh.calls[-1]
+    assert int(args[args.index("--limit") + 1]) >= 500
+
+
+def test_a_recurrence_inside_the_comment_interval_bumps_without_commenting(
+        gh, cfg):
+    """A bug nobody has triaged recurs every report_cooldown_s for as long
+    as it lasts -- 15 minutes by default, which at one comment apiece
+    buried the traceback that matters under ~96 comments a day. The body's
+    count and `last seen` carry the same information losslessly."""
+    from gpuqueue.bugreport import signature
+    exc = _boom()
+    sig = signature(exc, "checkout")
+    recent = (NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    gh.replies[("issue", "list")] = json.dumps(
+        [{"number": 7, "body": _sig_body(sig, last=recent)}])
+
+    assert bugfiler.file_bug(cfg, exc, "checkout", now=NOW) == "commented-issue"
+    assert not any(a[:2] == ["issue", "comment"] for a, _ in gh.calls)
+    edits = [s for a, s in gh.calls if a[:2] == ["issue", "edit"]]
+    assert edits and "occurrences: 2" in edits[0]
+
+
+def test_a_recurrence_past_the_comment_interval_comments_again(gh, cfg):
+    """The comment's real job is putting the issue back in someone's
+    notifications. Worth doing daily -- just not four times an hour."""
+    from gpuqueue.bugreport import signature
+    exc = _boom()
+    sig = signature(exc, "checkout")
+    old = (NOW - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    gh.replies[("issue", "list")] = json.dumps(
+        [{"number": 7, "body": _sig_body(sig, last=old)}])
+
+    bugfiler.file_bug(cfg, exc, "checkout", now=NOW)
+    assert any(a[:2] == ["issue", "comment"] for a, _ in gh.calls)
+
+
+def test_a_body_with_no_readable_last_seen_still_gets_its_comment(gh, cfg):
+    """An owner who rewrote the body by hand loses the timestamp, not the
+    notification. Unparseable must read as "no idea, so comment"."""
+    from gpuqueue.bugreport import signature
+    exc = _boom()
+    gh.replies[("issue", "list")] = json.dumps(
+        [{"number": 7, "body": f"sig: {signature(exc, 'checkout')}\nrewritten"}])
+    bugfiler.file_bug(cfg, exc, "checkout", now=NOW)
+    assert any(a[:2] == ["issue", "comment"] for a, _ in gh.calls)
+
+
+def test_labels_confirmed_in_one_repo_are_not_assumed_in_another(gh, cfg):
+    """A label exists in a repository, not in a process. Keyed by name
+    alone, a second AutofixConfig skipped creating labels it had never
+    created there -- and `issue create --label` fails outright on a label
+    that does not exist."""
+    from gpuqueue.config import AutofixConfig
+    other = AutofixConfig(enabled=True, repo="you/other",
+                          state_file=cfg.state_file)
+    bugfiler.ensure_labels(cfg)
+    bugfiler.ensure_labels(other)
+    repos = [a[a.index("--repo") + 1]
+             for a, _ in gh.calls if a[:2] == ["label", "create"]]
+    assert repos.count("you/gpuq") == len(bugfiler._LABEL_SPECS)
+    assert repos.count("you/other") == len(bugfiler._LABEL_SPECS)
+
+
+def test_a_naive_now_is_normalised_rather_than_crashing_the_budget(gh, cfg):
+    """`now` is a public argument and everything downstream of it is
+    aware: _load_dispatches forces UTC on what it reads, so a naive one
+    would raise comparing itself in dispatches_in_last_day and would never
+    match itself in refund_dispatch."""
+    naive = datetime(2026, 8, 5, 12, 0)
+    assert bugfiler.file_bug(cfg, _boom(), "checkout", now=naive) == "filed"
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 1
+
+
+def test_a_naive_now_still_gets_its_dispatch_refunded(gh, cfg, monkeypatch):
+    """The refund matches a recorded timestamp by equality, so the
+    normalisation has to happen before the debit, not after it."""
+    def fail_create(_cfg, args, stdin=None):
+        if args[:2] == ["issue", "create"]:
+            raise bugfiler.GhError("github is down")
+        return "[]"
+    monkeypatch.setattr(bugfiler, "_gh", fail_create)
+
+    with pytest.raises(bugfiler.GhError):
+        bugfiler.file_bug(cfg, _boom(), "checkout",
+                          now=datetime(2026, 8, 5, 12, 0))
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 0

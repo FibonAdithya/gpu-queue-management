@@ -1,11 +1,12 @@
 import errno
 import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from gpuqueue.bugreport import (CallerError, is_gpuq_fault, PHASES,
                                 signature, build_report, issue_title,
-                                issue_body, bump_body)
+                                issue_body, bump_body, last_seen, TITLE_MAX)
 from gpuqueue.executor import StartFailed
 from gpuqueue.git_ops import GitError
 from gpuqueue import git_ops
@@ -60,8 +61,16 @@ def test_start_failed_with_no_errno_is_gpuq_fault():
 
 
 def test_the_designed_phases_exist():
-    assert PHASES == ("preflight", "checkout", "execute", "artifacts",
-                      "reap", "admit")
+    assert PHASES == ("preflight", "checkout", "execute", "collect",
+                      "artifacts", "reap", "admit")
+
+
+def test_execute_and_collect_are_separate_phases():
+    """A job that would not start and the pass that finishes jobs which did
+    are two different failures. They shared the string "execute" once,
+    which put both under one word in the issue title -- signatures told
+    them apart, the human reading the title did not."""
+    assert "execute" in PHASES and "collect" in PHASES
 
 
 def _git_failure():
@@ -207,6 +216,44 @@ def test_bump_is_repeatable():
 def test_bump_leaves_a_body_it_does_not_recognise_alone():
     """An owner may have rewritten the body by hand. Never mangle it."""
     assert bump_body("hand written", "2026-08-06T09:00:00Z") == "hand written"
+
+
+def test_last_seen_reads_back_what_the_body_recorded():
+    """The body is the filer's only durable per-issue state -- it holds
+    nothing across restarts -- so this round trip is what lets a recurrence
+    bump the count without also commenting every time."""
+    body = bump_body(issue_body(_report()), "2026-08-06T09:00:00Z")
+    assert last_seen(body) == datetime(2026, 8, 6, 9, 0, tzinfo=timezone.utc)
+
+
+def test_last_seen_is_aware_so_it_can_be_compared_to_now():
+    assert last_seen(issue_body(_report())).tzinfo is not None
+
+
+def test_last_seen_of_an_unrecognisable_body_is_none_not_a_guess():
+    """None must read as "no idea, so comment", never as "long ago" -- a
+    body an owner rewrote by hand should still get its notification."""
+    assert last_seen("hand written") is None
+    assert last_seen("last seen: sometime last tuesday") is None
+    assert last_seen("") is None
+
+
+def test_the_title_stays_within_githubs_limit_including_the_signature():
+    """The slice used to run before the signature was appended, so the
+    returned string was longer than the number in the code suggested."""
+    r = _report()
+    r.message = "x" * 500
+    title = issue_title(r)
+    assert len(title) <= TITLE_MAX
+    assert title.endswith(f" [{r.sig}]")
+
+
+def test_a_long_message_never_costs_the_signature():
+    """Truncation must eat the message, not the one part of the title a
+    human matches against `sig:` when triaging by eye."""
+    r = _report()
+    r.message = "y" * 500
+    assert r.sig in issue_title(r)
 
 
 def test_every_module_in_the_package_is_recognised_as_a_gpuqueue_frame():

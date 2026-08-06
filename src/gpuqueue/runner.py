@@ -71,7 +71,7 @@ class Runner:
 
     def tick(self) -> None:
         self._phase("reap", self._reap)
-        self._phase("execute", self.collect)
+        self._phase("collect", self.collect)
         self._phase("admit", self.admit)
 
     def _phase(self, phase: str, fn) -> None:

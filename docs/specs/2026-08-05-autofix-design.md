@@ -133,6 +133,18 @@ deduplicated automatically; the owner closes duplicates when triaging the
 - Three auto-dispatches per rolling 24h. Past the cap the issue **still files**,
   labelled `throttled`, with no run — evidence is never lost, budget cannot run
   away.
+- **To run a `throttled` bug anyway, remove `throttled`.** That is the trigger;
+  adding `fix-me` on top of it is not, because the workflow refuses any issue
+  still carrying `throttled`. Either order works — the workflow also fires on
+  the label being removed — but removing `throttled` is the act that does it,
+  and an issue left carrying both labels runs nothing.
+- A recurrence always bumps `occurrences` and `last seen` in the body; it also
+  posts a comment at most once a day. An untriaged bug recurs every
+  `report_cooldown_s`, and a comment per recurrence buried the traceback that
+  matters under roughly a hundred a day.
+- Dedup reads the newest 500 open `gpuq-auto` issues. That is a real ceiling:
+  past it, older signatures fall out of the lookup and recur as duplicates.
+  The runner logs a warning when the list comes back full — close bugs.
 - Repo variable `GPUQ_AUTOFIX`, read by the workflow. Setting it to `off` from
   the GitHub mobile web UI stops everything without a commit.
 
