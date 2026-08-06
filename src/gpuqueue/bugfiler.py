@@ -6,8 +6,10 @@ with no `gh`, no token or no network runs jobs exactly as it does without
 autofix, so callers go through Runner._report_bug, which swallows GhError.
 
 The token this reaches for is scoped to `issues: write` on this repository
-and explicitly not `contents`. Nothing here pushes; its worst case is issue
-spam.
+and explicitly not `contents`. Nothing here pushes, but the issue body it
+files is also read as a prompt downstream, so its worst case is issue spam
+plus an attacker-influenced prompt, not issue spam alone -- see
+docs/specs/2026-08-05-autofix-design.md §1.
 """
 from __future__ import annotations
 

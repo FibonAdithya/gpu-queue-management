@@ -218,9 +218,17 @@ Three things to set up, once:
 1. **A fine-grained PAT**, on github.com → Settings → Developer settings →
    Fine-grained tokens. Scope it to this repository alone, and give it
    `Issues: Read and write` and nothing else. Explicitly **not** `Contents` —
-   anyone who can queue a job on this box can use this key, and the whole
-   argument for autofix being safe is that its worst case is issue spam,
-   exactly the argument made for the results key above.
+   anyone who can queue a job on this box can use this key, the same
+   argument made for the results key above. Unlike that key, though, the
+   issue body this one files is also the fixer's prompt, and the `JobSpec`
+   inside it is caller-supplied and unfiltered — so the worst case here is
+   not just issue spam, but issue spam plus a prompt an attacker could try
+   to steer. What bounds that is outside this token entirely: branch
+   protection on `main`, so nothing the fixer writes lands unreviewed, and
+   your own read of the PR before you merge it. This token itself still
+   cannot push — confirm that below — but "cannot push" is not the same
+   claim as "worst case is issue spam"; treat the PR the same way you would
+   treat one from any other outside contributor.
 
    Confirm it cannot push:
 

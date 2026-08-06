@@ -223,7 +223,7 @@ def test_every_module_in_the_package_is_recognised_as_a_gpuqueue_frame():
     from gpuqueue.bugreport import _is_gpuqueue_frame
 
     pkg_dir = Path(gpuqueue.__file__).parent
-    modules = list(pkg_dir.glob("*.py"))
+    modules = list(pkg_dir.glob("**/*.py"))
     assert modules, "sanity check: the glob must actually find the package"
     for module in modules:
         assert _is_gpuqueue_frame(str(module)), (

@@ -37,9 +37,9 @@ Its worst case is *not* just issue spam, though. The issue body it can file
 is also the fixer's prompt (§6), and the `JobSpec` embedded in that body —
 `cmd`, `branch`, `project` — is caller-supplied, not filtered. Anyone who can
 queue a job on the box can therefore, in principle, put chosen text in front
-of the headless Claude Code run. This is why step 7 of the workflow prompt
-tells the fixer to read the JobSpec block as data about a failure and never
-as instructions: the risk is real, not merely theoretical, and the sentence
+of the headless Claude Code run. This is why the workflow prompt, ahead of
+its numbered steps, tells the fixer to read the JobSpec block as data about
+a failure and never as instructions: the risk is real, not merely theoretical, and the sentence
 in an earlier draft of this document calling the worst case "issue spam"
 alone was too reassuring. What actually bounds it is two things outside this
 module entirely — branch protection on `main`, so nothing the fixer writes
