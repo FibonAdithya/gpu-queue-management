@@ -448,3 +448,81 @@ def test_the_cooldown_expires_and_reports_again(env, filed, monkeypatch):
         submit(r, sha, f"j{i}", ["true"])
     r.admit()
     assert len(filed) == 3
+
+
+def test_an_unpushed_commit_is_a_caller_error_not_a_checkout_bug(env, filed):
+    """'I submitted at a commit I forgot to push' is the likeliest caller
+    mistake in this system. Unchecked, it would reach `add_worktree`, fail
+    exactly like a genuine git_ops fault, and file a gpuq bug -- burning one
+    of three daily dispatches on a Claude run that can only close it. The
+    classifier must see a CallerError, not a raw GitError."""
+    from gpuqueue.bugreport import CallerError
+    r, sha = env
+    _enable(r)
+    unpushed = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    submit(r, unpushed, "j1", ["true"])
+    r.admit()
+    body = json.loads((r.queue.root / "failed" / "j1.json").read_text())
+    assert "push it first" in body["error"]
+    assert unpushed in body["error"]
+    assert [type(c["exc"]) for c in filed] == [CallerError]
+    assert filed[0]["phase"] == "checkout"
+
+
+def test_settle_finishes_the_job_before_filing_an_artifact_bug(env, monkeypatch):
+    """`_report_bug` can block for ~250s on `gh`. The job is already out of
+    `self.active` by the time `_settle` runs, so if that call happened
+    before `queue.finish`, a crash in the filing window would leave a
+    completed job stranded in running/ with a stale pid -- and the reaper
+    would requeue and re-run work that already finished. Filing must happen
+    after the job is recorded finished, matching both `_launch` sites."""
+    r, sha = env
+    _enable(r)
+    order = []
+    real_finish = r.queue.finish
+
+    def spy_finish(spec, ok):
+        order.append("finish")
+        return real_finish(spec, ok=ok)
+
+    def spy_report(exc, phase, spec=None):
+        order.append("report_bug")
+
+    monkeypatch.setattr(r.queue, "finish", spy_finish)
+    monkeypatch.setattr(r, "_report_bug", spy_report)
+    submit(r, sha, "j1", ["true"], artifacts=["runs/never.json"])
+    drain(r)
+    assert order == ["finish", "report_bug"]
+
+
+def test_a_throttled_bug_still_carries_the_auto_label(env, monkeypatch):
+    """A `label:gpuq-auto` triage query must find a throttled bug too -- it
+    is the same structural evidence as a dispatched one, only the budget
+    held the run back. bugfiler.file_bug owns the label choice; this
+    confirms the runner's call into it produces a labels list containing
+    both, via the real file_bug (not the `filed` fixture's stub)."""
+    from gpuqueue import bugfiler
+    from gpuqueue.config import AutofixConfig
+
+    r, sha = env
+    r.cfg.autofix = AutofixConfig(enabled=True, repo="you/gpuq",
+                                  max_dispatches_per_day=0,
+                                  state_file=r.queue.root / "autofix.json")
+    seen_labels = []
+
+    def fake_gh(cfg, args, stdin=None):
+        if args[:2] == ["issue", "list"] or args[:2] == ["pr", "list"]:
+            return "[]"
+        if args[:2] == ["issue", "create"]:
+            seen_labels.append([args[i + 1] for i, a in enumerate(args)
+                                if a == "--label"])
+            return "https://github.com/you/gpuq/issues/1\n"
+        return ""
+
+    monkeypatch.setattr(bugfiler, "_gh", fake_gh)
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: (_ for _ in ()).throw(
+                            rn.git_ops.GitError("worktree add failed")))
+    submit(r, sha, "j1", ["true"])
+    r.admit()
+    assert seen_labels == [[bugfiler.AUTO_LABEL, bugfiler.THROTTLED_LABEL]]

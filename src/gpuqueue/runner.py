@@ -107,13 +107,22 @@ class Runner:
         autofix; losing a bug report is an acceptable outcome, losing a job
         is not.
 
-        On a real gpuq fault, `file_bug` makes at least two `gh` calls
-        before its throttle applies, each with its own subprocess timeout of
-        up to 30s -- and this all happens on the single thread that also
-        polls every running job, so a network-partitioned box can stall
-        polling for roughly a minute per occurrence. The common cases are
-        free of that cost: `CallerError` and errno-classified `StartFailed`
-        are classified and returned before any `gh` subprocess runs.
+        On a real gpuq fault, and worse than "roughly a minute" might
+        suggest: `gpuq_commit`'s git call (10s) plus the three dedup lookups
+        -- open issue, open PR, recently-closed issue (90s) -- plus
+        `ensure_labels`, which retries every one of its four labels until
+        each individually succeeds rather than giving up as a set (120s),
+        plus `issue create` (30s), each a subprocess capped at
+        `GH_TIMEOUT_S` = 30s, is a first-fault worst case of roughly 250s --
+        and this all happens on the single thread that also polls every
+        running job, so a network-partitioned box can stall polling for the
+        better part of five minutes on the first occurrence of a new bug.
+        The common cases are free of that cost: `CallerError` and
+        errno-classified `StartFailed` are classified and returned before
+        any `gh` subprocess runs. What actually bounds how often the ~250s
+        can be paid is the per-signature cooldown in `self._report_cooldowns`
+        below, not this docstring's arithmetic -- after the first
+        occurrence, a persisting bug is free until the cooldown expires.
         """
         # Tag first, and regardless of what filing does below: the tag means
         # "this exception already had its one chance to be reported", not
@@ -317,6 +326,20 @@ class Runner:
     def _prepare_workdir(self, spec: JobSpec, project: ProjectConfig) -> Path:
         checkout = git_ops.ensure_checkout(project)
         git_ops.git(["fetch", "--quiet", "origin"], cwd=checkout, check=False)
+        # "I submitted at a commit I forgot to push" is the likeliest caller
+        # mistake in this whole system. Left unchecked, `add_worktree` below
+        # fails on it just the same as it would on a genuine gpuq/git fault,
+        # and `_launch` reports both as phase `checkout` -- filing a gpuq bug
+        # (and burning one of three daily dispatches) for a Claude run that
+        # can only close it. Catch it here, before that path, with a message
+        # that tells the submitter what to do instead of a raw GitError.
+        try:
+            git_ops.git(["cat-file", "-e", f"{spec.commit}^{{commit}}"],
+                       cwd=checkout)
+        except git_ops.GitError:
+            raise CallerError(
+                f"commit {spec.commit} is not in {project.remote}; "
+                "push it first") from None
         return git_ops.add_worktree(checkout, self.queue.work_dir(spec.id),
                                     spec.commit)
 
@@ -341,11 +364,19 @@ class Runner:
         spec.pid = None
         spec.exit_code = result.exit_code
         ok = result.exit_code == 0 and not result.timed_out
+        # Filing is deferred until after queue.finish (below), even though
+        # the exception is caught right here. `_report_bug` can block for
+        # ~250s on `gh`, and by this point the job is already out of
+        # `self.active` -- a crash in that window would leave a finished
+        # job sitting in running/ with a stale pid, and the reaper would
+        # requeue and re-run a job that already completed. Matches the
+        # ordering already used at both `_launch` call sites.
+        artifact_exc = None
         if ok:
             try:
                 self._collect_artifacts(spec, active.project, active.workdir)
             except Exception as e:
-                self._report_bug(e, "artifacts", spec)
+                artifact_exc = e
                 ok = False
                 spec.error = str(e)
         if not ok and spec.error is None:
@@ -353,6 +384,8 @@ class Runner:
 
         self._remove_worktree(active)
         self.queue.finish(spec, ok=ok)
+        if artifact_exc is not None:
+            self._report_bug(artifact_exc, "artifacts", spec)
         log.info("%s %s", spec.id, "done" if ok else f"failed: {spec.error}")
 
     def _collect_artifacts(self, spec: JobSpec, project: ProjectConfig,
