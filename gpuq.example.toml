@@ -47,7 +47,10 @@ commit_artifacts = true
 # enabled = true
 # repo    = "you/gpu-queue-management"
 # The environment variable holding the PAT. Named rather than GH_TOKEN so an
-# issues-only key is not inherited by every other tool on the box.
+# issues-only key is not inherited by every other tool on the box. Unset means
+# no credentials, not "whatever else this box is logged in as": gpuq strips
+# GH_TOKEN and GITHUB_TOKEN from gh's environment rather than filing as
+# somebody's `gh auth login`.
 # token_env = "GPUQ_GITHUB_TOKEN"
 # Auto-dispatches per rolling 24h. Past the cap the issue still files,
 # labelled `throttled`, with no run: evidence is never lost, budget cannot

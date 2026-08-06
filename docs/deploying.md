@@ -252,6 +252,16 @@ Three things to set up, once:
    supervisorctl restart gpuq-runner
    ```
 
+   The name matters, and `GPUQ_GITHUB_TOKEN` being unset means *no
+   credentials* rather than "whatever else this box is logged in as". `gh`
+   reads `GH_TOKEN` and `GITHUB_TOKEN` on its own and falls back to
+   `gh auth login`'s stored credentials after that, so a box where anyone
+   had ever run `gh auth login` would otherwise file issues as that person,
+   with that person's permissions — and the 403 you just confirmed would be
+   describing a token that is not the one in use. gpuq strips both variables
+   from `gh`'s environment when `token_env` is unset; an unconfigured box
+   logs a warning and runs jobs exactly as before.
+
 3. **The OAuth token for the Action**, from `claude setup-token` on your own
    machine, stored as the repository secret `CLAUDE_CODE_OAUTH_TOKEN`. It
    draws on your Max subscription. It lives only as a repo secret and never

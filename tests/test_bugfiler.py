@@ -39,6 +39,22 @@ def test_an_open_issue_with_the_signature_is_found(gh, cfg):
     assert found["number"] == 7
 
 
+def test_the_open_issue_lookup_does_not_depend_on_the_search_index(gh, cfg):
+    """This is the lookup that decides whether a bug is already filed, and
+    GitHub's search index is eventually consistent -- two occurrences
+    inside the indexing lag would both miss it and file twice. Every issue
+    this module files carries AUTO_LABEL, so listing on the label is a
+    direct query rather than an index read, and `_exact` still does the
+    precise matching locally. The other two lookups have no such label to
+    stand on, and there a stale index costs a duplicate rather than a
+    missed fix-in-flight.
+    """
+    bugfiler.find_open_issue(cfg, "abc123abc123")
+    args, _ = gh.calls[-1]
+    assert args[args.index("--label") + 1] == bugfiler.AUTO_LABEL
+    assert "--search" not in args
+
+
 def test_a_fuzzy_search_hit_without_the_exact_line_is_rejected(gh, cfg):
     """gh's search is full-text and will return near misses. Two different
     bugs sharing one issue is worse than filing a second one."""
@@ -115,6 +131,50 @@ def test_the_token_is_passed_to_gh_as_gh_token(monkeypatch, cfg, tmp_path):
     bugfiler._gh(cfg, ["issue", "list"])
     assert seen["env"]["GH_TOKEN"] == "ghp_secret"
     assert "ghp_secret" not in " ".join(seen["argv"])
+
+
+def test_an_unset_token_is_not_replaced_by_the_boxs_own_credentials(
+        monkeypatch, cfg):
+    """The whole security argument for autofix is that this token is scoped
+    to `issues: write` and cannot push. An unset GPUQ_GITHUB_TOKEN must
+    therefore mean *no credentials*, not "whatever else this box happens to
+    be authenticated as" -- a box where someone ran `gh auth login`, or
+    exported a full-scope GH_TOKEN for another tool, would otherwise file
+    issues as that identity with that identity's permissions, and the
+    documented `cannot push` check would be describing a token that is not
+    the one in use. Fail closed into the no-token path instead.
+    """
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["env"] = kw.get("env") or {}
+        class P:
+            returncode, stdout, stderr = 0, "[]", ""
+        return P()
+
+    monkeypatch.delenv("GPUQ_GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "ghp_someone_elses_full_scope_token")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_and_this_one_too")
+    monkeypatch.setattr(bugfiler.subprocess, "run", fake_run)
+    bugfiler._gh(cfg, ["issue", "list"])
+    assert "GH_TOKEN" not in seen["env"]
+    assert "GITHUB_TOKEN" not in seen["env"]
+
+
+def test_the_configured_token_still_wins_over_an_ambient_one(monkeypatch, cfg):
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["env"] = kw.get("env") or {}
+        class P:
+            returncode, stdout, stderr = 0, "[]", ""
+        return P()
+
+    monkeypatch.setenv("GPUQ_GITHUB_TOKEN", "ghp_the_configured_one")
+    monkeypatch.setenv("GH_TOKEN", "ghp_ambient")
+    monkeypatch.setattr(bugfiler.subprocess, "run", fake_run)
+    bugfiler._gh(cfg, ["issue", "list"])
+    assert seen["env"]["GH_TOKEN"] == "ghp_the_configured_one"
 
 
 def test_a_failing_gh_raises_gh_error(monkeypatch, cfg):
@@ -289,6 +349,40 @@ def test_a_dispatch_is_recorded_before_the_issue_is_created(gh, cfg,
     assert order == ["record_dispatch", "create_issue"]
 
 
+def test_a_failed_issue_creation_gives_the_dispatch_back(gh, cfg,
+                                                          monkeypatch):
+    """Recording first is what stops an unwritable counter authorising
+    infinite runs, but it leaves the opposite hole: if `gh issue create`
+    then fails, the budget was debited for a run that cannot happen,
+    because no issue exists to trigger one. Three creation failures during
+    a GitHub outage would otherwise spend the whole rolling-24h budget with
+    nothing filed and no way to notice -- the next real bug files
+    `throttled` for a cap that was never actually used. Refunding is safe
+    precisely because it only ever narrows: it happens on the path where we
+    know nothing was authorised.
+    """
+    def boom(cfg, title, body, labels):
+        raise bugfiler.GhError("HTTP 502: Bad gateway")
+
+    monkeypatch.setattr(bugfiler, "_create_issue", boom)
+    with pytest.raises(bugfiler.GhError):
+        bugfiler.file_bug(cfg, _boom(), "checkout", now=NOW)
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 0
+
+
+def test_a_refund_leaves_earlier_dispatches_alone(gh, cfg, monkeypatch):
+    """Only the stamp this call wrote comes back, not the budget."""
+    bugfiler.record_dispatch(cfg, NOW - timedelta(hours=1))
+
+    def boom(cfg, title, body, labels):
+        raise bugfiler.GhError("HTTP 502: Bad gateway")
+
+    monkeypatch.setattr(bugfiler, "_create_issue", boom)
+    with pytest.raises(bugfiler.GhError):
+        bugfiler.file_bug(cfg, _boom(), "checkout", now=NOW)
+    assert bugfiler.dispatches_in_last_day(cfg, NOW) == 1
+
+
 def test_an_unwritable_state_file_files_throttled_instead_of_dispatching(
         gh, cfg, monkeypatch):
     """A broken counter must degrade to no-dispatch, never to
@@ -455,6 +549,38 @@ def test_a_failed_label_creation_is_retried_not_cached_as_done(gh, cfg,
     assert len(auto_creates) == 2
     # ...but labels that succeeded the first time are not recreated.
     assert len(other_creates) == 3
+
+
+def test_ensuring_labels_does_not_overwrite_what_an_owner_edited(gh, cfg):
+    """`gh label create --force` *edits* a label that already exists. The
+    labels here are triage furniture the owner lives with, so recolouring
+    `throttled` or rewriting its description by hand must survive -- under
+    --force it was silently reset on every runner restart, which reads as
+    the queue fighting you. Creation stays idempotent by treating "already
+    exists" as success (below), not by overwriting.
+    """
+    bugfiler.ensure_labels(cfg)
+    creates = [a for a, _ in gh.calls if a[:2] == ["label", "create"]]
+    assert creates, "labels are still created on a fresh repo"
+    assert not any("--force" in a for a in creates)
+
+
+def test_a_label_that_already_exists_counts_as_ensured(gh, cfg, monkeypatch):
+    """Without --force, gh fails on an existing label. That is the normal
+    steady state of every box after the first bug, and it must not mean
+    four failed `gh` calls per bug forever."""
+    def fake(_cfg, args, stdin=None):
+        gh.calls.append((args, stdin))
+        if args[:2] == ["label", "create"]:
+            raise bugfiler.GhError(
+                "HTTP 422: Validation Failed (already exists)")
+        return "[]"
+
+    monkeypatch.setattr(bugfiler, "_gh", fake)
+    bugfiler.ensure_labels(cfg)
+    bugfiler.ensure_labels(cfg)
+    creates = [a for a, _ in gh.calls if a[:2] == ["label", "create"]]
+    assert len(creates) == len(bugfiler._LABEL_SPECS)
 
 
 def test_a_non_iterable_dispatches_value_does_not_stop_filing(cfg):

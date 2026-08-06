@@ -107,22 +107,16 @@ class Runner:
         autofix; losing a bug report is an acceptable outcome, losing a job
         is not.
 
-        On a real gpuq fault, and worse than "roughly a minute" might
-        suggest: `gpuq_commit`'s git call (10s) plus the three dedup lookups
-        -- open issue, open PR, recently-closed issue (90s) -- plus
-        `ensure_labels`, which retries every one of its four labels until
-        each individually succeeds rather than giving up as a set (120s),
-        plus `issue create` (30s), each a subprocess capped at
-        `GH_TIMEOUT_S` = 30s, is a first-fault worst case of roughly 250s --
-        and this all happens on the single thread that also polls every
-        running job, so a network-partitioned box can stall polling for the
-        better part of five minutes on the first occurrence of a new bug.
-        The common cases are free of that cost: `CallerError` and
-        errno-classified `StartFailed` are classified and returned before
-        any `gh` subprocess runs. What actually bounds how often the ~250s
-        can be paid is the per-signature cooldown in `self._report_cooldowns`
-        below, not this docstring's arithmetic -- after the first
-        occurrence, a persisting bug is free until the cooldown expires.
+        Filing a new bug is slow in a way worth knowing about: a first
+        occurrence runs a git call, three dedup lookups, up to four label
+        creations and an issue creation, each a subprocess capped at
+        `bugfiler.GH_TIMEOUT_S`. On a network-partitioned box that is
+        minutes, not seconds -- on the single thread that also polls every
+        running job. Two things bound it, and neither is arithmetic that
+        survives a refactor: caller faults (`CallerError`, errno-classified
+        `StartFailed`) return before any `gh` subprocess runs, and the
+        per-signature cooldown below means a persisting bug pays that cost
+        once rather than once per occurrence.
         """
         # Tag first, and regardless of what filing does below: the tag means
         # "this exception already had its one chance to be reported", not
@@ -154,6 +148,14 @@ class Runner:
             # occurrence bump -- that is a deliberate, correct trade.
             # Recurrence counting on the issue is a nice-to-have; not
             # stalling the reaper is not. Do not "fix" this back.
+            #
+            # The stamp is written before file_bug, so a failed attempt
+            # (GitHub down, token expired) also spends the cooldown and
+            # this bug goes unfiled for the next window. Deliberate: the
+            # thing being bounded is how often the loop can block on `gh`,
+            # and a call that fails slowly blocks it exactly as hard as one
+            # that succeeds. A persisting bug refiles at the next window;
+            # one that stopped happening was never worth the stall.
             sig = signature(exc, phase)
             now = time.monotonic()
             last = self._report_cooldowns.get(sig)

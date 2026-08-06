@@ -44,11 +44,27 @@ def _gh(cfg: AutofixConfig, args: list[str], stdin: str | None = None) -> str:
 
     The PAT goes in through the environment. argv is world-readable in
     /proc, and a token in a process listing is a token on a shared box.
+
+    An unset `cfg.token_env` means *no credentials*, not "whatever else
+    this box is authenticated as". gh reads GH_TOKEN and GITHUB_TOKEN from
+    the environment on its own, and falls back to `gh auth login`'s stored
+    credentials after that -- so on a box where anyone had ever run
+    `gh auth login`, or exported a full-scope GH_TOKEN for some other tool,
+    autofix would quietly file as that identity with that identity's
+    permissions. The whole security argument for this module is that its
+    token is scoped to `issues: write` and cannot push; inheriting a
+    different one makes the token the operator verified in
+    docs/deploying.md not the token in use. Scrub both, so an
+    unconfigured box fails closed into the no-token path (GhError, logged,
+    queue unaffected) rather than succeeding as the wrong principal.
     """
     env = dict(os.environ)
     token = os.environ.get(cfg.token_env)
     if token:
         env["GH_TOKEN"] = token
+    else:
+        env.pop("GH_TOKEN", None)
+        env.pop("GITHUB_TOKEN", None)
     try:
         proc = subprocess.run(["gh", *args], input=stdin, env=env, text=True,
                               capture_output=True, timeout=GH_TIMEOUT_S)
@@ -82,8 +98,38 @@ def _exact(rows: list[dict], sig: str) -> list[dict]:
     return [r for r in rows if f"sig: {sig}" in (r.get("body") or "")]
 
 
+# The space after `sig:` in every query below is load-bearing, not
+# formatting. `sig:` is not a GitHub search qualifier; with the space it is
+# dropped as noise and the hex matches as a term (verified against the live
+# API: `sig: <term> in:body` returns the same rows as `<term> in:body`).
+# Written `sig:<hex>`, GitHub parses it as an unknown qualifier and matches
+# nothing at all, silently -- every lookup returns empty, dedup never fires
+# and each occurrence files a new issue.
+#
+# What this cannot fix: GitHub's search index is eventually consistent, so
+# two occurrences inside the indexing lag both miss and file twice. The
+# open-issue lookup avoids the index entirely by listing on the label
+# instead; the PR and closed-issue lookups still search, where a duplicate
+# is the worst case rather than a missed fix-in-flight.
+
+
 def find_open_issue(cfg: AutofixConfig, sig: str) -> dict | None:
-    rows = _exact(_search(cfg, "issue", "open", f"sig: {sig} in:body"), sig)
+    """Is this bug already filed and open?
+
+    Listed on the label rather than searched: this is the lookup that
+    decides whether an occurrence is a recurrence, and a stale search index
+    here means a duplicate issue for a bug that already has one. Every
+    issue this module files carries AUTO_LABEL, so the label is a complete
+    index of its own work, and `_exact` does the precise matching locally.
+    """
+    out = _gh(cfg, ["issue", "list", "--repo", cfg.repo, "--state", "open",
+                    "--label", AUTO_LABEL, "--json", "number,body",
+                    "--limit", "100"])
+    try:
+        rows = json.loads(out or "[]")
+    except json.JSONDecodeError:
+        rows = []
+    rows = _exact(rows, sig)
     return rows[0] if rows else None
 
 
@@ -181,6 +227,29 @@ def record_dispatch(cfg: AutofixConfig, now: datetime) -> None:
     _save_dispatches(cfg, [*kept, now])
 
 
+def refund_dispatch(cfg: AutofixConfig, now: datetime) -> None:
+    """Undo one recorded dispatch, for a run that turned out impossible.
+
+    The budget is debited before the issue exists, deliberately (see
+    `file_bug`). That ordering makes an unwritable counter fail towards
+    no-dispatch, but it leaves the opposite hole open: a debit for a run
+    nothing can ever trigger, because `issue create` failed and there is no
+    issue. Across a GitHub outage that spends the day's budget on nothing.
+
+    Only ever narrows what was just written, and only on the path where we
+    know nothing was authorised -- so unlike the debit, failing here is
+    harmless and is swallowed rather than raised over the GhError the
+    caller actually needs to see.
+    """
+    try:
+        stamps = _load_dispatches(cfg)
+        if now in stamps:
+            stamps.remove(now)
+            _save_dispatches(cfg, stamps)
+    except Exception as e:
+        log.warning("autofix: could not refund a dispatch: %s", e)
+
+
 _ISSUE_NUMBER = re.compile(r"/issues/(\d+)")
 
 # Names of labels confirmed present, tracked one at a time rather than one
@@ -203,15 +272,28 @@ _LABEL_SPECS = (
 
 def ensure_labels(cfg: AutofixConfig) -> None:
     """Make the labels this module needs once per process rather than
-    documenting a manual step a rebuilt box will skip."""
+    documenting a manual step a rebuilt box will skip.
+
+    Deliberately not `--force`: that flag *edits* a label that already
+    exists, so an owner who recoloured `throttled` or rewrote its
+    description had it reset on every runner restart, which reads as the
+    queue fighting them over their own triage furniture. Idempotence comes
+    from treating "already exists" as the success it is instead.
+    """
     for name, colour, desc in _LABEL_SPECS:
         if name in _labels_ensured:
             continue
         try:
             _gh(cfg, ["label", "create", name, "--repo", cfg.repo,
-                      "--color", colour, "--description", desc, "--force"])
+                      "--color", colour, "--description", desc])
         except GhError as e:
-            log.warning("could not ensure label %s: %s", name, e)
+            if "already exists" in str(e).lower():
+                # The steady state of every box after its first bug. Not a
+                # failure, and must not be retried four times per bug for
+                # the life of the process.
+                _labels_ensured.add(name)
+            else:
+                log.warning("could not ensure label %s: %s", name, e)
         else:
             _labels_ensured.add(name)
 
@@ -305,7 +387,23 @@ def file_bug(cfg: AutofixConfig, exc: BaseException, phase: str, *,
     # bug is structural evidence just the same as a dispatched one -- it
     # was only the budget, not the classification, that held it back.
     labels = [AUTO_LABEL, THROTTLED_LABEL] if throttled else [AUTO_LABEL]
-    _create_issue(cfg, issue_title(report), body, labels)
+    try:
+        number = _create_issue(cfg, issue_title(report), body, labels)
+    except Exception:
+        # No issue means no run: give the budget back before the error goes
+        # up, or an outage during `issue create` spends the day's cap on
+        # dispatches that cannot happen. Safe in a way the debit is not --
+        # this only narrows, and only where nothing was authorised.
+        if not throttled:
+            refund_dispatch(cfg, now)
+        raise
+    if number is None:
+        # gh returns the new issue's URL on stdout; not finding a number in
+        # it means gh changed its output, not that filing failed. Worth a
+        # line in the log, since every dedup lookup from here on depends on
+        # the issue we can no longer name.
+        log.warning("autofix: filed %s but could not read an issue number "
+                    "out of gh's output", report.sig)
     if throttled:
         # Evidence is never lost; budget cannot run away.
         log.warning("autofix throttled: filed %s with no run", report.sig)
