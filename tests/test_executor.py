@@ -26,6 +26,34 @@ def finish(running, limit=30.0):
         time.sleep(0.02)
     raise AssertionError("job did not finish")
 
+def stopped_running(pid, limit=5.0):
+    """Wait until `pid` is gone or a zombie. False if it is still running.
+
+    Two reasons this is not `os.kill(pid, 0)` raising ESRCH. A killed
+    grandchild is reparented to init and stays a zombie until init reaps
+    it, and `kill(pid, 0)` succeeds for a zombie -- so "gone" races the
+    reaper, and loses under load. And `_kill_group` waits only for the
+    direct child, so the group's other members can still be a moment
+    behind it.
+
+    A zombie holds no VRAM, which is the property these tests are about.
+    """
+    deadline = time.monotonic() + limit
+    while True:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True                       # reaped already
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return True                       # exited between the two calls
+        if stat.rsplit(") ", 1)[1].split()[0] == "Z":
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+
 def test_success_returns_zero_and_captures_stdout(tmp_path):
     out, err = _logs(tmp_path)
     r = finish(start_job(mkspec(["sh", "-c", "echo hello"]), tmp_path, out, err))
@@ -74,8 +102,7 @@ def test_timeout_kills_the_whole_process_group(tmp_path):
     r = finish(start_job(mkspec(cmd, timeout_s=1), tmp_path, out, err))
     assert r.timed_out is True
     child = int(marker.read_text().strip())
-    with pytest.raises(OSError):
-        os.kill(child, 0)
+    assert stopped_running(child), "the backgrounded worker outlived the group kill"
 
 def test_kill_job_terminates_a_live_job(tmp_path):
     """Runner shutdown must not leave a job holding the card."""
