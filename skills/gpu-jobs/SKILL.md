@@ -1,6 +1,6 @@
 ---
 name: gpu-jobs
-description: Use when running training, evaluation or any GPU work on this box, and when a long CPU job would otherwise block you - submit it to the queue instead of running it directly, then either wait for it or go do something else.
+description: Use when running training, evaluation or any GPU work on this box, and when a long CPU job would otherwise block you - submit it to the queue instead of running it directly, then either wait for it or go do something else. Also use when you have anything to report about the queue itself - a bug, a measurement, or a proposal about how it behaves.
 ---
 
 # Running work on a shared GPU box
@@ -63,10 +63,11 @@ A job that fails on CUDA out-of-memory is reported as such and is never
 retried: it is a configuration problem, not a transient. Make the model or
 the batch smaller.
 
-## When gpuq itself is broken
+## Telling the owner something about gpuq
 
-If the *queue* misbehaves — `gpuq submit` errors, `gpuq wait` never returns,
-`gpuq show` disagrees with reality — report it:
+Use `gpuq bug` for anything you want the owner to see about the queue itself.
+Not only breakage — a proposal, a measurement, a design observation, a gap in
+the CLI all go through the same door:
 
 ```bash
 gpuq bug "gpuq wait never returns for a cancelled job" --body "$(cat <<'EOF'
@@ -75,11 +76,28 @@ EOF
 )"
 ```
 
-This does not fix anything by itself and it does not dispatch a run. It files
-an issue for the owner, who decides. Do **not** use it for your own job
-failing: a CUDA OOM, a timeout, a non-zero exit, or a declared artifact your
-script did not write are your bugs, and the runner already tells you so. When
-the runner's own code raises, it files without being asked.
+It does not fix anything and it does not dispatch a run. It files an issue for
+the owner, who decides.
+
+**Do not open the issue yourself with `gh issue create`.** It looks equivalent
+and is not. `gpuq bug` applies the `gpuq-reported` label, and that label is the
+only thing that routes the issue anywhere: it is what assigns the owner, and an
+issue with no label notifies nobody at all. A hand-filed issue sits unread
+indefinitely, looking filed. This has already happened once.
+
+If `gpuq bug` says autofix is not configured, you are on a box that cannot
+file — likely not the GPU box at all. Then, and only then, use `gh` directly
+and apply the label by hand, because nothing else will:
+
+```bash
+gh issue create --repo <owner>/gpu-queue-management \
+  --label gpuq-reported --title "..." --body "..."
+```
+
+Do **not** use either path for your own job failing: a CUDA OOM, a timeout, a
+non-zero exit, or a declared artifact your script did not write are your bugs,
+and the runner already tells you so. When the runner's own code raises, it
+files without being asked.
 
 ## Do not
 
