@@ -19,14 +19,16 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import bugfiler
 from . import git_ops
+from .bugreport import CallerError, signature
 from .claim import gpu_claim, ClaimBusy
 from .config import RunnerConfig, ProjectConfig
 from .executor import (start_job, poll_job, kill_job, JobResult, RunningJob,
                        StartFailed)
 from .gpuid import gpu_key, GpuIdError
 from .preflight import preflight, PreflightFailed
-from .queue import QueueRoot
+from .queue import QueueRoot, STATES
 from .reaper import reap
 from .spec import JobSpec
 
@@ -50,6 +52,9 @@ class Runner:
         self._stopping = False
         # None means "never swept", so the first tick does a full one.
         self._last_cuda_sweep: float | None = None
+        # signature -> time.monotonic() of the last report. See the
+        # cooldown check in _report_bug for why this exists.
+        self._report_cooldowns: dict[str, float] = {}
 
     # --- lifecycle ----------------------------------------------------
     def run_forever(self) -> None:
@@ -65,9 +70,104 @@ class Runner:
         self._stopping = True
 
     def tick(self) -> None:
-        self._reap()
-        self.collect()
-        self.admit()
+        self._phase("reap", self._reap)
+        self._phase("collect", self.collect)
+        self._phase("admit", self.admit)
+
+    def _phase(self, phase: str, fn) -> None:
+        """Report an unhandled exception, then let it out.
+
+        Re-raised deliberately: a runner whose reaper is broken should still
+        die and be restarted by supervisor, exactly as before. Reporting is
+        additive, and a filer that changed crash semantics would be a second
+        bug shipped alongside the first.
+
+        Some phases nest: `_take_card` already reports and re-raises a
+        preflight exception before it reaches `admit`, which is itself
+        wrapped in `_phase("admit", ...)`. Without the tag check below that
+        same exception would be filed a second time here, under a different
+        phase string -- and because `signature()` hashes phase into the
+        payload, that is a second, undeduped issue for one crash. The
+        `__gpuq_reported__` tag set by `_report_bug` is how the inner,
+        more specific site keeps the outer one from re-filing.
+        """
+        try:
+            fn()
+        except Exception as e:
+            if not getattr(e, "__gpuq_reported__", False):
+                self._report_bug(e, phase)
+            raise
+
+    def _report_bug(self, exc: BaseException, phase: str,
+                    spec: JobSpec | None = None) -> None:
+        """File a bug against gpuq, and never let that break the queue.
+
+        Every path into bugfiler goes through here. A box with no `gh`, no
+        token or no network must run jobs exactly as it does without
+        autofix; losing a bug report is an acceptable outcome, losing a job
+        is not.
+
+        Filing a new bug is slow in a way worth knowing about: a first
+        occurrence runs a git call, three dedup lookups, up to four label
+        creations and an issue creation, each a subprocess capped at
+        `bugfiler.GH_TIMEOUT_S`. On a network-partitioned box that is
+        minutes, not seconds -- on the single thread that also polls every
+        running job. Two things bound it, and neither is arithmetic that
+        survives a refactor: caller faults (`CallerError`, errno-classified
+        `StartFailed`) return before any `gh` subprocess runs, and the
+        per-signature cooldown below means a persisting bug pays that cost
+        once rather than once per occurrence.
+        """
+        # Tag first, and regardless of what filing does below: the tag means
+        # "this exception already had its one chance to be reported", not
+        # "filing succeeded". A caller further up the stack (see `_phase`)
+        # must not re-file it just because this attempt failed or was a
+        # no-op. Guarded because an exception type with __slots__ would
+        # otherwise turn a cosmetic dedup problem into a crash inside the
+        # one function that must never raise.
+        try:
+            exc.__gpuq_reported__ = True
+        except Exception:
+            pass
+        if not self.cfg.autofix.enabled:
+            return
+        try:
+            # Computed before any I/O, and inside this try: signature()
+            # raises ValueError on a phase outside PHASES, and this
+            # function must never raise. `admit()` can reach here once per
+            # pending job in a single tick with none of them entering
+            # `self.active` (a failed `_launch` never does), so without a
+            # cooldown a broken git_ops with 20 queued jobs means 20 calls
+            # into file_bug -- up to three `gh` subprocesses at 30s each --
+            # before admit() returns. That stalls `poll_job` for the same
+            # window, so a running job's deadline goes unenforced and a
+            # timed-out job is never killed: worse than a crash, since
+            # supervisor restarts a crashed runner in seconds.
+            #
+            # Suppressed occurrences lose their issue comment and
+            # occurrence bump -- that is a deliberate, correct trade.
+            # Recurrence counting on the issue is a nice-to-have; not
+            # stalling the reaper is not. Do not "fix" this back.
+            #
+            # The stamp is written before file_bug, so a failed attempt
+            # (GitHub down, token expired) also spends the cooldown and
+            # this bug goes unfiled for the next window. Deliberate: the
+            # thing being bounded is how often the loop can block on `gh`,
+            # and a call that fails slowly blocks it exactly as hard as one
+            # that succeeds. A persisting bug refiles at the next window;
+            # one that stopped happening was never worth the stall.
+            sig = signature(exc, phase)
+            now = time.monotonic()
+            last = self._report_cooldowns.get(sig)
+            if last is not None and now - last < self.cfg.autofix.report_cooldown_s:
+                return
+            self._report_cooldowns[sig] = now
+            counts = {s: len(self.queue.list_state(s)) for s in STATES}
+            outcome = bugfiler.file_bug(self.cfg.autofix, exc, phase,
+                                        spec=spec, queue_counts=counts)
+            log.info("autofix (%s): %s", phase, outcome)
+        except Exception as e:
+            log.warning("autofix: could not file a bug for %s: %s", phase, e)
 
     def _reap(self) -> None:
         """Recover abandoned work every tick; sweep the card on a timer.
@@ -172,6 +272,9 @@ class Runner:
         except PreflightFailed as e:
             log.warning("%s waiting: %s", spec.id, e)
             return None
+        except Exception as e:
+            self._report_bug(e, "preflight", spec)
+            raise
         try:
             key = gpu_key()
         except GpuIdError as e:
@@ -191,8 +294,13 @@ class Runner:
         try:
             workdir = self._prepare_workdir(spec, project)  # git, on the loop
         except Exception as e:
+            # Card release first: one job's problem must never strand
+            # another job's hold on the card, and `_report_bug` never
+            # raises but that is not a property this cleanup should have to
+            # depend on to be unconditional.
             self._exit_claim(claim_cm)
             self._fail_running(spec, f"checkout failed: {e}")
+            self._report_bug(e, "checkout", spec)
             return False
         out_log, err_log = self.queue.log_paths(spec.id)
         try:
@@ -204,6 +312,7 @@ class Runner:
             self._exit_claim(claim_cm)
             self._remove_worktree_at(project, workdir)
             self._fail_running(spec, str(e))
+            self._report_bug(e, "execute", spec)
             return False
 
         spec.pid = running.pid
@@ -219,6 +328,20 @@ class Runner:
     def _prepare_workdir(self, spec: JobSpec, project: ProjectConfig) -> Path:
         checkout = git_ops.ensure_checkout(project)
         git_ops.git(["fetch", "--quiet", "origin"], cwd=checkout, check=False)
+        # "I submitted at a commit I forgot to push" is the likeliest caller
+        # mistake in this whole system. Left unchecked, `add_worktree` below
+        # fails on it just the same as it would on a genuine gpuq/git fault,
+        # and `_launch` reports both as phase `checkout` -- filing a gpuq bug
+        # (and burning one of three daily dispatches) for a Claude run that
+        # can only close it. Catch it here, before that path, with a message
+        # that tells the submitter what to do instead of a raw GitError.
+        try:
+            git_ops.git(["cat-file", "-e", f"{spec.commit}^{{commit}}"],
+                       cwd=checkout)
+        except git_ops.GitError:
+            raise CallerError(
+                f"commit {spec.commit} is not in {project.remote}; "
+                "push it first") from None
         return git_ops.add_worktree(checkout, self.queue.work_dir(spec.id),
                                     spec.commit)
 
@@ -243,10 +366,19 @@ class Runner:
         spec.pid = None
         spec.exit_code = result.exit_code
         ok = result.exit_code == 0 and not result.timed_out
+        # Filing is deferred until after queue.finish (below), even though
+        # the exception is caught right here. `_report_bug` can block for
+        # ~250s on `gh`, and by this point the job is already out of
+        # `self.active` -- a crash in that window would leave a finished
+        # job sitting in running/ with a stale pid, and the reaper would
+        # requeue and re-run a job that already completed. Matches the
+        # ordering already used at both `_launch` call sites.
+        artifact_exc = None
         if ok:
             try:
                 self._collect_artifacts(spec, active.project, active.workdir)
             except Exception as e:
+                artifact_exc = e
                 ok = False
                 spec.error = str(e)
         if not ok and spec.error is None:
@@ -254,6 +386,8 @@ class Runner:
 
         self._remove_worktree(active)
         self.queue.finish(spec, ok=ok)
+        if artifact_exc is not None:
+            self._report_bug(artifact_exc, "artifacts", spec)
         log.info("%s %s", spec.id, "done" if ok else f"failed: {spec.error}")
 
     def _collect_artifacts(self, spec: JobSpec, project: ProjectConfig,
@@ -264,7 +398,10 @@ class Runner:
         for rel in spec.artifacts:
             src = workdir / rel
             if not src.exists():
-                raise RuntimeError(f"declared artifact not produced: {rel}")
+                # Not a gpuq bug: the job was asked for this file and did
+                # not produce it. Typed so the classifier does not read the
+                # gpuq traceback around it as gpuq's fault.
+                raise CallerError(f"declared artifact not produced: {rel}")
             srcs.append(src)
             rels.append(rel)
         if project.commit_artifacts:

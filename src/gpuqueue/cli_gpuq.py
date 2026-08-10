@@ -10,7 +10,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import bugfiler
 from .claim import job_orphaned
+from .config import ConfigError, default_config_path, load_config
 from .queue import QueueRoot, STATES
 from .spec import JobSpec, SpecError
 
@@ -143,6 +145,38 @@ def _cmd_cancel(args) -> int:
     return 1
 
 
+def _cmd_bug(args) -> int:
+    """File a bug an agent noticed. Everything the runner cannot see:
+    `gpuq submit` / `wait` / `show` failures, config errors, CLI gaps.
+
+    This path carries free text and unreliable blame, so it dispatches
+    nothing. The owner adds `fix-me`, and that same act is what deduplicates
+    it -- there is no traceback here to sign.
+    """
+    try:
+        cfg = load_config(args.config or default_config_path())
+    except ConfigError as e:
+        print(f"gpuq: {e}", file=sys.stderr)
+        return 2
+    if not cfg.autofix.enabled or not cfg.autofix.repo:
+        print("gpuq: autofix is not configured on this box; "
+              "set [autofix].enabled and [autofix].repo", file=sys.stderr)
+        return 2
+
+    body = args.body if args.body is not None else sys.stdin.read()
+    if not body.strip():
+        print("gpuq: a body is required — say what happened and what you "
+              "expected", file=sys.stderr)
+        return 2
+    try:
+        number = bugfiler.file_agent_report(cfg.autofix, args.title, body)
+    except bugfiler.GhError as e:
+        print(f"gpuq: could not file the report: {e}", file=sys.stderr)
+        return 1
+    print(f"filed #{number}" if number else "filed")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gpuq")
     p.add_argument("--queue-root", default=None)
@@ -187,6 +221,13 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("cancel")
     c.add_argument("id")
     c.set_defaults(func=_cmd_cancel)
+
+    b = sub.add_parser("bug", help="report a gpuq bug the runner cannot see")
+    b.add_argument("title")
+    b.add_argument("--body", default=None,
+                   help="the report; read from stdin when omitted")
+    b.add_argument("--config", default=None)
+    b.set_defaults(func=_cmd_bug)
     return p
 
 

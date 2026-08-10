@@ -205,6 +205,98 @@ ssh $BOX 'cd /workspace/checkouts/myproject && git push --dry-run origin HEAD'
 # expect: ERROR: Write access to repository not granted
 ```
 
+### Letting gpuq file bugs against itself
+
+Optional, and off unless you add `[autofix]` to the config. When gpuq's own
+code raises — a bad worktree, a `git_ops` failure — the runner files a GitHub
+issue carrying the traceback, and a workflow opens a PR against it. Caller
+faults never file: an OOM, a timeout, a plain `exit N`, or a declared
+artifact your job did not produce are your problem, not the queue's.
+
+Three things to set up, once:
+
+1. **A fine-grained PAT**, on github.com → Settings → Developer settings →
+   Fine-grained tokens. Scope it to this repository alone, and give it
+   `Issues: Read and write` and nothing else. Explicitly **not** `Contents` —
+   anyone who can queue a job on this box can use this key, the same
+   argument made for the results key above. Unlike that key, though, the
+   issue body this one files is also the fixer's prompt, and the `JobSpec`
+   inside it is caller-supplied and unfiltered — so the worst case here is
+   not just issue spam, but issue spam plus a prompt an attacker could try
+   to steer. What bounds that is outside this token entirely: branch
+   protection on `main`, so nothing the fixer writes lands unreviewed, and
+   your own read of the PR before you merge it. This token itself still
+   cannot push — confirm that below — but "cannot push" is not the same
+   claim as "worst case is issue spam"; treat the PR the same way you would
+   treat one from any other outside contributor.
+
+   One thing to know before pointing this at a **public** repo: the issue
+   body embeds the failing job's `JobSpec`, which includes its `cmd`
+   verbatim. A `JobSpec` has no environment field, so nothing is copied out
+   of the box's environment by construction — but a job submitted with a
+   secret in its command line publishes that secret. Pass credentials
+   through the environment, never as an argument, on any box filing into a
+   repo that is not private.
+
+   Confirm it cannot push:
+
+   ```bash
+   GH_TOKEN=<the-pat> gh api -X PUT \
+     repos/<owner>/gpu-queue-management/contents/probe.txt \
+     -f message=probe -f content=eA== 2>&1 | head -3
+   # expect: HTTP 403 — Resource not accessible by personal access token
+   ```
+
+2. **Export it where supervisord can see it**, so the runner inherits it.
+   It is deliberately not written into `supervisor/gpuq-runner.conf` itself:
+   that file is world-readable and lands in `/etc`, and `%(ENV_X)s`
+   references there fail supervisord's config *parse* — not just the
+   substitution — if the variable is unset anywhere in supervisord's own
+   environment, which would stop the runner starting on every box that has
+   never heard of autofix. Exporting it one level up avoids both problems:
+
+   ```bash
+   echo 'export GPUQ_GITHUB_TOKEN=<the-pat>' >> /etc/default/supervisor
+   supervisorctl restart gpuq-runner
+   ```
+
+   The name matters, and `GPUQ_GITHUB_TOKEN` being unset means *no
+   credentials* rather than "whatever else this box is logged in as". `gh`
+   reads `GH_TOKEN` and `GITHUB_TOKEN` on its own and falls back to
+   `gh auth login`'s stored credentials after that, so a box where anyone
+   had ever run `gh auth login` would otherwise file issues as that person,
+   with that person's permissions — and the 403 you just confirmed would be
+   describing a token that is not the one in use. gpuq strips both variables
+   from `gh`'s environment when `token_env` is unset; an unconfigured box
+   logs a warning and runs jobs exactly as before.
+
+3. **The OAuth token for the Action**, from `claude setup-token` on your own
+   machine, stored as the repository secret `CLAUDE_CODE_OAUTH_TOKEN`. It
+   draws on your Max subscription. It lives only as a repo secret and never
+   goes near the box.
+
+The runner creates the labels it needs (`gpuq-auto`, `gpuq-reported`,
+`throttled`, `fix-me`) the first time it files.
+
+A bug filed past the daily dispatch cap carries **both** `gpuq-auto` and
+`throttled`, so it still turns up in a `label:gpuq-auto` triage query even
+though no run happened for it. That second label is also why the workflow
+will not pick it up just because you add `fix-me`: the gate skips anything
+labelled `throttled` regardless of what else is on the issue. To dispatch a
+throttled bug by hand, **remove `throttled` first, then add `fix-me`** — in
+that order, since adding `fix-me` while `throttled` is still present does
+nothing.
+
+**The off switch** is a repository variable, not a commit: set
+`GPUQ_AUTOFIX` to `off` (also accepted: `false`, `no`, `disabled`, `0`, any
+case) under Settings → Secrets and variables → Actions → Variables. Filing
+continues; dispatching stops. It can be flipped from the GitHub mobile web
+UI. Leaving the variable unset is the default state of every repo and keeps
+autofix on, exactly as before this variable was ever set.
+
+**Branch protection on `main`** is what makes this safe to leave on. The
+Action opens PRs; you merge them.
+
 ## 5. Verify
 
 ```bash

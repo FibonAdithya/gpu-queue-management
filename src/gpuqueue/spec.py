@@ -7,6 +7,13 @@ from datetime import datetime, timezone
 
 LANES = ("cpu", "gpu")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# A commit is caller-supplied, reaches git's argv, and -- when git fails on
+# it -- ends up verbatim inside a ``` fenced block in a bug report that a
+# headless agent reads as its prompt. A newline and a closing fence escape
+# that block. Wide enough for anything git takes as a rev (sha, tag,
+# `origin/main`, `HEAD~1`, `v1.2.3^{commit}`), narrow enough to have no
+# newlines, quotes, backticks or shell metacharacters in it.
+_SAFE_REV = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/~^{}-]*$")
 
 
 class SpecError(ValueError):
@@ -55,6 +62,9 @@ class JobSpec:
             raise SpecError("project is required")
         if not self.commit:
             raise SpecError("commit is required; a branch alone is not reproducible")
+        if not _SAFE_REV.match(self.commit):
+            raise SpecError(
+                f"commit must match {_SAFE_REV.pattern}, got {self.commit!r}")
         if not self.cmd or not all(isinstance(a, str) for a in self.cmd):
             raise SpecError("cmd must be a non-empty list of strings")
         if not isinstance(self.timeout_s, int) or self.timeout_s <= 0:

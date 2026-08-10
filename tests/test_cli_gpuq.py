@@ -5,6 +5,9 @@ import pytest
 from gpuqueue.cli_gpuq import main, generate_id
 from gpuqueue.queue import QueueRoot
 
+import io
+from gpuqueue import bugfiler
+
 @pytest.fixture
 def root(tmp_path, monkeypatch):
     r = tmp_path / "queue"
@@ -222,3 +225,64 @@ def test_plain_list_marks_orphans_visibly(root, capsys):
     capsys.readouterr()
     main(["list"])
     assert "ORPHANED" in capsys.readouterr().out
+
+
+CONFIG = """
+[queue]
+root = "{root}"
+
+[autofix]
+enabled = true
+repo = "you/gpu-queue-management"
+"""
+
+
+@pytest.fixture
+def cfg_file(tmp_path):
+    p = tmp_path / "gpuq.toml"
+    p.write_text(CONFIG.format(root=tmp_path / "queue"))
+    return p
+
+
+@pytest.fixture
+def reports(monkeypatch):
+    sent = []
+    monkeypatch.setattr(bugfiler, "file_agent_report",
+                        lambda cfg, title, body: sent.append((title, body)) or 42)
+    return sent
+
+
+def test_bug_files_a_report(cfg_file, reports, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO("gpuq wait never returns\n"))
+    assert main(["bug", "--config", str(cfg_file), "wait hangs"]) == 0
+    assert reports == [("wait hangs", "gpuq wait never returns\n")]
+    assert "42" in capsys.readouterr().out
+
+
+def test_bug_takes_the_body_from_a_flag(cfg_file, reports):
+    main(["bug", "--config", str(cfg_file), "wait hangs", "--body", "inline"])
+    assert reports[0][1] == "inline"
+
+
+def test_bug_refuses_when_autofix_is_disabled(tmp_path, reports, capsys):
+    p = tmp_path / "gpuq.toml"
+    p.write_text('[queue]\nroot = "/q"\n')
+    assert main(["bug", "--config", str(p), "t", "--body", "b"]) == 2
+    assert reports == []
+    assert "autofix" in capsys.readouterr().err
+
+
+def test_bug_reports_a_gh_failure_without_a_traceback(cfg_file, monkeypatch,
+                                                      capsys):
+    monkeypatch.setattr(bugfiler, "file_agent_report",
+                        lambda *a: (_ for _ in ()).throw(
+                            bugfiler.GhError("HTTP 403")))
+    assert main(["bug", "--config", str(cfg_file), "t", "--body", "b"]) == 1
+    assert "403" in capsys.readouterr().err
+
+
+def test_bug_refuses_an_empty_body(cfg_file, reports, capsys):
+    """A report with no prose is not a report; the auto path exists for
+    reports with no prose."""
+    assert main(["bug", "--config", str(cfg_file), "t", "--body", "  "]) == 2
+    assert reports == []
