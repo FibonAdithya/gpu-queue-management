@@ -88,3 +88,31 @@ def test_the_fixer_can_mint_an_oidc_token():
     permissions = _block(WORKFLOW.read_text(), "permissions:")
     assert "id-token: write" in permissions, (
         "claude-code-action cannot authenticate without id-token: write")
+
+
+def _claude_args(text: str) -> str:
+    return _block(text, "          claude_args: |")
+
+
+def test_the_fixer_is_granted_tools_explicitly():
+    """The action grants no Bash access by default, and denies silently.
+
+    Observed: the first authenticated dispatch ran 8 turns, collected 7
+    permission denials, did nothing, and reported success -- the SDK's
+    `is_error: false` means the session ended cleanly, not that work
+    happened. A missing grant costs a green run with no artifact, which is
+    the hardest failure of all to notice.
+    """
+    args = _claude_args(WORKFLOW.read_text())
+    assert "--allowedTools" in args, (
+        "without an explicit --allowedTools the fixer is denied every tool "
+        "it needs and the run still goes green")
+
+
+def test_the_fixer_is_never_granted_a_merge_verb():
+    """Nothing in this system merges. Branch protection is the second
+    layer, and a control with only one layer is a control you are one
+    mistake away from losing."""
+    args = _claude_args(WORKFLOW.read_text())
+    assert "gh pr merge" not in args, (
+        "granting a merge verb would let the fixer land its own work")
