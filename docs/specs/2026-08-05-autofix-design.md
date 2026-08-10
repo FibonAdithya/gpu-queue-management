@@ -44,8 +44,12 @@ in an earlier draft of this document calling the worst case "issue spam"
 alone was too reassuring. What actually bounds it is two things outside this
 module entirely — branch protection on `main`, so nothing the fixer writes
 lands without a human reading it, and the owner's own review of the PR before
-merge. Neither is new machinery; both already exist for the ordinary reason
-that an autonomous PR from *any* source should be read before it merges. The
+merge, for the ordinary reason that an autonomous PR from *any* source should
+be read before it merges. An earlier draft called both of these existing
+machinery. The review was; the branch protection was not — it was assumed
+here and nowhere enabled, and GitHub gates the setting behind a paid plan for
+private repositories, so acquiring it meant making this repository public.
+Both are real now, and `docs/deploying.md` records how to verify it. The
 worst case, stated accurately, is issue spam plus an attacker-influenced
 prompt, held from becoming an attacker-influenced *merge* by those two
 controls.
