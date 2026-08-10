@@ -181,18 +181,19 @@ Preflight's rule changes from "refuse on any foreign CUDA process" to
 protection against an accidental direct run is unchanged; it simply stops
 treating a legitimate co-tenant as an intruder.
 
-This requires a fix in `own_pids()` (`preflight.py:53`). It exempts each live
-record's pid but expands `_descendants()` only for the runner's own pid, so a
-direct `gpu-claim` run's actual CUDA process — the *child* of the recorded
-pid — is not exempt.
+That attribution rested on a bug this design surfaced, which is **already
+fixed** in #12, ahead of this work. `own_pids()` exempted each live record's
+pid but expanded `_descendants()` only for the caller's own pid, so a direct
+`gpu-claim` run's CUDA process — the *child* of the recorded pid — was
+covered by nothing, and `reaper.kill_orphan_cuda` `SIGKILL`ed it within
+`orphan_cuda_interval_s`. It was reproduced before being fixed; the test
+double-forks so the pair sits outside pytest's process tree, and reads
+`/proc` State rather than `claim.pid_alive`, which reports a zombie as alive.
 
-**That is very likely a live bug today, independent of this work.**
-`reaper.kill_orphan_cuda` builds `exempt` from the same `own_pids()`, so on a
-box where the runner is up, a direct `gpu-claim -- python train.py` (which
-the README advertises) appears unexempt and is `SIGKILL`ed within
-`orphan_cuda_interval_s`. This has been read from the code, not proven. It
-should be confirmed with a failing test, filed as its own issue, and fixed in
-its own commit ahead of this work rather than folded into it.
+So this work starts from a `main` where a claim's pid already stands for its
+whole process tree. §2's `attribute()` narrows that from "which pids does the
+protocol account for" to "which *record* owns this pid" — the finer question
+the watchdog needs, and one nothing currently answers.
 
 ## 6. The VRAM watchdog
 
@@ -300,8 +301,8 @@ runner silently ignoring a declaration and admitting on wrong numbers.
 - Watchdog: over on two consecutive sweeps kills; over on one does not;
   `vram_mb: null` is never over; both §6 guards disable enforcement.
 - Preflight admits a ledgered co-tenant and refuses an unledgered process.
-- The §5 reaper bug: a direct `gpu-claim` child survives a sweep. This test
-  must fail against `main` before the fix.
+- The §5 reaper bug: a direct `gpu-claim` child survives a sweep. Already
+  covered by the tests landed with #12, which must keep passing.
 - Backward compatibility: a job with no `--vram-mb` is admitted alone and
   excludes everything else, byte-for-byte today's behaviour.
 
