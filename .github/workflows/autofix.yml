@@ -33,8 +33,27 @@ jobs:
     # `off` alone. Unset must keep meaning "on", which is the default state
     # of every repo that has never touched this variable -- so absence is
     # deliberately not in this list.
+    #
+    # DO NOT remove the `x` prefixes below. They are not decoration; they
+    # are the only thing keeping "unset" out of that list. GitHub's
+    # expressions use loose equality and coerce anything numeric-looking to
+    # a number, and an unset variable is the empty string, which coerces to
+    # zero -- so a bare zero entry in the list MATCHED AN UNSET VARIABLE.
+    # Verified on a live runner: with GPUQ_AUTOFIX unset, both
+    # `contains(fromJSON('[<bare zero>]'), vars.GPUQ_AUTOFIX)` and
+    # `vars.GPUQ_AUTOFIX == '<bare zero>'` returned true. That silently
+    # disabled dispatch on every repo that had never set the variable --
+    # the default state, and the exact state the paragraph above says must
+    # mean "on". Filing kept working, so it presented as a broken fixer
+    # rather than a shut gate.
+    #
+    # Prefixing both sides leaves neither numeric, so no coercion happens
+    # and every spelling still matches. Also verified live: unset -> false;
+    # zero, `off`, `OFF` and `false` -> true. `tests/test_workflow.py`
+    # guards this.
     if: >-
-      !contains(fromJSON('["off", "false", "no", "disabled", "0"]'), vars.GPUQ_AUTOFIX)
+      !contains(fromJSON('["xoff", "xfalse", "xno", "xdisabled", "x0"]'),
+                format('x{0}', vars.GPUQ_AUTOFIX))
       && !contains(github.event.issue.labels.*.name, 'throttled')
       && (
            (github.event.action == 'opened'
