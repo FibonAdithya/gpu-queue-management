@@ -144,3 +144,114 @@ def test_reap_can_skip_the_expensive_cuda_sweep(tmp_path, monkeypatch):
     assert called == []
     reap(q, cfg, include_orphan_cuda=True)
     assert called == [1]
+
+
+# --- a direct `gpu-claim` run must survive the sweep --------------------
+#
+# The README advertises `gpu-claim -- <cmd>` as usable on its own. Its CUDA
+# process is the *child* of the pid recorded in the claim file, and
+# `preflight.own_pids` expands `_descendants()` only for the runner's own
+# pid -- so that child is exempted by nothing and `kill_orphan_cuda`
+# SIGKILLs a legitimate run. Every other test in this file stubs
+# `own_pids` to set(), which is why the suite cannot currently see this.
+
+import os as _os
+import signal as _signal
+import subprocess as _sp
+import sys as _sys
+import time as _time
+from pathlib import Path as _Path
+from gpuqueue import preflight as _pf
+
+# Detaches before spawning its child, so the pair is NOT in pytest's own
+# process tree. Without the double fork `_descendants(os.getpid())` exempts
+# them and these tests pass while the bug is fully present.
+_HOLDER = r'''
+import json, os, subprocess, sys, time
+out = sys.argv[1]
+if os.fork() != 0: os._exit(0)
+os.setsid()
+if os.fork() != 0: os._exit(0)
+child = subprocess.Popen(["sleep", "60"])
+tmp = out + ".part"
+with open(tmp, "w") as f:
+    json.dump({"holder": os.getpid(), "child": child.pid}, f)
+os.rename(tmp, out)
+time.sleep(60)
+'''
+
+
+def _live(pid: int) -> bool:
+    """Not `claim.pid_alive`: that uses os.kill(pid, 0), which succeeds on a
+    zombie. A SIGKILLed child whose parent is still sleeping is exactly a
+    zombie, so pid_alive would report the kill as survival."""
+    try:
+        status = _Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return False
+    for line in status.splitlines():
+        if line.startswith("State:"):
+            return line.split()[1] != "Z"
+    return False
+
+
+@pytest.fixture
+def direct_claim(tmp_path, monkeypatch):
+    """A detached `gpu-claim`-shaped process pair plus its claim file."""
+    claim_dir = tmp_path / "claims"
+    claim_dir.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(claim_dir))
+
+    out = tmp_path / "pids.json"
+    _sp.run([_sys.executable, "-c", _HOLDER, str(out)], check=True, timeout=30)
+    deadline = _time.monotonic() + 10
+    while not out.exists():
+        if _time.monotonic() > deadline:
+            pytest.fail("helper never reported its pids")
+        _time.sleep(0.05)
+    pids = json.loads(out.read_text())
+    holder, child = pids["holder"], pids["child"]
+
+    (claim_dir / "GPU-test.lock.json").write_text(json.dumps({
+        "pid": holder, "owner": "someone", "cmd": ["python", "train.py"],
+        "started_at": "2026-08-10T00:00:00Z", "key": "GPU-test"}))
+
+    # The whole reproduction rests on these two not being in pytest's tree.
+    assert holder not in _pf._descendants(_os.getpid())
+    assert child not in _pf._descendants(_os.getpid())
+    try:
+        yield holder, child
+    finally:
+        for pid in (child, holder):
+            try:
+                _os.kill(pid, _signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_own_pids_covers_a_claim_holders_children(direct_claim):
+    """The root cause. The claim names the gpu-claim process; the process
+    actually on the card is its child."""
+    holder, child = direct_claim
+    own = _pf.own_pids()
+    assert holder in own, "the recorded pid itself is exempt"
+    assert child in own, "a claim holder's CUDA child is not exempt"
+
+
+def test_does_not_kill_a_direct_gpu_claim_run(q, direct_claim, monkeypatch):
+    """The consequence: a legitimate `gpu-claim` run is SIGKILLed within
+    orphan_cuda_interval_s on any box where the runner is up."""
+    holder, child = direct_claim
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True)
+    monkeypatch.setattr(rp, "own_pids", _pf.own_pids)   # undo the autouse stub
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": child, "used_mb": 900,
+                                  "name": "train.py"}])
+
+    result = reap(q, cfg)
+
+    deadline = _time.monotonic() + 2
+    while _live(child) and _time.monotonic() < deadline:
+        _time.sleep(0.05)
+    assert _live(child), "SIGKILLed a legitimate direct gpu-claim run"
+    assert result["killed_pids"] == []

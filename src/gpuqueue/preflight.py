@@ -51,12 +51,27 @@ def compute_apps() -> list[dict] | None:
 
 
 def own_pids() -> set[int]:
-    pids = {os.getpid(), os.getppid()}
+    """Every pid the claim protocol accounts for, including their children.
+
+    A claim names the process that took the lock, but the process actually
+    on the card is normally its child: `gpu-claim` runs the command as a
+    subprocess, and the runner starts jobs the same way. Expanding only our
+    own tree exempted a direct `gpu-claim` run's recorded pid while leaving
+    the trainer underneath it covered by nothing — so `kill_orphan_cuda`
+    SIGKILLed a legitimate run as an orphan, and preflight read it as
+    foreign contention.
+
+    Roots are collected before they are walked so that the common case —
+    a claim whose pid *is* this process — does not walk the same tree twice.
+    """
+    roots = {os.getpid()}
     for _, body in list_claims():
         pid = int(body.get("pid", -1))
         if pid > 0 and pid_alive(pid):
-            pids.add(pid)
-    pids.update(_descendants(os.getpid()))
+            roots.add(pid)
+    pids = roots | {os.getppid()}
+    for root in roots:
+        pids.update(_descendants(root))
     return pids
 
 
