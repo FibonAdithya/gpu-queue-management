@@ -97,6 +97,11 @@ def test_does_not_kill_pids_of_running_jobs(q, monkeypatch):
     spec = q.claim("j1")
     spec.pid = 4321
     q._write(q.path_for("running", "j1"), spec)
+    # The job has to still be in `running` when reap() builds the protect set:
+    # requeue_orphans() runs first and drops any running job whose process is
+    # gone. Without this the test asserts nothing on a box where pid 4321 is
+    # dead -- j1 gets requeued, protect comes out empty, and the kill is real.
+    monkeypatch.setattr(rp, "pid_alive", lambda pid: True)
     monkeypatch.setattr(rp, "compute_apps",
                         lambda: [{"pid": 4321, "used_mb": 900, "name": "t.py"}])
     monkeypatch.setattr(rp, "_kill", lambda pid: pytest.fail("killed a live job"))
