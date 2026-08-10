@@ -230,13 +230,28 @@ Three things to set up, once:
    claim as "worst case is issue spam"; treat the PR the same way you would
    treat one from any other outside contributor.
 
-   One thing to know before pointing this at a **public** repo: the issue
-   body embeds the failing job's `JobSpec`, which includes its `cmd`
-   verbatim. A `JobSpec` has no environment field, so nothing is copied out
-   of the box's environment by construction — but a job submitted with a
-   secret in its command line publishes that secret. Pass credentials
-   through the environment, never as an argument, on any box filing into a
-   repo that is not private.
+   **This repository is public**, so this is no longer a conditional
+   warning: every issue autofix files here is world-readable, immediately
+   and permanently. The issue body embeds the failing job's `JobSpec`,
+   which includes its `cmd` verbatim. A `JobSpec` has no environment field,
+   so nothing is copied out of the box's environment by construction — but
+   a job submitted with a secret in its command line publishes that secret
+   to everyone. Pass credentials through the environment, never as an
+   argument.
+
+   The job's stderr is *not* published, which is worth knowing because it
+   is the likelier leak: `_describe_failure` writes up to 4 KB of it into
+   `spec.error`, and the issue body dumps the whole `JobSpec`. The two
+   paths are mutually exclusive by construction — `_describe_failure` runs
+   only when `spec.error is None` on a caller fault, and caller faults
+   never file — so a trainer that prints an API key to stderr does not
+   publish it. Do not rely on that for `cmd`, which is published.
+
+   If that trade is wrong for your jobs, `[autofix].repo` takes any
+   `owner/name` and does not have to be the repository the code lives in:
+   point it at a private one and the evidence stays private. The catch is
+   that the issue is what triggers the workflow, so `autofix.yml` has to
+   live in that repository too.
 
    Confirm it cannot push:
 
@@ -296,6 +311,28 @@ autofix on, exactly as before this variable was ever set.
 
 **Branch protection on `main`** is what makes this safe to leave on. The
 Action opens PRs; you merge them.
+
+What is actually configured, so you can check this paragraph rather than
+trust it: a pull request is required (zero approvals, so a solo maintainer
+is not locked out of their own repository), `test (3.11)` and `test (3.12)`
+must pass, and force-pushes and deletions are refused. Admins are exempt —
+that is an escape hatch for you, not for the Action, whose token is not an
+admin and is not exempt.
+
+```bash
+gh api repos/<owner>/gpu-queue-management/branches/main/protection \
+  --jq '{pr_required: (.required_pull_request_reviews != null),
+         checks: .required_status_checks.contexts,
+         force_push: .allow_force_pushes.enabled}'
+# expect: pr_required true, both test contexts, force_push false
+```
+
+Note that this setting is unavailable on a private repository on a free
+plan — GitHub 403s it with "Upgrade to GitHub Pro or make this repository
+public". Enabling it here is why this repository is public. If you fork
+this into a private repo on a free plan, **this control does not exist for
+you**, and the paragraph above is false until you either pay for it or
+accept that nothing enforces the review.
 
 ## 5. Verify
 
