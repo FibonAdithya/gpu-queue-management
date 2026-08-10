@@ -18,6 +18,14 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  # claude-code-action exchanges a GitHub OIDC token for its own credentials,
+  # and cannot mint one without this. Without it the run fails at the action
+  # itself -- after checkout, after install, after the suite has gone green --
+  # with "Could not fetch an OIDC token". Loud, but only ever heard at the one
+  # moment nobody is watching: when a bug has just been filed on an unattended
+  # box. It grants no access to this repository's contents; it lets the job
+  # prove to a third party which workflow and repository it is.
+  id-token: write
 
 jobs:
   fix:

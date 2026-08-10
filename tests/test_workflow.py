@@ -1,10 +1,16 @@
 """Structural guards on `.github/workflows/autofix.yml`.
 
-Nothing here runs the workflow -- these are the two properties whose failure
-is silent. A gate that never opens still reports success (the job is
-`skipped`, and a run full of skipped jobs is a green run), and a trigger
-that hands the OAuth token to fork-authored code looks exactly like one
-that does not.
+Nothing here runs the workflow. These are the properties whose failure
+nobody is present to see. A gate that never opens still reports success
+(the job is `skipped`, and a run full of skipped jobs is a green run), and
+a trigger that hands the OAuth token to fork-authored code looks exactly
+like one that does not.
+
+The missing-permission check is the odd one out: it fails loudly rather
+than silently. It is here because of *when* it is heard -- after checkout,
+after install, after the suite has gone green, on an unattended box that
+has just hit a bug. A workflow this rarely exercised gets one chance to
+work, and none of these three failures gets a second look until then.
 
 Both checks are scoped to the block they are about rather than the whole
 file, so the surrounding comments stay free to name the thing they are
@@ -66,3 +72,19 @@ def test_the_workflow_never_triggers_on_pull_request_target():
     assert "pull_request_target" not in _block(WORKFLOW.read_text(), "on:"), (
         "pull_request_target runs fork-authored code with access to "
         "secrets, and this workflow holds CLAUDE_CODE_OAUTH_TOKEN")
+
+
+def test_the_fixer_can_mint_an_oidc_token():
+    """claude-code-action authenticates by exchanging a GitHub OIDC token.
+
+    Without `id-token: write` it cannot mint one, and the run dies at the
+    action with "Could not fetch an OIDC token" -- having already spent a
+    checkout, an install and a full test run getting there. Observed: the
+    first real dispatch this system ever performed failed exactly here.
+
+    The permission grants no access to repository contents. It lets the job
+    prove to a third party which workflow and repository it is.
+    """
+    permissions = _block(WORKFLOW.read_text(), "permissions:")
+    assert "id-token: write" in permissions, (
+        "claude-code-action cannot authenticate without id-token: write")
