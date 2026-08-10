@@ -1,0 +1,57 @@
+# Runs the suite on every PR and on every push to main.
+#
+# This exists because of what autofix depends on. `autofix.yml` gates the
+# fixer on "Confirm the suite is green before touching anything", so before
+# this workflow the first time pytest ran on GitHub was the moment a bug was
+# filed -- and a suite that had quietly rotted showed up as "autofix is
+# broken", at the one moment nobody is watching, rather than as "a test
+# broke", on the PR that broke it.
+#
+# The push-to-main trigger is not redundant with the PR one: `main` has no
+# branch protection (private repo on a free plan, so the setting is not
+# available), which means a direct push is possible and would otherwise
+# reach `main` with nothing having run.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: this workflow reads code and runs tests. Nothing it does
+# needs a token that can write. Contrast `autofix.yml`, which needs write and
+# is gated on labels for exactly that reason.
+permissions:
+  contents: read
+
+# A force-push mid-run makes the in-flight run answer a question nobody is
+# asking any more.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor `pyproject.toml` declares and the version
+        # `autofix.yml` pins, so the fixer's environment stays covered.
+        # 3.12 is what the box actually runs. Testing only one of them
+        # leaves the other's breakage to be discovered somewhere worse.
+        python-version: ['3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install gpuq and its test dependencies
+        run: python -m pip install --quiet -e '.[dev]'
+
+      - name: Run the suite
+        run: python -m pytest -q
