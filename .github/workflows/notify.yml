@@ -1,0 +1,50 @@
+# Makes a filed bug reach a human.
+#
+# The design assumed GitHub's own email covered this: "GitHub emails on
+# issue and PR activity". It does not, for the case that matters. The box
+# files with the owner's own token, and GitHub does not notify you about
+# your own actions -- so the one event this whole system exists to surface
+# is the one event that arrives silently. Verified on this repository:
+# issue #5 was filed by the runner and produced no notification at all,
+# while CI failures on the same repo notified normally.
+#
+# Fixing that needs a *different actor* to touch the issue after it is
+# filed, which is all this workflow is. `github-actions[bot]` assigns the
+# owner, and an assignment from someone else is a notification.
+#
+# Deliberately not gated on GPUQ_AUTOFIX or on `throttled`. Both of those
+# switch off *dispatch*, and the design is explicit that filing continues
+# when they do -- a bug nobody is allowed to auto-fix is still a bug
+# somebody needs to know about. If anything it matters more there, because
+# no PR is coming to remind you.
+name: notify
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  assign:
+    # Both filing paths: `gpuq-auto` is the runner's structural evidence,
+    # `gpuq-reported` is an agent's prose. Labels are the gate because only
+    # someone with triage permission can set them -- GitHub silently drops
+    # labels from anyone else, so a stranger opening an issue cannot route
+    # themselves into your notifications.
+    if: >-
+      contains(github.event.issue.labels.*.name, 'gpuq-auto')
+      || contains(github.event.issue.labels.*.name, 'gpuq-reported')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assign the owner so the filing reaches them
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          gh issue edit "$NUMBER" --repo "$REPO" --add-assignee "$OWNER"
+          echo "assigned $OWNER to #$NUMBER"
