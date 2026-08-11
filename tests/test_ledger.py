@@ -1,5 +1,8 @@
 # tests/test_ledger.py
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -158,3 +161,87 @@ def test_busy_message_names_the_holders_and_the_shortfall():
                           4000, 7676)
     assert "4000" in msg and "3676" in msg
     assert "42" in msg and "gpuq:job-a" in msg
+
+
+def test_acquire_writes_a_live_record(tmp_path):
+    got = lg.acquire(KEY, vram_mb=512, owner="me", cmd=["python", "t.py"],
+                     directory=tmp_path, usable_mb=7676, usage_pid=os.getpid())
+    assert got.pid == os.getpid()
+    assert got.usage_pid == os.getpid()
+    assert [r.vram_mb for r in lg.records_for(KEY, tmp_path)] == [512]
+    lg.remove(got)
+
+
+def test_two_claims_share_a_card_when_both_fit(tmp_path):
+    a = lg.acquire(KEY, vram_mb=3000, owner="a", cmd=[], directory=tmp_path,
+                   usable_mb=7676)
+    b = lg.acquire(KEY, vram_mb=3000, owner="b", cmd=[], directory=tmp_path,
+                   usable_mb=7676)
+    assert len(lg.records_for(KEY, tmp_path)) == 2
+    lg.remove(a)
+    lg.remove(b)
+
+
+def test_records_do_not_collide_when_one_process_holds_several(tmp_path):
+    """The runner holds one record per GPU job, all with its own pid."""
+    a = lg.acquire(KEY, vram_mb=100, owner="a", cmd=[], directory=tmp_path,
+                   usable_mb=7676)
+    b = lg.acquire(KEY, vram_mb=100, owner="b", cmd=[], directory=tmp_path,
+                   usable_mb=7676)
+    assert a.path != b.path
+    assert len(lg.records_for(KEY, tmp_path)) == 2
+
+
+def test_acquire_refuses_when_the_card_is_full(tmp_path):
+    lg.acquire(KEY, vram_mb=7000, owner="a", cmd=[], directory=tmp_path,
+               usable_mb=7676)
+    with pytest.raises(lg.ClaimBusy, match="MiB free"):
+        lg.acquire(KEY, vram_mb=1000, owner="b", cmd=[], directory=tmp_path,
+                   usable_mb=7676)
+
+
+def test_a_dead_holders_record_does_not_reserve_anything(tmp_path):
+    mkrec(tmp_path, name="4000000.dead.json", pid=4000000, vram_mb=7000)
+    got = lg.acquire(KEY, vram_mb=7000, owner="b", cmd=[], directory=tmp_path,
+                     usable_mb=7676)
+    assert got.vram_mb == 7000
+
+
+def test_a_holder_in_another_process_blocks_by_capacity(tmp_path):
+    """A real second process is the only honest test: the record has to
+    outlive the mutex, which is released the instant acquire returns."""
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import time;from gpuqueue import ledger as lg;"
+         f"lg.acquire({KEY!r},vram_mb=7000,owner='a',cmd=[],"
+         f"directory={str(tmp_path)!r},usable_mb=7676);"
+         "print('held',flush=True);time.sleep(30)"],
+        stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(lg.ClaimBusy):
+            lg.acquire(KEY, vram_mb=1000, owner="b", cmd=[],
+                       directory=tmp_path, usable_mb=7676)
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_an_old_style_exclusive_flock_is_reported_as_such(tmp_path, monkeypatch):
+    """A gpu-claim from before the ledger holds LOCK_EX for its whole run
+    and would otherwise hang us forever."""
+    monkeypatch.setattr(lg, "MUTEX_WAIT_S", 0.2)
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import fcntl,os,time;"
+         f"fd=os.open({str(lg.mutex_path(KEY, tmp_path))!r},os.O_CREAT|os.O_RDWR,0o666);"
+         "fcntl.flock(fd,fcntl.LOCK_EX);print('held',flush=True);time.sleep(30)"],
+        stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(lg.ClaimBusy, match="older gpu-claim"):
+            lg.acquire(KEY, vram_mb=512, owner="b", cmd=[],
+                       directory=tmp_path, usable_mb=7676)
+    finally:
+        holder.kill()
+        holder.wait()

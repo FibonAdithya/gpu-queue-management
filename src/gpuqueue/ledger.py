@@ -14,8 +14,11 @@ an undeclared claim behave as it did before any of this existed.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import secrets
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -192,3 +195,65 @@ def busy_message(key: str, records: list[Record], want_mb: int | None,
         for r in records
     ] or ["  (none -- this claim does not fit the card at all)"]
     return "\n".join([head, *lines])
+
+
+# Bound on the mutex wait, not on holding the card. A participant only
+# ever holds this flock for a directory read and one rename, so anything
+# longer means the holder predates this ledger entirely.
+MUTEX_WAIT_S = 10.0
+_MUTEX_POLL_S = 0.05
+
+
+def _take_mutex(fd: int, timeout_s: float) -> None:
+    """Bounded, because a participant only holds this for a directory read
+    and one rename. Waiting longer than that means the holder is not
+    playing by these rules -- in practice a gpu-claim from before the
+    ledger, which takes LOCK_EX for the whole run and would hang us until
+    its training finished."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise ClaimBusy(
+                    f"could not take the ledger mutex within {timeout_s:g}s: "
+                    "an older gpu-claim is holding this card exclusively for "
+                    "the whole of its run. Wait for it, or upgrade it.")
+            time.sleep(_MUTEX_POLL_S)
+
+
+def acquire(key: str, *, vram_mb: int | None, owner: str,
+            cmd: list[str] | None, directory, usable_mb: int | None,
+            usage_pid: int | None = None) -> Record:
+    """Take a share of the card, or raise ClaimBusy.
+
+    Non-blocking on capacity by design: the caller decides whether to wait,
+    and the runner must not, because a single-threaded loop that waits here
+    stalls the CPU lane behind whoever holds the card.
+    """
+    d = Path(directory)
+    d.mkdir(parents=True, exist_ok=True)
+    ldir = ledger_dir(key, d)
+    ldir.mkdir(parents=True, exist_ok=True)
+
+    fd = os.open(mutex_path(key, d), os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        _take_mutex(fd, MUTEX_WAIT_S)
+        live = live_records(records_for(key, d))
+        if not fits(live, vram_mb, usable_mb):
+            raise ClaimBusy(busy_message(key, live, vram_mb, usable_mb))
+        # A token, not just the pid: the runner holds one record per GPU
+        # job and every one of them carries the runner's pid.
+        rec = Record(path=ldir / f"{os.getpid()}.{secrets.token_hex(3)}.json",
+                     pid=os.getpid(), usage_pid=usage_pid, vram_mb=vram_mb,
+                     owner=owner, cmd=list(cmd or []),
+                     started_at=utcnow_iso(), key=key)
+        write_record(rec)
+        return rec
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
