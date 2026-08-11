@@ -34,6 +34,11 @@ class JobSpec:
     cmd: list[str]
     artifacts: list[str] = field(default_factory=list)
     timeout_s: int = 3600
+    # None means "the whole card": admit alone, exclude everything else.
+    # That is the default because a job that has not said what it needs
+    # cannot be admitted alongside anything safely -- and it is what keeps
+    # every spec written before this field behaving exactly as it did.
+    vram_mb: int | None = None
     attempts: int = 0
     dedupe_key: str | None = None
     submitted_at: str = field(default_factory=utcnow_iso)
@@ -69,6 +74,12 @@ class JobSpec:
             raise SpecError("cmd must be a non-empty list of strings")
         if not isinstance(self.timeout_s, int) or self.timeout_s <= 0:
             raise SpecError(f"timeout_s must be a positive int, got {self.timeout_s!r}")
+        if self.vram_mb is not None and (not isinstance(self.vram_mb, int)
+                                         or isinstance(self.vram_mb, bool)
+                                         or self.vram_mb <= 0):
+            raise SpecError(
+                f"vram_mb must be a positive int or None (meaning the whole "
+                f"card), got {self.vram_mb!r}")
         if self.attempts < 0:
             raise SpecError("attempts must be >= 0")
         for a in self.artifacts:
