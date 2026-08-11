@@ -1849,7 +1849,7 @@ def test_one_sweep_over_the_line_does_not_convict(tmp_path, monkeypatch):
     strikes = {}
     apps = [{"pid": 500, "used_mb": 3070, "name": "t.py"}]
     assert rp.check_vram([r], apps, strikes) == []
-    assert strikes[r.name] == 1
+    assert strikes[str(r.path)] == 1
 
 
 def test_two_consecutive_sweeps_convict(tmp_path, monkeypatch):
@@ -1976,20 +1976,25 @@ def check_vram(records: list, apps: list[dict],
     for rec in records:
         if rec.vram_mb is None:
             continue  # declared the whole card, so it cannot exceed it
-        seen.add(rec.name)
-        used = ledger.used_mb(owned.get(rec.name, []))
+        # Keyed by full path, matching ledger.attribute. A bare filename
+        # is not unique across <key>.lock.d directories, and these strikes
+        # persist across sweeps -- a collision would charge one holder's
+        # strikes to another and kill the wrong job.
+        key = str(rec.path)
+        seen.add(key)
+        used = ledger.used_mb(owned.get(key, []))
         if used <= rec.vram_mb:
-            strikes.pop(rec.name, None)
+            strikes.pop(key, None)
             continue
-        strikes[rec.name] = strikes.get(rec.name, 0) + 1
-        if strikes[rec.name] >= WATCHDOG_STRIKES:
-            strikes.pop(rec.name, None)
+        strikes[key] = strikes.get(key, 0) + 1
+        if strikes[key] >= WATCHDOG_STRIKES:
+            strikes.pop(key, None)
             convicted.append({"owner": rec.owner, "declared": rec.vram_mb,
                               "used": used, "usage_pid": rec.usage_pid,
                               "record": rec.name})
-    for name in list(strikes):
-        if name not in seen:
-            strikes.pop(name)  # the holder is gone; its strikes go with it
+    for key in list(strikes):
+        if key not in seen:
+            strikes.pop(key)  # the holder is gone; its strikes go with it
     return convicted
 ```
 
