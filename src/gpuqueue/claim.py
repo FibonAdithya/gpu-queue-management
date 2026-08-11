@@ -9,17 +9,26 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
 from . import ledger
 from .gpuid import gpu_key, total_vram_mb
-from .ledger import ClaimBusy          # re-exported: callers import it here
+from .ledger import ClaimBusy, MutexTimeout  # re-exported: callers use these
 from .procs import pid_alive           # re-exported for the same reason
 
 DEFAULT_CLAIM_DIR = "/var/lock/gpu"
 WAIT_POLL_S = 0.5
+
+# A MutexTimeout means an old-style gpu-claim is holding LOCK_EX for its
+# whole run, which can be hours -- a different condition from "the card is
+# full," which clears in the time a job takes to exit. Retrying at the
+# capacity cadence would mean polling flock at _MUTEX_POLL_S under the
+# hood every WAIT_POLL_S, for as long as that run lasts. Its own, longer
+# interval is what keeps that from being a busy-wait.
+MUTEX_WAIT_POLL_S = 5.0
 
 
 def claim_dir() -> Path:
@@ -96,11 +105,18 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
     `wait` polls capacity rather than blocking on flock: the mutex is
     released the instant `acquire` returns, so there is no longer a kernel
     queue to wait in.
+
+    A `MutexTimeout` -- an old-style gpu-claim holding the mutex itself,
+    not the card being full -- is a different wait with a different
+    cause, so it gets its own cadence and a one-time explanation instead
+    of silently retrying at the capacity rate for however long that run
+    lasts.
     """
     d = Path(directory) if directory else claim_dir()
     key = key or gpu_key()
     if usable_mb is None:
         usable_mb = default_usable_mb()
+    warned = False
     while True:
         try:
             rec = ledger.acquire(
@@ -108,6 +124,15 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
                 cmd=cmd, directory=d, usable_mb=usable_mb,
                 usage_pid=os.getpid() if own_usage else None)
             break
+        except MutexTimeout:
+            if not wait:
+                raise
+            if not warned:
+                print("gpu-claim: warning: an older gpu-claim is holding "
+                      "this card exclusively; this may last as long as its "
+                      "run", file=sys.stderr)
+                warned = True
+            time.sleep(MUTEX_WAIT_POLL_S)
         except ClaimBusy:
             if not wait:
                 raise

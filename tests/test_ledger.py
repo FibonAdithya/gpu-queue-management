@@ -247,6 +247,18 @@ def test_an_old_style_exclusive_flock_is_reported_as_such(tmp_path, monkeypatch)
         holder.wait()
 
 
+def test_mutex_timeout_is_caught_by_except_claim_busy():
+    """The whole point of `MutexTimeout(ClaimBusy)`: every existing
+    `except ClaimBusy` -- the runner, gpu-claim, callers not yet written
+    -- must keep catching this without being told about it."""
+    try:
+        raise lg.MutexTimeout("an old gpu-claim is holding the mutex")
+    except lg.ClaimBusy as e:
+        assert isinstance(e, lg.MutexTimeout)
+    else:
+        pytest.fail("MutexTimeout escaped an `except ClaimBusy`")
+
+
 def app(pid, used_mb=100, name="train.py"):
     return {"pid": pid, "used_mb": used_mb, "name": name}
 

@@ -35,6 +35,20 @@ class ClaimBusy(RuntimeError):
     """The card has no room for this claim."""
 
 
+class MutexTimeout(ClaimBusy):
+    """Could not take the ledger mutex itself -- not a capacity refusal.
+
+    A subclass of `ClaimBusy`, not a sibling: every existing `except
+    ClaimBusy` (the runner, `gpu-claim`, callers not yet written) must
+    keep catching this without being told about it. What a caller who
+    *does* care about the distinction gets is the option to add a more
+    specific `except MutexTimeout` before the general one -- which is
+    exactly what `gpu_claim`'s `wait=True` path does, since "an old
+    gpu-claim is holding LOCK_EX for its whole run" can last hours and
+    is worth explaining, where "the card is full" is not.
+    """
+
+
 @dataclass
 class Record:
     path: Path
@@ -217,7 +231,7 @@ def _take_mutex(fd: int, timeout_s: float) -> None:
             return
         except OSError:
             if time.monotonic() >= deadline:
-                raise ClaimBusy(
+                raise MutexTimeout(
                     f"could not take the ledger mutex within {timeout_s:g}s: "
                     "an older gpu-claim is holding this card exclusively for "
                     "the whole of its run. Wait for it, or upgrade it.")

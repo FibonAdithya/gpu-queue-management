@@ -4,8 +4,9 @@ import subprocess
 import sys
 import pytest
 from gpuqueue import ledger as lg
-from gpuqueue.claim import (gpu_claim, ClaimBusy, read_claim, pid_alive,
-                            list_claims, release_stale, default_usable_mb)
+from gpuqueue.claim import (gpu_claim, ClaimBusy, MutexTimeout, read_claim,
+                            pid_alive, list_claims, release_stale,
+                            default_usable_mb)
 
 KEY = "4b8f2c1a-0000-0000-0000-000000000001"
 
@@ -97,6 +98,73 @@ def test_wait_blocks_until_there_is_room(tmp_path, monkeypatch):
     with gpu_claim(key=KEY, directory=tmp_path, vram_mb=1000,
                    usable_mb=7676, wait=True) as c:
         assert c.vram_mb == 1000
+
+
+def _spawn_lock_ex_holder(tmp_path, sleep_s=30):
+    """A detached process holding the real `LOCK_EX` on the mutex path --
+    what a pre-ledger gpu-claim looks like from the outside. A real
+    second process is the only honest way to exercise `_take_mutex`'s
+    timeout: an in-process flock can't contend with itself."""
+    return subprocess.Popen(
+        [sys.executable, "-c",
+         "import fcntl,os,time;"
+         f"fd=os.open({str(lg.mutex_path(KEY, tmp_path))!r},os.O_CREAT|os.O_RDWR,0o666);"
+         f"fcntl.flock(fd,fcntl.LOCK_EX);print('held',flush=True);time.sleep({sleep_s})"],
+        stdout=subprocess.PIPE, text=True)
+
+
+def test_wait_true_warns_once_across_several_mutex_timeouts(
+        tmp_path, monkeypatch, capsys):
+    """A MutexTimeout means an old-style gpu-claim holds the mutex itself,
+    which can last hours -- worth one explanation, not one every retry.
+
+    `time.sleep` is not mocked here: `ledger._take_mutex`'s own internal
+    poll shares the one process-wide `time` module with `gpu_claim`'s
+    retry loop, so patching `time.sleep` globally (as the capacity-wait
+    test above does, safely, because that path never touches a real
+    flock) would also collapse `_take_mutex`'s internal polling and
+    change which branch fires. Real, scaled-down durations avoid that
+    trap entirely: the holder lives just long enough for several real
+    `MutexTimeout`s to occur before it exits on its own and the claim
+    goes through.
+    """
+    monkeypatch.setattr(lg, "MUTEX_WAIT_S", 0.03)
+    monkeypatch.setattr("gpuqueue.claim.MUTEX_WAIT_POLL_S", 0.03)
+    holder = _spawn_lock_ex_holder(tmp_path, sleep_s=0.4)
+
+    attempts = []
+    real_acquire = lg.acquire
+
+    def counting_acquire(*a, **kw):
+        attempts.append(1)
+        return real_acquire(*a, **kw)
+
+    monkeypatch.setattr(lg, "acquire", counting_acquire)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676,
+                       wait=True) as c:
+            assert c.vram_mb is None  # the claim eventually went through
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+        holder.wait()
+    assert len(attempts) >= 3  # several retries happened before it succeeded
+    err = capsys.readouterr().err
+    assert err.count("gpu-claim: warning:") == 1
+
+
+def test_wait_false_raises_immediately_on_mutex_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(lg, "MUTEX_WAIT_S", 0.05)
+    holder = _spawn_lock_ex_holder(tmp_path)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(MutexTimeout):
+            with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676):
+                pass
+    finally:
+        holder.kill()
+        holder.wait()
 
 
 def test_release_stale_removes_dead_pid_records(tmp_path):
