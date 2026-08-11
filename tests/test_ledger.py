@@ -256,7 +256,7 @@ def test_attribute_charges_a_pid_to_its_records_tree(monkeypatch):
                         lambda pid: {555} if pid == 100 else set())
     r = rec(512, pid=100)
     owned, unledgered = lg.attribute([app(555)], [r])
-    assert [a["pid"] for a in owned[r.name]] == [555]
+    assert [a["pid"] for a in owned[str(r.path)]] == [555]
     assert unledgered == []
 
 
@@ -264,7 +264,7 @@ def test_attribute_charges_the_usage_pid_itself(monkeypatch):
     monkeypatch.setattr(lg, "descendants", lambda pid: set())
     r = rec(512, pid=100)
     owned, unledgered = lg.attribute([app(100)], [r])
-    assert [a["pid"] for a in owned[r.name]] == [100]
+    assert [a["pid"] for a in owned[str(r.path)]] == [100]
 
 
 def test_a_stranger_is_unledgered(monkeypatch):
@@ -290,11 +290,32 @@ def test_each_pid_is_charged_to_exactly_one_record(monkeypatch):
                         lambda pid: {pid + 1000})
     a, b = rec(512, pid=100), rec(512, pid=200)
     owned, unledgered = lg.attribute([app(1100), app(1200)], [a, b])
-    assert [x["pid"] for x in owned[a.name]] == [1100]
-    assert [x["pid"] for x in owned[b.name]] == [1200]
+    assert [x["pid"] for x in owned[str(a.path)]] == [1100]
+    assert [x["pid"] for x in owned[str(b.path)]] == [1200]
     assert unledgered == []
 
 
 def test_used_mb_sums_and_tolerates_unknowns():
     assert lg.used_mb([app(1, 200), app(2, 300)]) == 500
     assert lg.used_mb([app(1, None)]) == 0
+
+
+def test_records_with_the_same_name_in_different_dirs_both_own(monkeypatch):
+    """`all_records()` spans every `<key>.lock.d/` directory, so a bare
+    filename is only unique within one directory, not across the whole
+    ledger. Keying `owned` by name would let the second record's tree
+    silently overwrite the first's, and the first holder's live process
+    would read as a stranger to the reaper and the watchdog -- both of
+    which kill."""
+    monkeypatch.setattr(lg, "descendants", lambda pid: set())
+    a = lg.Record(path=Path("/tmp/keyA.lock.d/100.aaa.json"), pid=100,
+                  usage_pid=100, vram_mb=512, owner="a", cmd=[],
+                  started_at="", key=KEY)
+    b = lg.Record(path=Path("/tmp/keyB.lock.d/100.aaa.json"), pid=200,
+                  usage_pid=200, vram_mb=512, owner="b", cmd=[],
+                  started_at="", key=KEY)
+    assert a.name == b.name  # same basename, different directories
+    owned, unledgered = lg.attribute([app(100), app(200)], [a, b])
+    assert [x["pid"] for x in owned[str(a.path)]] == [100]
+    assert [x["pid"] for x in owned[str(b.path)]] == [200]
+    assert unledgered == []

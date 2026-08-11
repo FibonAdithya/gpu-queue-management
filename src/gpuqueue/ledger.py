@@ -263,23 +263,29 @@ def attribute(apps: list[dict],
               records: list[Record]) -> tuple[dict[str, list[dict]], list[dict]]:
     """Charge every visible CUDA process to the record that owns it.
 
-    Returns (owned, unledgered), keyed by record name. Three callers need
-    this answer -- preflight, the orphan reaper and the VRAM watchdog --
-    and they share one implementation so they cannot disagree about who
-    owns a pid, which is the disagreement that gets a legitimate job
-    killed.
+    Returns (owned, unledgered), keyed by the record's full path. Three
+    callers need this answer -- preflight, the orphan reaper and the VRAM
+    watchdog -- and they share one implementation so they cannot disagree
+    about who owns a pid, which is the disagreement that gets a
+    legitimate job killed.
+
+    Keyed by `str(path)` rather than `Record.name`: `all_records()` spans
+    every `<key>.lock.d/` directory, so a bare filename is unique only
+    within one directory, not across the whole ledger. Keying by name
+    would let a second record's tree silently overwrite a first's, and
+    the first holder's live process would then read as a stranger.
 
     A record with no `usage_pid` has been admitted but not launched. It
     owns nothing, and must not adopt a stranger's process.
     """
-    trees = {r.name: {r.usage_pid} | descendants(r.usage_pid)
+    trees = {str(r.path): {r.usage_pid} | descendants(r.usage_pid)
              for r in records if r.usage_pid is not None}
     owned: dict[str, list[dict]] = {}
     unledgered: list[dict] = []
     for app in apps:
-        for name, tree in trees.items():
+        for path, tree in trees.items():
             if app["pid"] in tree:
-                owned.setdefault(name, []).append(app)
+                owned.setdefault(path, []).append(app)
                 break
         else:
             unledgered.append(app)
