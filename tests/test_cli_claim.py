@@ -19,7 +19,7 @@ def test_runs_command_and_returns_its_exit_code():
 
 def test_claim_released_after_command(tmp_path):
     cli_claim.main(["--", "true"])
-    assert list(tmp_path.glob("*.lock.json")) == []
+    assert list(tmp_path.glob("*.lock.d/*.json")) == []
 
 def test_busy_exits_75(monkeypatch, capsys):
     def busy(**kw):

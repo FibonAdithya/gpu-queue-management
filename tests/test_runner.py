@@ -107,7 +107,7 @@ def test_gpu_claim_is_released_when_the_job_ends(env, tmp_path):
     r, sha = env
     submit(r, sha, "g1", ["true"], lane="gpu")
     drain(r)
-    assert list((tmp_path / "claims").glob("*.lock.json")) == []
+    assert list((tmp_path / "claims").glob("*.lock.d/*.json")) == []
 
 def test_a_busy_card_leaves_the_job_pending_not_failed(env, tmp_path):
     """An outside gpu-claim holder must not consume the queued job."""
@@ -209,7 +209,7 @@ def test_shutdown_survives_a_job_file_removed_by_hand(env):
     r.shutdown()
     assert r.active == {}
     # the GPU claim was released despite the other job's missing file
-    assert list((r.cfg.claim_dir).glob("*.lock.json")) == []
+    assert list((r.cfg.claim_dir).glob("*.lock.d/*.json")) == []
 
 
 def test_an_idle_runner_still_reaps_an_abandoned_job(env):
