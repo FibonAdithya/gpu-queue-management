@@ -6,7 +6,6 @@ looking at a busy card learns *who* holds it without a running service.
 """
 from __future__ import annotations
 
-import errno
 import fcntl
 import json
 import os
@@ -15,6 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .gpuid import gpu_key, lock_filename
+from .procs import pid_alive          # re-exported: callers import it from here
 from .spec import utcnow_iso
 
 DEFAULT_CLAIM_DIR = "/var/lock/gpu"
@@ -38,16 +38,6 @@ def read_claim(path: Path) -> dict | None:
         return json.loads(path.read_text())
     except Exception:
         return None
-
-
-def pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError as e:
-        return e.errno == errno.EPERM  # exists but not ours
-    return True
 
 
 def job_orphaned(job_pid: int | None, runner_pid: int | None) -> bool:

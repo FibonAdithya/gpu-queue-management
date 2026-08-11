@@ -10,7 +10,8 @@ import os
 import subprocess
 import sys
 
-from .claim import list_claims, pid_alive
+from .claim import list_claims
+from .procs import descendants as _descendants, pid_alive
 
 
 class PreflightFailed(RuntimeError):
@@ -73,17 +74,6 @@ def own_pids() -> set[int]:
     for root in roots:
         pids.update(_descendants(root))
     return pids
-
-
-def _descendants(pid: int) -> set[int]:
-    try:
-        out = _run(["ps", "-o", "pid=", "--ppid", str(pid)])
-    except Exception:
-        return set()
-    kids = {int(l) for l in out.split() if l.strip().isdigit()}
-    for k in list(kids):
-        kids |= _descendants(k)
-    return kids
 
 
 def _foreign(apps: list[dict], allow: set[int] | None) -> list[dict]:
