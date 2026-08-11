@@ -7,6 +7,8 @@ from pathlib import Path
 
 import tomllib  # stdlib from 3.11, which is why 3.11 is the floor
 
+from .ledger import DEFAULT_RESERVE_MB
+
 
 class ConfigError(ValueError):
     """The configuration file is missing or malformed."""
@@ -61,6 +63,20 @@ class AutofixConfig:
 class RunnerConfig:
     queue_root: Path
     cpu_slots: int = 4
+    # None means "ask the card". An explicit value is for boxes where the
+    # query is unavailable or reports something the driver will not
+    # actually hand out.
+    gpu_vram_mb: int | None = None
+    # One source of truth with the standalone gpu-claim path, which needs
+    # the same number and has no config to read it from.
+    gpu_vram_reserve_mb: int = DEFAULT_RESERVE_MB
+    # A latency budget, not a safety one. VRAM accounting alone would admit
+    # sixteen 500 MiB jobs onto an 8 GB card, all time-slicing, each slower
+    # than it would have been queued -- and with independent submitters
+    # that cost lands on a stranger. Two is what has been measured (15% to
+    # 62% utilization); raise it on a box that has measured more.
+    gpu_max_jobs: int = 2
+    enforce_vram: bool = True
     poll_interval_s: float = 2.0
     claim_dir: Path | None = None
     kill_orphan_cuda: bool = True
@@ -86,6 +102,21 @@ def load_config(path: Path) -> RunnerConfig:
     cpu_slots = int(queue.get("cpu_slots", 4))
     if cpu_slots < 1:
         raise ConfigError("[queue].cpu_slots must be >= 1")
+
+    gpu_vram_mb = queue.get("gpu_vram_mb")
+    gpu_vram_mb = int(gpu_vram_mb) if gpu_vram_mb is not None else None
+    gpu_vram_reserve_mb = int(queue.get("gpu_vram_reserve_mb",
+                                        DEFAULT_RESERVE_MB))
+    gpu_max_jobs = int(queue.get("gpu_max_jobs", 2))
+    if gpu_max_jobs < 1:
+        raise ConfigError("[queue].gpu_max_jobs must be >= 1")
+    if gpu_vram_reserve_mb < 0:
+        raise ConfigError("[queue].gpu_vram_reserve_mb must be >= 0")
+    if gpu_vram_mb is not None and gpu_vram_reserve_mb >= gpu_vram_mb:
+        raise ConfigError(
+            f"[queue].gpu_vram_reserve_mb ({gpu_vram_reserve_mb}) must be "
+            f"less than gpu_vram_mb ({gpu_vram_mb}); a reserve that "
+            "swallows the card admits nothing and queues GPU jobs forever")
 
     projects: dict[str, ProjectConfig] = {}
     for name, p in (data.get("project") or {}).items():
@@ -134,6 +165,10 @@ def load_config(path: Path) -> RunnerConfig:
     return RunnerConfig(
         queue_root=Path(root),
         cpu_slots=cpu_slots,
+        gpu_vram_mb=gpu_vram_mb,
+        gpu_vram_reserve_mb=gpu_vram_reserve_mb,
+        gpu_max_jobs=gpu_max_jobs,
+        enforce_vram=bool(queue.get("enforce_vram", True)),
         poll_interval_s=float(queue.get("poll_interval_s", 2.0)),
         claim_dir=Path(claim_dir) if claim_dir else None,
         kill_orphan_cuda=bool(queue.get("kill_orphan_cuda", True)),

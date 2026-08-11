@@ -1,3 +1,5 @@
+import textwrap
+
 import pytest
 from gpuqueue.config import load_config, ConfigError
 
@@ -17,6 +19,11 @@ def _write(tmp_path, text):
     p = tmp_path / "gpuq.toml"
     p.write_text(text)
     return p
+
+def write_and_load(tmp_path, body):
+    # Indented triple-quoted TOML in the test body needs dedenting before
+    # it's valid at column 0; _write() alone doesn't do that.
+    return load_config(_write(tmp_path, textwrap.dedent(body)))
 
 def test_loads_queue_settings(tmp_path):
     cfg = load_config(_write(tmp_path, TOML))
@@ -123,3 +130,45 @@ def test_a_repo_must_look_like_owner_slash_name(tmp_path):
     text = TOML + '\n[autofix]\nenabled = true\nrepo = "https://github.com/a/b"\n'
     with pytest.raises(ConfigError, match="owner/name"):
         load_config(_write(tmp_path, text))
+
+
+def test_capacity_defaults(tmp_path):
+    cfg = write_and_load(tmp_path, """
+        [queue]
+        root = "/q"
+    """)
+    assert cfg.gpu_vram_mb is None      # discovered from nvidia-smi
+    assert cfg.gpu_vram_reserve_mb == 512
+    assert cfg.gpu_max_jobs == 2
+    assert cfg.enforce_vram is True
+
+
+def test_capacity_keys_are_read(tmp_path):
+    cfg = write_and_load(tmp_path, """
+        [queue]
+        root = "/q"
+        gpu_vram_mb = 8188
+        gpu_vram_reserve_mb = 1024
+        gpu_max_jobs = 4
+        enforce_vram = false
+    """)
+    assert (cfg.gpu_vram_mb, cfg.gpu_vram_reserve_mb) == (8188, 1024)
+    assert cfg.gpu_max_jobs == 4
+    assert cfg.enforce_vram is False
+
+
+def test_gpu_max_jobs_must_be_at_least_one(tmp_path):
+    with pytest.raises(ConfigError, match="gpu_max_jobs"):
+        write_and_load(tmp_path, '[queue]\nroot = "/q"\ngpu_max_jobs = 0\n')
+
+
+def test_reserve_may_not_swallow_the_whole_card(tmp_path):
+    """A reserve at or above capacity admits nothing and would leave every
+    GPU job pending forever, which is worse than refusing to start."""
+    with pytest.raises(ConfigError, match="gpu_vram_reserve_mb"):
+        write_and_load(tmp_path, """
+            [queue]
+            root = "/q"
+            gpu_vram_mb = 1024
+            gpu_vram_reserve_mb = 1024
+        """)
