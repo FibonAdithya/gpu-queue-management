@@ -111,9 +111,17 @@ def test_a_dead_holders_record_does_not_shelter_anyone(tmp_path, monkeypatch):
     _record(tmp_path, 4000000, 4000000)
     monkeypatch.setattr(pf, "compute_apps",
                         lambda: [{"pid": 4321, "used_mb": 900, "name": "t.py"}])
-    # Unconditional, like test_an_unledgered_process_still_refuses: this
-    # must stay empty so the *ledger* check -- not this process's own
-    # descendant tree -- is what proves the dead holder shelters no one.
+    # descendants(os.getpid()) must stay empty so this process's own
+    # exempt set can't accidentally cover 4321 and let the test pass for
+    # the wrong reason.
     monkeypatch.setattr(pf, "descendants", lambda pid: set())
+    # ledger.attribute() walks its *own* `descendants` (imported directly
+    # in ledger.py), never preflight's -- patching pf.descendants cannot
+    # reach it. This is what actually puts 4321 in the dead holder's
+    # tree, so liveness filtering has something real to prove: without
+    # it, the dead record would legitimately own 4321 and preflight
+    # would stay silent.
+    monkeypatch.setattr(lg, "descendants",
+                        lambda pid: {4321} if pid == 4000000 else set())
     with pytest.raises(PreflightFailed):
         pf.preflight(directory=tmp_path)
