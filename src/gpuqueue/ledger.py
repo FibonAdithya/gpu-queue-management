@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .gpuid import lock_filename
-from .procs import pid_alive
+from .procs import descendants, pid_alive
 from .spec import utcnow_iso
 
 # Held back from admission. Two processes that each fit exactly still have
@@ -257,3 +257,37 @@ def acquire(key: str, *, vram_mb: int | None, owner: str,
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+def attribute(apps: list[dict],
+              records: list[Record]) -> tuple[dict[str, list[dict]], list[dict]]:
+    """Charge every visible CUDA process to the record that owns it.
+
+    Returns (owned, unledgered), keyed by record name. Three callers need
+    this answer -- preflight, the orphan reaper and the VRAM watchdog --
+    and they share one implementation so they cannot disagree about who
+    owns a pid, which is the disagreement that gets a legitimate job
+    killed.
+
+    A record with no `usage_pid` has been admitted but not launched. It
+    owns nothing, and must not adopt a stranger's process.
+    """
+    trees = {r.name: {r.usage_pid} | descendants(r.usage_pid)
+             for r in records if r.usage_pid is not None}
+    owned: dict[str, list[dict]] = {}
+    unledgered: list[dict] = []
+    for app in apps:
+        for name, tree in trees.items():
+            if app["pid"] in tree:
+                owned.setdefault(name, []).append(app)
+                break
+        else:
+            unledgered.append(app)
+    return owned, unledgered
+
+
+def used_mb(apps: list[dict]) -> int:
+    """nvidia-smi reports [N/A] for a process it can see but not measure;
+    counting that as zero under-reports, which is the safe direction for a
+    watchdog that kills."""
+    return sum(a.get("used_mb") or 0 for a in apps)

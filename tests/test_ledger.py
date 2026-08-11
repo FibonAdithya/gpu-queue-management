@@ -245,3 +245,56 @@ def test_an_old_style_exclusive_flock_is_reported_as_such(tmp_path, monkeypatch)
     finally:
         holder.kill()
         holder.wait()
+
+
+def app(pid, used_mb=100, name="train.py"):
+    return {"pid": pid, "used_mb": used_mb, "name": name}
+
+
+def test_attribute_charges_a_pid_to_its_records_tree(monkeypatch):
+    monkeypatch.setattr(lg, "descendants",
+                        lambda pid: {555} if pid == 100 else set())
+    r = rec(512, pid=100)
+    owned, unledgered = lg.attribute([app(555)], [r])
+    assert [a["pid"] for a in owned[r.name]] == [555]
+    assert unledgered == []
+
+
+def test_attribute_charges_the_usage_pid_itself(monkeypatch):
+    monkeypatch.setattr(lg, "descendants", lambda pid: set())
+    r = rec(512, pid=100)
+    owned, unledgered = lg.attribute([app(100)], [r])
+    assert [a["pid"] for a in owned[r.name]] == [100]
+
+
+def test_a_stranger_is_unledgered(monkeypatch):
+    monkeypatch.setattr(lg, "descendants", lambda pid: set())
+    owned, unledgered = lg.attribute([app(4321)], [rec(512, pid=100)])
+    assert owned == {}
+    assert [a["pid"] for a in unledgered] == [4321]
+
+
+def test_a_reserved_record_owns_nothing(monkeypatch):
+    """Between acquire and launch there is no process to charge, so the
+    record must not silently adopt a stranger's."""
+    monkeypatch.setattr(lg, "descendants", lambda pid: {999})
+    r = lg.Record(path=Path("/tmp/1.x.json"), pid=100, usage_pid=None,
+                  vram_mb=512, owner="me", cmd=[], started_at="", key=KEY)
+    owned, unledgered = lg.attribute([app(999)], [r])
+    assert owned == {}
+    assert [a["pid"] for a in unledgered] == [999]
+
+
+def test_each_pid_is_charged_to_exactly_one_record(monkeypatch):
+    monkeypatch.setattr(lg, "descendants",
+                        lambda pid: {pid + 1000})
+    a, b = rec(512, pid=100), rec(512, pid=200)
+    owned, unledgered = lg.attribute([app(1100), app(1200)], [a, b])
+    assert [x["pid"] for x in owned[a.name]] == [1100]
+    assert [x["pid"] for x in owned[b.name]] == [1200]
+    assert unledgered == []
+
+
+def test_used_mb_sums_and_tolerates_unknowns():
+    assert lg.used_mb([app(1, 200), app(2, 300)]) == 500
+    assert lg.used_mb([app(1, None)]) == 0
