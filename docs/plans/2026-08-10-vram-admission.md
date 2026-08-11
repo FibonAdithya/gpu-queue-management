@@ -1080,7 +1080,10 @@ def _take_mutex(fd: int, timeout_s: float) -> None:
             return
         except OSError:
             if time.monotonic() >= deadline:
-                raise ClaimBusy(
+                # MutexTimeout, a ClaimBusy subclass: callers that only
+                # catch ClaimBusy keep working, and gpu_claim can still
+                # tell this from a full card.
+                raise MutexTimeout(
                     f"could not take the ledger mutex within {timeout_s:g}s: "
                     "an older gpu-claim is holding this card exclusively for "
                     "the whole of its run. Wait for it, or upgrade it.")
@@ -1445,6 +1448,7 @@ from .procs import pid_alive           # re-exported for the same reason
 
 DEFAULT_CLAIM_DIR = "/var/lock/gpu"
 WAIT_POLL_S = 0.5
+MUTEX_WAIT_POLL_S = 5.0   # see the MutexTimeout branch below
 
 
 def default_usable_mb() -> int | None:
@@ -1499,6 +1503,20 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
                 cmd=cmd, directory=d, usable_mb=usable_mb,
                 usage_pid=os.getpid() if own_usage else None)
             break
+        except MutexTimeout:
+            # Owner ruling during execution: a held mutex means an old
+            # gpu-claim owns the card for its whole run -- hours, not the
+            # seconds a full card takes to clear. Keep waiting (it really
+            # is transient) but say so once, and back off, or we poll
+            # flock under the hood every WAIT_POLL_S for that whole run.
+            if not wait:
+                raise
+            if not warned:
+                print("gpu-claim: warning: an older gpu-claim is holding "
+                      "this card exclusively; this may last as long as its "
+                      "run", file=sys.stderr)
+                warned = True
+            time.sleep(MUTEX_WAIT_POLL_S)
         except ClaimBusy:
             if not wait:
                 raise
