@@ -184,6 +184,29 @@ foreign CUDA processes and refuses to start when it finds any, naming the pid
 and command. This cannot stop a determined direct run. It converts accidental
 contention into a fast, readable failure instead of an OOM half an hour in.
 
+### Pinning the job to the card
+
+Holding the lock says which card is yours. A gpu-lane job is also **told**,
+via `CUDA_VISIBLE_DEVICES` set to the card's uuid, by both the runner and
+`gpu-claim`. cpu-lane jobs are left alone: they never took the card.
+
+Two things this buys. The allocation becomes binding rather than advisory — a
+pinned process cannot see, and so cannot accidentally take, a card it was not
+given. And the queue becomes usable by consumers that *refuse to guess* a
+device: a trainer resolving `device: auto` under a strict policy has no way to
+know which card it was handed unless something says so, and before this it
+could not run under the queue at all.
+
+The value is nvidia-smi's own uuid spelling — not `gpu_key`'s normalized form,
+and not an index. `gpu_key` is lowercased and prefix-stripped because it names
+a lock file; the driver resolves the string as the driver spells it. An index
+is wrong here for the same reason the lock is not keyed on one: it is not
+stable under a remap, so pinning `0` re-introduces the guess.
+
+On a box whose driver reports no uuid, the name-index fallback is still a
+usable lock key but is not something the driver can resolve. Nothing is
+pinned, a warning is logged, and jobs run exactly as they did before.
+
 ## Failure handling
 
 | Failure | Response |

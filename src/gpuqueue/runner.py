@@ -26,7 +26,7 @@ from .claim import gpu_claim, ClaimBusy
 from .config import RunnerConfig, ProjectConfig
 from .executor import (start_job, poll_job, kill_job, JobResult, RunningJob,
                        StartFailed)
-from .gpuid import gpu_key, GpuIdError
+from .gpuid import gpu_key, cuda_visible_value, GpuIdError
 from .preflight import preflight, PreflightFailed
 from .queue import QueueRoot, STATES
 from .reaper import reap
@@ -290,6 +290,34 @@ class Runner:
             return None
         return cm
 
+    def _card_pin(self, spec: JobSpec) -> dict:
+        """CUDA_VISIBLE_DEVICES for a gpu job, naming the card it was given.
+
+        The claim already serializes the card. This makes the allocation
+        binding on the job rather than advisory: a pinned process cannot see,
+        and so cannot accidentally take, a card the queue did not hand it.
+
+        It also makes the queue usable by consumers that refuse to guess a
+        device. `resolve_device(..., strict=True)` in the wgan-synthetic
+        project declines to resolve `device: auto` unless the process has been
+        pinned, precisely so two agents cannot both silently land on cuda:0.
+        Nothing was doing the pinning, so every `device: auto` config -- which
+        is most of them -- failed to start under the queue.
+
+        cpu-lane jobs are left alone. They never took the card, and handing
+        one a pin would say they had.
+        """
+        if spec.lane != "gpu":
+            return {}
+        value = cuda_visible_value()
+        if value is None:
+            # Degraded, not broken: this is the no-uuid box the lock's
+            # name-index fallback exists for. Jobs run exactly as they did
+            # before pinning, so say so once rather than failing the job.
+            log.warning("%s not pinned: no GPU uuid to pin to", spec.id)
+            return {}
+        return {"CUDA_VISIBLE_DEVICES": value}
+
     def _launch(self, spec: JobSpec, project: ProjectConfig, claim_cm) -> bool:
         try:
             workdir = self._prepare_workdir(spec, project)  # git, on the loop
@@ -303,11 +331,13 @@ class Runner:
             self._report_bug(e, "checkout", spec)
             return False
         out_log, err_log = self.queue.log_paths(spec.id)
+        job_env = {"GPUQ_JOB_ID": spec.id,
+                   "GPUQ_QUEUE_ROOT": str(self.queue.root)}
+        job_env.update(self._card_pin(spec))
         try:
             running = start_job(
                 spec, workdir, out_log, err_log, project=project,
-                extra_env={"GPUQ_JOB_ID": spec.id,
-                           "GPUQ_QUEUE_ROOT": str(self.queue.root)})
+                extra_env=job_env)
         except StartFailed as e:
             self._exit_claim(claim_cm)
             self._remove_worktree_at(project, workdir)

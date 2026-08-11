@@ -63,3 +63,53 @@ def test_reap_removes_dead_claims(tmp_path, capsys):
 
 def test_missing_command_exits_2(capsys):
     assert cli_claim.main([]) == 2
+
+
+# --- pinning the child to the claimed card -----------------------------------
+# Same reasoning as the runner: holding the lock says which card is yours, and
+# the pin is what makes the child process able to act on that.
+
+def test_child_is_pinned_to_the_claimed_card(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli_claim, "cuda_visible_value",
+                        lambda index=0: f"GPU-{KEY}")
+    out = tmp_path / "pin.txt"
+    cli_claim.main(["--", "sh", "-c",
+                    f"printf '%s' \"${{CUDA_VISIBLE_DEVICES-unset}}\" > {out}"])
+    assert out.read_text() == f"GPU-{KEY}"
+
+
+def test_pin_follows_the_requested_gpu_index(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake(index=0):
+        seen["index"] = index
+        return "GPU-second-card"
+
+    monkeypatch.setattr(cli_claim, "cuda_visible_value", fake)
+    out = tmp_path / "pin.txt"
+    cli_claim.main(["--gpu-index", "1", "--", "sh", "-c",
+                    f"printf '%s' \"$CUDA_VISIBLE_DEVICES\" > {out}"])
+    assert seen["index"] == 1
+    assert out.read_text() == "GPU-second-card"
+
+
+def test_an_explicit_caller_setting_is_not_clobbered(tmp_path, monkeypatch):
+    # Unlike the runner, whose job can override the pin from inside its own
+    # command, gpu-claim's caller can only express intent through the
+    # environment it invokes us with. Treat that as deliberate.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
+    monkeypatch.setattr(cli_claim, "cuda_visible_value",
+                        lambda index=0: f"GPU-{KEY}")
+    out = tmp_path / "pin.txt"
+    cli_claim.main(["--", "sh", "-c",
+                    f"printf '%s' \"$CUDA_VISIBLE_DEVICES\" > {out}"])
+    assert out.read_text() == "7"
+
+
+def test_runs_unpinned_when_no_uuid_is_available(tmp_path, monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(cli_claim, "cuda_visible_value", lambda index=0: None)
+    out = tmp_path / "pin.txt"
+    assert cli_claim.main(["--", "sh", "-c",
+                           f"printf '%s' \"${{CUDA_VISIBLE_DEVICES-unset}}\" > {out}"]) == 0
+    assert out.read_text() == "unset"

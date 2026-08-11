@@ -543,3 +543,54 @@ def test_a_throttled_bug_still_carries_the_auto_label(env, monkeypatch):
     submit(r, sha, "j1", ["true"])
     r.admit()
     assert seen_labels == [[bugfiler.AUTO_LABEL, bugfiler.THROTTLED_LABEL]]
+
+
+# --- pinning a gpu job to the card it was allocated --------------------------
+# The claim serializes the card; the pin makes the allocation binding on the
+# job. Without it a consumer that refuses to guess a device (the pattern
+# `resolve_device(..., strict=True)` implements) cannot run under the queue at
+# all, because nothing in the environment says which card it was given.
+
+def _pin_seen_by(r, sha, tmp_path, lane):
+    out = tmp_path / f"pin_{lane}.txt"
+    submit(r, sha, f"pin_{lane}",
+           ["sh", "-c", f"printf '%s' \"${{CUDA_VISIBLE_DEVICES-unset}}\" > {out}"],
+           lane=lane)
+    drain(r)
+    return out.read_text()
+
+
+def test_gpu_job_is_pinned_to_the_claimed_card(env, tmp_path, monkeypatch):
+    r, sha = env
+    monkeypatch.setattr(rn, "cuda_visible_value", lambda index=0: "GPU-abc123")
+    assert _pin_seen_by(r, sha, tmp_path, "gpu") == "GPU-abc123"
+
+
+def test_cpu_job_is_not_pinned(env, tmp_path, monkeypatch):
+    # A cpu-lane job never took the card, so it must not be handed one.
+    r, sha = env
+    monkeypatch.setattr(rn, "cuda_visible_value", lambda index=0: "GPU-abc123")
+    assert _pin_seen_by(r, sha, tmp_path, "cpu") == "unset"
+
+
+def test_gpu_job_runs_unpinned_when_no_uuid_is_available(env, tmp_path,
+                                                         monkeypatch):
+    # Degraded but not broken: a box whose driver reports no uuid still runs
+    # jobs, exactly as it did before pinning existed.
+    r, sha = env
+    monkeypatch.setattr(rn, "cuda_visible_value", lambda index=0: None)
+    assert _pin_seen_by(r, sha, tmp_path, "gpu") == "unset"
+
+
+def test_the_job_may_override_the_pin(env, tmp_path, monkeypatch):
+    # The pin is a default, not a cage: a job that names its own mapping wins,
+    # which is what makes the existing `export CUDA_VISIBLE_DEVICES=...` driver
+    # scripts keep working unchanged.
+    r, sha = env
+    monkeypatch.setattr(rn, "cuda_visible_value", lambda index=0: "GPU-abc123")
+    out = tmp_path / "override.txt"
+    submit(r, sha, "override",
+           ["sh", "-c", f"export CUDA_VISIBLE_DEVICES=7; printf '%s' \"$CUDA_VISIBLE_DEVICES\" > {out}"],
+           lane="gpu")
+    drain(r)
+    assert out.read_text() == "7"
