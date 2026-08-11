@@ -107,3 +107,54 @@ def test_zero_is_not_misread_as_none(tmp_path):
     (got,) = lg.records_for(KEY, tmp_path)
     assert got.usage_pid == 0
     assert got.vram_mb == 0
+
+
+def rec(vram_mb, pid=100, owner="me"):
+    return lg.Record(path=Path(f"/tmp/{pid}.x.json"), pid=pid, usage_pid=pid,
+                     vram_mb=vram_mb, owner=owner, cmd=["python", "t.py"],
+                     started_at="2026-08-10T00:00:00Z", key=KEY)
+
+
+def test_a_declared_claim_fits_an_empty_ledger():
+    assert lg.fits([], 512, 7676) is True
+
+
+def test_declarations_sum_against_capacity():
+    assert lg.fits([rec(4000)], 3676, 7676) is True
+    assert lg.fits([rec(4000)], 3677, 7676) is False
+
+
+def test_exclusive_fits_only_an_empty_ledger():
+    assert lg.fits([], None, 7676) is True
+    assert lg.fits([rec(16)], None, 7676) is False
+
+
+def test_nothing_fits_alongside_an_exclusive_holder():
+    assert lg.fits([rec(None)], 16, 7676) is False
+
+
+def test_a_declaration_larger_than_the_card_never_fits():
+    assert lg.fits([], 9000, 7676) is False
+    assert lg.exceeds_capacity(9000, 7676) is True
+    assert lg.exceeds_capacity(7676, 7676) is False
+
+
+def test_unknown_capacity_degrades_to_exclusive():
+    """A box whose card cannot be queried gets the old behaviour rather
+    than arithmetic on a number nobody has."""
+    assert lg.fits([], 512, None) is True
+    assert lg.fits([rec(16)], 512, None) is False
+    assert lg.exceeds_capacity(512, None) is False
+
+
+def test_free_mb_reports_the_remainder():
+    assert lg.free_mb([rec(4000)], 7676) == 3676
+    assert lg.free_mb([rec(None)], 7676) == 0
+    assert lg.free_mb([], None) == 0
+
+
+def test_busy_message_names_the_holders_and_the_shortfall():
+    msg = lg.busy_message(KEY, [rec(4000, pid=42, owner="gpuq:job-a")],
+                          4000, 7676)
+    assert "4000" in msg and "3676" in msg
+    assert "42" in msg and "gpuq:job-a" in msg

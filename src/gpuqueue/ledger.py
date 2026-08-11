@@ -145,3 +145,50 @@ def set_usage_pid(rec: Record, pid: int | None) -> None:
 
 def remove(rec: Record) -> None:
     rec.path.unlink(missing_ok=True)
+
+
+def exceeds_capacity(want_mb: int | None, usable_mb: int | None) -> bool:
+    """A declaration that can never be admitted, however empty the card.
+
+    The runner needs this apart from `fits` so it can fail such a job
+    instead of leaving it pending forever.
+    """
+    if want_mb is None or usable_mb is None:
+        return False
+    return want_mb > usable_mb
+
+
+def fits(records: list[Record], want_mb: int | None,
+         usable_mb: int | None) -> bool:
+    """`usable_mb is None` means the card could not be queried, so every
+    claim is treated as exclusive -- degraded, and the same posture
+    preflight already takes when it cannot enumerate the card."""
+    if any(r.vram_mb is None for r in records):
+        return False
+    if want_mb is None or usable_mb is None:
+        return not records
+    if want_mb > usable_mb:
+        return False
+    return sum(r.vram_mb or 0 for r in records) + want_mb <= usable_mb
+
+
+def free_mb(records: list[Record], usable_mb: int | None) -> int:
+    if usable_mb is None or any(r.vram_mb is None for r in records):
+        return 0
+    return max(0, usable_mb - sum(r.vram_mb or 0 for r in records))
+
+
+def busy_message(key: str, records: list[Record], want_mb: int | None,
+                 usable_mb: int | None) -> str:
+    want = "the whole card" if want_mb is None else f"{want_mb} MiB"
+    head = (f"GPU {key}: need {want}, "
+            f"{free_mb(records, usable_mb)} MiB free"
+            + (f" of {usable_mb}" if usable_mb is not None else "")
+            + ". Holders:")
+    lines = [
+        f"  pid {r.pid:>7}  {r.owner:<24} "
+        f"{'exclusive' if r.vram_mb is None else str(r.vram_mb) + ' MiB':>12}"
+        f"  {' '.join(r.cmd) or '?'}"
+        for r in records
+    ] or ["  (none -- this claim does not fit the card at all)"]
+    return "\n".join([head, *lines])
