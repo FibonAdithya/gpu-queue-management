@@ -93,3 +93,17 @@ def test_all_records_spans_every_key(tmp_path):
 
 def test_all_records_on_a_missing_directory_is_empty(tmp_path):
     assert lg.all_records(tmp_path / "nope") == []
+
+
+def test_zero_is_not_misread_as_none(tmp_path):
+    """0 is falsy but not absent: `d.get(...) if ... else None` would
+    silently turn a real 0 into None, and for vram_mb that flips the
+    record's meaning to exclusive -- the most permissive value there is."""
+    path = lg.ledger_dir(KEY, tmp_path) / "100.aaa.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(
+        {"pid": 100, "usage_pid": 0, "vram_mb": 0, "owner": "me",
+         "cmd": [], "started_at": "2026-08-10T00:00:00Z", "key": KEY}))
+    (got,) = lg.records_for(KEY, tmp_path)
+    assert got.usage_pid == 0
+    assert got.vram_mb == 0

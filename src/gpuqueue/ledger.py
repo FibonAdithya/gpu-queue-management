@@ -71,8 +71,10 @@ def _load(path: Path) -> Record | None:
         d = json.loads(path.read_text())
         return Record(
             path=path, pid=int(d["pid"]),
-            usage_pid=int(d["usage_pid"]) if d.get("usage_pid") else None,
-            vram_mb=int(d["vram_mb"]) if d.get("vram_mb") else None,
+            usage_pid=(int(d["usage_pid"])
+                       if d.get("usage_pid") is not None else None),
+            vram_mb=(int(d["vram_mb"])
+                     if d.get("vram_mb") is not None else None),
             owner=d.get("owner", "?"), cmd=list(d.get("cmd") or []),
             started_at=d.get("started_at", ""), key=d.get("key", ""))
     except Exception:
