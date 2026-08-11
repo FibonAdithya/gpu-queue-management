@@ -1,6 +1,8 @@
 import pytest
 from gpuqueue import gpuid
-from gpuqueue.gpuid import normalize_gpu_uuid, gpu_key, lock_filename, GpuIdError
+from gpuqueue.gpuid import (
+    normalize_gpu_uuid, gpu_key, lock_filename, GpuIdError, total_vram_mb,
+)
 
 HEX = "4b8f2c1a-0000-0000-0000-000000000001"
 
@@ -84,3 +86,28 @@ def test_cuda_visible_value_is_none_when_smi_is_missing(monkeypatch):
         raise FileNotFoundError("nvidia-smi")
     monkeypatch.setattr(gpuid, "_run", boom)
     assert gpuid.cuda_visible_value() is None
+
+
+# --- capacity discovery -------------------------------------------------------
+
+def test_total_vram_mb_parses_mib(monkeypatch):
+    monkeypatch.setattr(gpuid, "_run", lambda argv: "8188 MiB\n")
+    assert total_vram_mb() == 8188
+
+def test_total_vram_mb_reads_the_requested_index(monkeypatch):
+    monkeypatch.setattr(gpuid, "_run", lambda argv: "8188 MiB\n16376 MiB\n")
+    assert total_vram_mb(1) == 16376
+
+def test_total_vram_mb_none_when_smi_is_missing(monkeypatch):
+    def boom(argv):
+        raise FileNotFoundError()
+    monkeypatch.setattr(gpuid, "_run", boom)
+    assert total_vram_mb() is None
+
+def test_total_vram_mb_none_on_unparseable_output(monkeypatch):
+    monkeypatch.setattr(gpuid, "_run", lambda argv: "[N/A]\n")
+    assert total_vram_mb() is None
+
+def test_total_vram_mb_none_when_index_is_past_the_end(monkeypatch):
+    monkeypatch.setattr(gpuid, "_run", lambda argv: "8188 MiB\n")
+    assert total_vram_mb(3) is None

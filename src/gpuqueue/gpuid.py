@@ -112,3 +112,22 @@ def cuda_visible_value(index: int = 0) -> str | None:
 
 def lock_filename(key: str) -> str:
     return _UNSAFE.sub("-", key) + ".lock"
+
+
+def total_vram_mb(index: int = 0) -> int | None:
+    """What the card reports as its total, in MiB. None when unknown.
+
+    Same query family as the uuid lookup above, and deliberately the same
+    yardstick the ledger and the watchdog use: nvidia-smi's own MiB, not
+    torch's idea of it.
+    """
+    try:
+        out = _run(["nvidia-smi", "--query-gpu=memory.total",
+                    "--format=csv,noheader"])
+    except Exception:
+        return None
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    if index >= len(lines):
+        return None
+    digits = lines[index].replace("MiB", "").strip()
+    return int(digits) if digits.isdigit() else None
