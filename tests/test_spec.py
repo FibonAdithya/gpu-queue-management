@@ -98,7 +98,7 @@ def test_vram_mb_accepts_a_positive_int():
     assert spec.to_dict()["vram_mb"] == 512
 
 
-@pytest.mark.parametrize("bad", [0, -1, "512", 512.0])
+@pytest.mark.parametrize("bad", [0, -1, "512", 512.0, True, False])
 def test_vram_mb_rejects_anything_but_a_positive_int(bad):
     with pytest.raises(SpecError, match="vram_mb"):
         mkspec(vram_mb=bad).validate()
