@@ -3,78 +3,131 @@ import os
 import subprocess
 import sys
 import pytest
+from gpuqueue import ledger as lg
 from gpuqueue.claim import (gpu_claim, ClaimBusy, read_claim, pid_alive,
-                            list_claims, release_stale)
+                            list_claims, release_stale, default_usable_mb)
 
 KEY = "4b8f2c1a-0000-0000-0000-000000000001"
 
-def test_claim_writes_claim_file_with_pid_and_cmd(tmp_path):
+
+def test_claim_writes_a_record_with_pid_and_cmd(tmp_path):
     with gpu_claim(key=KEY, owner="me", cmd=["python", "t.py"],
-                   directory=tmp_path) as c:
-        assert c["pid"] == os.getpid()
+                   directory=tmp_path, usable_mb=7676) as c:
+        assert c.pid == os.getpid()
         (path, body), = list_claims(tmp_path)
         assert body["owner"] == "me"
         assert body["cmd"] == ["python", "t.py"]
         assert body["started_at"].endswith("Z")
 
-def test_claim_file_removed_on_exit(tmp_path):
-    with gpu_claim(key=KEY, directory=tmp_path):
+
+def test_an_undeclared_claim_is_exclusive(tmp_path):
+    """The default is the whole card, which is what keeps every caller
+    written before --vram-mb behaving exactly as it did."""
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676) as c:
+        assert c.vram_mb is None
+        with pytest.raises(ClaimBusy):
+            with gpu_claim(key=KEY, directory=tmp_path, vram_mb=16,
+                           usable_mb=7676):
+                pass
+
+
+def test_two_declared_claims_share_the_card(tmp_path):
+    with gpu_claim(key=KEY, owner="a", directory=tmp_path, vram_mb=3000,
+                   usable_mb=7676):
+        with gpu_claim(key=KEY, owner="b", directory=tmp_path, vram_mb=3000,
+                       usable_mb=7676):
+            assert len(list_claims(tmp_path)) == 2
+
+
+def test_a_declared_claim_is_refused_when_the_card_is_full(tmp_path):
+    with gpu_claim(key=KEY, directory=tmp_path, vram_mb=7000, usable_mb=7676):
+        with pytest.raises(ClaimBusy, match="MiB free"):
+            with gpu_claim(key=KEY, directory=tmp_path, vram_mb=1000,
+                           usable_mb=7676):
+                pass
+
+
+def test_claim_charges_its_own_tree_by_default(tmp_path):
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676) as c:
+        assert c.usage_pid == os.getpid()
+
+
+def test_own_usage_false_leaves_the_record_unattributed(tmp_path):
+    """The runner takes the card before the job process exists."""
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676,
+                   own_usage=False) as c:
+        assert c.usage_pid is None
+
+
+def test_record_removed_on_exit(tmp_path):
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676):
         pass
     assert list_claims(tmp_path) == []
 
-def test_claim_file_removed_on_exception(tmp_path):
+
+def test_record_removed_on_exception(tmp_path):
     with pytest.raises(ValueError):
-        with gpu_claim(key=KEY, directory=tmp_path):
+        with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676):
             raise ValueError("boom")
     assert list_claims(tmp_path) == []
 
-def test_second_claim_in_another_process_is_busy(tmp_path):
-    """flock is per-open-file-description; a real second process is the
-    only honest test of exclusion."""
-    holder = subprocess.Popen(
-        [sys.executable, "-c",
-         "import time,sys;from gpuqueue.claim import gpu_claim;"
-         f"ctx=gpu_claim(key={KEY!r},directory={str(tmp_path)!r});ctx.__enter__();"
-         "print('held',flush=True);time.sleep(30)"],
-        stdout=subprocess.PIPE, text=True)
-    try:
-        assert holder.stdout.readline().strip() == "held"
-        with pytest.raises(ClaimBusy):
-            with gpu_claim(key=KEY, directory=tmp_path):
-                pass
-    finally:
-        holder.kill()
-        holder.wait()
 
 def test_different_keys_do_not_collide(tmp_path):
-    with gpu_claim(key=KEY, directory=tmp_path):
-        with gpu_claim(key="other-uuid", directory=tmp_path):
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676):
+        with gpu_claim(key="other-uuid", directory=tmp_path, usable_mb=7676):
             assert len(list_claims(tmp_path)) == 2
 
-def test_pid_alive_true_for_self():
-    assert pid_alive(os.getpid()) is True
 
-def test_pid_alive_false_for_impossible_pid():
-    assert pid_alive(4000000) is False
+def test_wait_blocks_until_there_is_room(tmp_path, monkeypatch):
+    """`wait` polls capacity now rather than blocking on flock, because the
+    mutex is released the instant acquire returns."""
+    monkeypatch.setattr("gpuqueue.claim.WAIT_POLL_S", 0.01)
+    holder = lg.acquire(KEY, vram_mb=7000, owner="a", cmd=[],
+                        directory=tmp_path, usable_mb=7676)
+    calls = []
+    real_sleep = __import__("time").sleep
 
-def test_release_stale_removes_dead_pid_claims(tmp_path):
-    stale = tmp_path / f"{KEY}.lock.json"
-    stale.write_text(json.dumps(
-        {"pid": 4000000, "owner": "ghost", "cmd": ["x"],
-         "started_at": "2026-08-05T00:00:00Z", "key": KEY}))
-    released = release_stale(tmp_path)
-    assert [r["owner"] for r in released] == ["ghost"]
-    assert not stale.exists()
+    def freeing_sleep(s):
+        calls.append(s)
+        if len(calls) == 2:
+            lg.remove(holder)
+        real_sleep(0)
 
-def test_release_stale_keeps_live_claims(tmp_path):
-    with gpu_claim(key=KEY, directory=tmp_path):
+    monkeypatch.setattr("gpuqueue.claim.time.sleep", freeing_sleep)
+    with gpu_claim(key=KEY, directory=tmp_path, vram_mb=1000,
+                   usable_mb=7676, wait=True) as c:
+        assert c.vram_mb == 1000
+
+
+def test_release_stale_removes_dead_pid_records(tmp_path):
+    lg.write_record(lg.Record(
+        path=lg.ledger_dir(KEY, tmp_path) / "4000000.dead.json",
+        pid=4000000, usage_pid=4000000, vram_mb=512, owner="ghost",
+        cmd=["x"], started_at="2026-08-10T00:00:00Z", key=KEY))
+    assert [r["owner"] for r in release_stale(tmp_path)] == ["ghost"]
+    assert list_claims(tmp_path) == []
+
+
+def test_release_stale_keeps_live_records(tmp_path):
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676):
         assert release_stale(tmp_path) == []
         assert len(list_claims(tmp_path)) == 1
+
 
 def test_read_claim_returns_none_on_garbage(tmp_path):
     p = tmp_path / "bad.lock.json"
     p.write_text("{not json")
     assert read_claim(p) is None
+
+
+def test_default_usable_mb_holds_back_a_reserve(monkeypatch):
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: 8188)
+    assert default_usable_mb() == 8188 - lg.DEFAULT_RESERVE_MB
+
+
+def test_default_usable_mb_is_none_when_the_card_cannot_be_queried(monkeypatch):
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: None)
+    assert default_usable_mb() is None
 
 
 def test_job_orphaned_when_the_runner_is_gone():

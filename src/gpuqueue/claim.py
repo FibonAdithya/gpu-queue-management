@@ -1,36 +1,29 @@
-"""The advisory lock and its claim file.
+"""The advisory lock and its claim record.
 
 Enforcement is advisory because flock cannot be otherwise between
-unprivileged processes. The claim file exists so that a human or agent
+unprivileged processes. The claim record exists so that a human or agent
 looking at a busy card learns *who* holds it without a running service.
 """
 from __future__ import annotations
 
-import fcntl
+import getpass
 import json
 import os
-import getpass
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .gpuid import gpu_key, lock_filename
-from .procs import pid_alive          # re-exported: callers import it from here
-from .spec import utcnow_iso
+from . import ledger
+from .gpuid import gpu_key, total_vram_mb
+from .ledger import ClaimBusy          # re-exported: callers import it here
+from .procs import pid_alive           # re-exported for the same reason
 
 DEFAULT_CLAIM_DIR = "/var/lock/gpu"
-
-
-class ClaimBusy(RuntimeError):
-    """Another process holds the card."""
+WAIT_POLL_S = 0.5
 
 
 def claim_dir() -> Path:
     return Path(os.environ.get("GPU_CLAIM_DIR", DEFAULT_CLAIM_DIR))
-
-
-def _paths(key: str, directory: Path) -> tuple[Path, Path]:
-    lock = directory / lock_filename(key)
-    return lock, lock.with_suffix(lock.suffix + ".json")
 
 
 def read_claim(path: Path) -> dict | None:
@@ -63,65 +56,66 @@ def job_orphaned(job_pid: int | None, runner_pid: int | None) -> bool:
     return not pid_alive(runner_pid)
 
 
+def default_usable_mb() -> int | None:
+    """What a standalone `gpu-claim` may admit against.
+
+    None when the card cannot be queried, which `ledger.fits` turns into
+    exclusive-only admission -- degraded, and the same posture preflight
+    already takes when it cannot enumerate the card.
+    """
+    total = total_vram_mb()
+    return None if total is None else total - ledger.DEFAULT_RESERVE_MB
+
+
 def list_claims(directory: Path | None = None) -> list[tuple[Path, dict]]:
     d = Path(directory) if directory else claim_dir()
-    if not d.is_dir():
-        return []
-    out = []
-    for p in sorted(d.glob("*.lock.json")):
-        body = read_claim(p)
-        if body:
-            out.append((p, body))
-    return out
+    return [(r.path, r.to_dict()) for r in ledger.all_records(d)]
 
 
 def release_stale(directory: Path | None = None) -> list[dict]:
-    """Remove claim files whose owning pid is gone. Returns what it freed."""
+    """Remove records whose owning pid is gone. Returns what it freed."""
+    d = Path(directory) if directory else claim_dir()
     released = []
-    for path, body in list_claims(directory):
-        if not pid_alive(int(body.get("pid", -1))):
-            released.append(body)
-            path.unlink(missing_ok=True)
+    for r in ledger.all_records(d):
+        if not pid_alive(r.pid):
+            released.append(r.to_dict())
+            ledger.remove(r)
     return released
 
 
 @contextmanager
 def gpu_claim(key: str | None = None, owner: str | None = None,
               cmd: list[str] | None = None, wait: bool = False,
-              directory: Path | None = None):
+              directory: Path | None = None, vram_mb: int | None = None,
+              usable_mb: int | None = None, own_usage: bool = True):
+    """Hold a share of the card. `vram_mb=None` means the whole of it.
+
+    `own_usage=False` is for the runner, which takes the card before the
+    job process exists and fills the usage pid in after launch.
+
+    `wait` polls capacity rather than blocking on flock: the mutex is
+    released the instant `acquire` returns, so there is no longer a kernel
+    queue to wait in.
+    """
     d = Path(directory) if directory else claim_dir()
-    d.mkdir(parents=True, exist_ok=True)
     key = key or gpu_key()
-    lock_path, claim_path = _paths(key, d)
-
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    flags = fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB
-    try:
-        fcntl.flock(fd, flags)
-    except OSError:
-        os.close(fd)
-        held = read_claim(claim_path) or {}
-        raise ClaimBusy(
-            f"GPU {key} is held by pid {held.get('pid', '?')} "
-            f"({held.get('owner', '?')}): {' '.join(held.get('cmd') or []) or '?'}"
-        )
-
-    body = {
-        "pid": os.getpid(),
-        "owner": owner or _default_owner(),
-        "cmd": cmd or [],
-        "started_at": utcnow_iso(),
-        "key": key,
-    }
-    claim_path.write_text(json.dumps(body, indent=2) + "\n")
-    try:
-        yield body
-    finally:
-        claim_path.unlink(missing_ok=True)
+    if usable_mb is None:
+        usable_mb = default_usable_mb()
+    while True:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+            rec = ledger.acquire(
+                key, vram_mb=vram_mb, owner=owner or _default_owner(),
+                cmd=cmd, directory=d, usable_mb=usable_mb,
+                usage_pid=os.getpid() if own_usage else None)
+            break
+        except ClaimBusy:
+            if not wait:
+                raise
+            time.sleep(WAIT_POLL_S)
+    try:
+        yield rec
+    finally:
+        ledger.remove(rec)
 
 
 def _default_owner() -> str:

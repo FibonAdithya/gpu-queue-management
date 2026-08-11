@@ -95,10 +95,12 @@ def test_gpu_and_cpu_lanes_run_concurrently(env):
     r.shutdown()
 
 def test_gpu_job_holds_a_claim_file_while_running(env, tmp_path):
+    """Records live one file per holder under `<key>.lock.d/`, not the
+    single `<key>.lock.json` a pre-ledger gpu-claim wrote."""
     r, sha = env
     submit(r, sha, "g1", ["sleep", "5"], lane="gpu")
     r.admit()
-    assert list((tmp_path / "claims").glob("*.lock.json"))
+    assert list((tmp_path / "claims").glob("*.lock.d/*.json"))
     r.shutdown()
 
 def test_gpu_claim_is_released_when_the_job_ends(env, tmp_path):
