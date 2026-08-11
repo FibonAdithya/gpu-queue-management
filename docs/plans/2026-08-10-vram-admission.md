@@ -299,6 +299,8 @@ as it does today once admission starts reading this field."
 
 ### Task 3: `[queue]` capacity configuration
 
+> **Execution order:** run this task *after* Task 8, not in numeric order. It imports `ledger.DEFAULT_RESERVE_MB` so the reserve has one source of truth, and `ledger.py` does not exist until Task 5. Nothing else about the task changes. `ledger` never imports `config`, so this is not a cycle.
+
 **Files:**
 - Modify: `src/gpuqueue/config.py:60-69` (`RunnerConfig`), `src/gpuqueue/config.py:82-88` (parsing)
 - Test: `tests/test_config.py`
@@ -377,7 +379,9 @@ In `RunnerConfig`, after `cpu_slots`:
     # query is unavailable or reports something the driver will not
     # actually hand out.
     gpu_vram_mb: int | None = None
-    gpu_vram_reserve_mb: int = 512
+    # One source of truth with the standalone gpu-claim path, which needs
+    # the same number and has no config to read it from.
+    gpu_vram_reserve_mb: int = DEFAULT_RESERVE_MB
     # A latency budget, not a safety one. VRAM accounting alone would admit
     # sixteen 500 MiB jobs onto an 8 GB card, all time-slicing, each slower
     # than it would have been queued -- and with independent submitters
@@ -387,12 +391,15 @@ In `RunnerConfig`, after `cpu_slots`:
     enforce_vram: bool = True
 ```
 
+Add `from .ledger import DEFAULT_RESERVE_MB` to the imports at the top of `config.py`.
+
 In `load_config`, after the `cpu_slots` check:
 
 ```python
     gpu_vram_mb = queue.get("gpu_vram_mb")
     gpu_vram_mb = int(gpu_vram_mb) if gpu_vram_mb is not None else None
-    gpu_vram_reserve_mb = int(queue.get("gpu_vram_reserve_mb", 512))
+    gpu_vram_reserve_mb = int(queue.get("gpu_vram_reserve_mb",
+                                        DEFAULT_RESERVE_MB))
     gpu_max_jobs = int(queue.get("gpu_max_jobs", 2))
     if gpu_max_jobs < 1:
         raise ConfigError("[queue].gpu_max_jobs must be >= 1")
