@@ -11,7 +11,7 @@ KEY = "4b8f2c1a-0000-0000-0000-000000000001"
 def fake_gpu(tmp_path, monkeypatch):
     monkeypatch.setenv("GPU_CLAIM_DIR", str(tmp_path))
     monkeypatch.setattr(cli_claim, "gpu_key", lambda index=0: KEY)
-    monkeypatch.setattr(cli_claim, "preflight", lambda allow=None: None)
+    monkeypatch.setattr(cli_claim, "preflight", lambda allow=None, directory=None: None)
 
 def test_runs_command_and_returns_its_exit_code():
     assert cli_claim.main(["--", "sh", "-c", "exit 0"]) == 0
@@ -29,14 +29,14 @@ def test_busy_exits_75(monkeypatch, capsys):
     assert "999" in capsys.readouterr().err
 
 def test_preflight_failure_exits_69(monkeypatch, capsys):
-    def fail(allow=None):
+    def fail(allow=None, directory=None):
         raise PreflightFailed("pid 4321 train.py")
     monkeypatch.setattr(cli_claim, "preflight", fail)
     assert cli_claim.main(["--", "true"]) == 69
     assert "4321" in capsys.readouterr().err
 
 def test_no_preflight_flag_skips_it(monkeypatch):
-    def fail(allow=None):
+    def fail(allow=None, directory=None):
         raise PreflightFailed("should not be called")
     monkeypatch.setattr(cli_claim, "preflight", fail)
     assert cli_claim.main(["--no-preflight", "--", "true"]) == 0

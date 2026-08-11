@@ -31,7 +31,7 @@ def env(tmp_path, monkeypatch):
                                      checkout=tmp_path / "checkout",
                                      commit_artifacts=True)})
     monkeypatch.setattr(rn, "gpu_key", lambda index=0: "test-uuid")
-    monkeypatch.setattr(rn, "preflight", lambda allow=None: None)
+    monkeypatch.setattr(rn, "preflight", lambda allow=None, directory=None: None)
     r = Runner(cfg)
     return r, sha
 

@@ -72,3 +72,48 @@ def test_preflight_passes_when_cannot_see(monkeypatch, capsys):
 def test_preflight_passes_when_clear(monkeypatch):
     monkeypatch.setattr(pf, "compute_apps", lambda: [])
     pf.preflight()
+
+from gpuqueue import ledger as lg
+
+KEY = "4b8f2c1a-0000-0000-0000-000000000001"
+
+
+def _record(tmp_path, pid, usage_pid, vram_mb=512):
+    rec = lg.Record(path=lg.ledger_dir(KEY, tmp_path) / f"{pid}.aaa.json",
+                    pid=pid, usage_pid=usage_pid, vram_mb=vram_mb,
+                    owner="co-tenant", cmd=["python", "t.py"],
+                    started_at="2026-08-10T00:00:00Z", key=KEY)
+    lg.write_record(rec)
+    return rec
+
+
+def test_a_ledgered_co_tenant_is_not_contention(tmp_path, monkeypatch):
+    """Sharing is the point. A declared holder's process must not read as
+    an intruder, or no second job can ever start."""
+    _record(tmp_path, os.getpid(), os.getpid())
+    monkeypatch.setattr(pf, "compute_apps",
+                        lambda: [{"pid": 5150, "used_mb": 400, "name": "co.py"}])
+    monkeypatch.setattr(pf, "descendants",
+                        lambda pid: {5150} if pid == os.getpid() else set())
+    pf.preflight(directory=tmp_path)
+
+
+def test_an_unledgered_process_still_refuses(tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "compute_apps",
+                        lambda: [{"pid": 4321, "used_mb": 900, "name": "train.py"}])
+    monkeypatch.setattr(pf, "descendants", lambda pid: set())
+    with pytest.raises(PreflightFailed) as e:
+        pf.preflight(directory=tmp_path)
+    assert "4321" in str(e.value) and "train.py" in str(e.value)
+
+
+def test_a_dead_holders_record_does_not_shelter_anyone(tmp_path, monkeypatch):
+    _record(tmp_path, 4000000, 4000000)
+    monkeypatch.setattr(pf, "compute_apps",
+                        lambda: [{"pid": 4321, "used_mb": 900, "name": "t.py"}])
+    # Unconditional, like test_an_unledgered_process_still_refuses: this
+    # must stay empty so the *ledger* check -- not this process's own
+    # descendant tree -- is what proves the dead holder shelters no one.
+    monkeypatch.setattr(pf, "descendants", lambda pid: set())
+    with pytest.raises(PreflightFailed):
+        pf.preflight(directory=tmp_path)

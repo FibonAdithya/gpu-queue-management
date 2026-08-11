@@ -150,7 +150,7 @@ def test_reap_can_skip_the_expensive_cuda_sweep(tmp_path, monkeypatch):
 #
 # The README advertises `gpu-claim -- <cmd>` as usable on its own. Its CUDA
 # process is the *child* of the pid recorded in the claim file, and
-# `preflight.own_pids` expands `_descendants()` only for the runner's own
+# `preflight.own_pids` expands `descendants()` only for the runner's own
 # pid -- so that child is exempted by nothing and `kill_orphan_cuda`
 # SIGKILLs a legitimate run. Every other test in this file stubs
 # `own_pids` to set(), which is why the suite cannot currently see this.
@@ -164,7 +164,7 @@ from pathlib import Path as _Path
 from gpuqueue import preflight as _pf
 
 # Detaches before spawning its child, so the pair is NOT in pytest's own
-# process tree. Without the double fork `_descendants(os.getpid())` exempts
+# process tree. Without the double fork `descendants(os.getpid())` exempts
 # them and these tests pass while the bug is fully present.
 _HOLDER = r'''
 import json, os, subprocess, sys, time
@@ -217,8 +217,8 @@ def direct_claim(tmp_path, monkeypatch):
         "started_at": "2026-08-10T00:00:00Z", "key": "GPU-test"}))
 
     # The whole reproduction rests on these two not being in pytest's tree.
-    assert holder not in _pf._descendants(_os.getpid())
-    assert child not in _pf._descendants(_os.getpid())
+    assert holder not in _pf.descendants(_os.getpid())
+    assert child not in _pf.descendants(_os.getpid())
     try:
         yield holder, child
     finally:
