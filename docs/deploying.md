@@ -29,6 +29,8 @@ nvidia-smi -L || echo "NO nvidia-smi"
 nvidia-smi --query-gpu=uuid --format=csv,noheader
 echo "== can it enumerate CUDA processes? =="
 nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv,noheader
+echo "== does it report a total? (capacity discovery) =="
+nvidia-smi --query-gpu=memory.total --format=csv,noheader
 echo "== supervisor / git =="
 command -v supervisord supervisorctl; ls -d /etc/supervisor/conf.d; git --version
 echo "== workspace =="
@@ -43,8 +45,32 @@ What the answers mean:
 | A Python **3.11+** | stdlib `tomllib`; there is no `tomli` fallback | Use another interpreter on the box (step 3), or install one |
 | `nvidia-smi -L` | GPU identity comes from here — torch is never imported | Without it the GPU lane refuses every job, by design |
 | `--query-compute-apps` | Decides whether preflight is a real guard | See [Preflight](#preflight-is-only-as-good-as-nvidia-smi) below |
+| `--query-gpu=memory.total` | Capacity discovery for the GPU lane | Must print like `8188 MiB`. See [Capacity discovery](#capacity-discovery-fails-quietly) below |
 | supervisor + `conf.d` | How the runner is kept alive | `./bootstrap.sh --no-supervisor` and run `gpuq-runner` yourself |
 | `/workspace` writable | Default prefix for queue, locks, checkouts | Set `GPUQ_PREFIX` to somewhere writable |
+
+### Capacity discovery fails quietly
+
+Confirm on the box, once, before believing the GPU lane shares anything:
+
+```bash
+gpu-claim --status                       # should print an empty ledger, not an error
+python3 -c 'from gpuqueue.gpuid import total_vram_mb; print(total_vram_mb())'
+```
+
+The second command must print the card's total in MiB. If it prints `None`,
+`gpuq` cannot size the card, and **every GPU job is admitted exclusively** —
+the lane behaves exactly as it did before declarations existed. Nothing
+errors and nothing warns at submit time; jobs simply queue behind each other
+while `gpuq list` looks entirely healthy. That is the one failure in this
+feature that is invisible from the outside, which is why it is worth one
+command up front.
+
+`total_vram_mb` parses `nvidia-smi --query-gpu=memory.total`, expecting a
+line like `8188 MiB`. A driver that words it differently returns `None` by
+the same path as a missing binary. Set `[queue].gpu_vram_mb` explicitly to
+override, and prefer a number the driver will actually hand out rather than
+the nameplate total.
 
 ### Preflight is only as good as nvidia-smi
 
