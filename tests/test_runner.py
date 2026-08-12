@@ -780,3 +780,28 @@ def test_the_victim_is_retried_only_once(env, monkeypatch):
     r._last_conviction = time.monotonic()
     _run_until_settled(r, "j1")
     assert r.queue.find("j1")[0] == "failed"
+
+
+TIMED_OUT_AFTER_OOM = ["sh", "-c",
+                       "echo 'CUDA out of memory' >&2; sleep 5"]
+
+
+def test_a_hang_after_an_oom_line_beside_a_conviction_is_not_retried(
+        env, monkeypatch):
+    """A training script that catches an OOM, logs it, then hangs in NCCL
+    teardown is still a hang: `docs/design.md` gives wall-clock timeout no
+    retry, full stop, and a co-tenant's conviction does not buy it one --
+    that rule only ever excuses an OOM, never a timeout."""
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: r.queue.work_dir(spec.id))
+    r.queue.work_dir("j1").mkdir(parents=True, exist_ok=True)
+    submit(r, sha, "j1", TIMED_OUT_AFTER_OOM, lane="gpu", vram_mb=512,
+          timeout_s=1)
+    assert r.admit() == ["j1"]
+    r._last_conviction = time.monotonic()   # a co-tenant convicted mid-run
+    _run_until_settled(r, "j1")
+    state, spec = r.queue.find("j1")
+    assert state == "failed"
+    assert spec.attempts == 0

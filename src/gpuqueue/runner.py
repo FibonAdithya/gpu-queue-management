@@ -531,8 +531,20 @@ class Runner:
         over-using the card. That is a genuine transient, so it gets the
         single retry `attempts` already bounds, and every other OOM
         behaves exactly as before.
+
+        Branch order mirrors `_describe_failure`: convicted, then
+        timed_out, then oom -- so the two cannot drift apart. A job can
+        print an OOM-looking line and then hang (e.g. in NCCL teardown);
+        `result.timed_out` there is still true, and a hang is a bug, not
+        a transient, no matter what a co-tenant did at the same moment.
+        Checking timed_out before oom, same as _describe_failure does,
+        keeps that job out of the retry path.
         """
-        if not result.oom or spec.id in self._convicted:
+        if spec.id in self._convicted:
+            return False
+        if result.timed_out:
+            return False
+        if not result.oom:
             return False
         if self._last_conviction is None:
             return False
