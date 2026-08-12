@@ -27,7 +27,7 @@ same box should get scheduling without reimplementing it.
 |---|---|
 | `gpu-claim` | Advisory lock keyed on the GPU UUID, with a preflight that refuses to start when foreign CUDA processes hold the card. Wraps any command. |
 | `gpuq` | Submit, list, inspect and cancel jobs. |
-| `gpuq-runner` | Supervisor-managed daemon. Admits CPU jobs concurrently and GPU jobs one at a time, reaps dead claims, commits artifacts. |
+| `gpuq-runner` | Supervisor-managed daemon. Admits CPU jobs concurrently and GPU jobs against their declared VRAM, reaps dead claims, commits artifacts. |
 | `bootstrap.sh` | Takes a bare box to a working runner, idempotently. |
 | `bugreport.py` / `bugfiler.py` | When gpuq's own code raises, file a GitHub issue carrying the traceback and a dedup signature so a headless Claude Code run can open a PR against it. Off unless configured; see `docs/specs/2026-08-05-autofix-design.md`. |
 
@@ -40,5 +40,11 @@ the architecture and `docs/plans/` for the implementation plan.
 Needs Python 3.11+ (stdlib `tomllib`). If the box's `python3` is older,
 point `bootstrap.sh` at the right one with `PYTHON=/path/to/python3.11`.
 
-Per-job VRAM limits are not implemented: a job that holds the card holds
-all of it. See "Not in scope" in `docs/design.md`.
+A GPU job may declare what it needs, and jobs are admitted while their
+declarations fit the card:
+
+    gpuq submit --lane gpu --vram-mb 512 ...
+
+Declare nothing and you get the whole card, as before. Declarations are in
+MiB as `nvidia-smi` reports them, and a job using more than it declared is
+killed and told so. See `docs/specs/2026-08-10-vram-admission-design.md`.

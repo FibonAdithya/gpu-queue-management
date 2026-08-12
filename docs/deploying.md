@@ -113,6 +113,16 @@ Flags: `--dry-run`, `--no-supervisor`.
 example placeholders and tells you to edit it, so there is nothing real to
 clone yet. It is not fatal and everything else still installs.
 
+### Upgrading past the VRAM ledger
+
+Upgrade the whole installation in one pass — `bootstrap.sh` does this, and
+it is why the README argues for one shared installation and never a
+vendored copy. A runner from before the ledger reads `<key>.lock.json` and
+cannot see `<key>.lock.d/`, so it treats a new `gpu-claim` holder's trainer
+as an orphan and kills it. The reverse direction is safe: new code reads an
+old holder's file as an exclusive claim, and a pre-ledger `gpu-claim`
+holding `flock` for its whole run is reported as such rather than hung on.
+
 ## 4. Declare your projects
 
 Edit `$GPUQ_CONFIG` on the box, then rerun `bootstrap.sh` to clone them:
