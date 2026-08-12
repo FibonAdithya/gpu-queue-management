@@ -42,13 +42,34 @@ def _child_env(gpu_index: int) -> dict:
     inside their own command, but gpu-claim's caller can only express intent
     through the environment they invoke us with, so treat that as deliberate.
     Unset when no uuid is available, which leaves behaviour exactly as it was.
+
+    Two qualifications on "an existing setting wins":
+
+    An *empty* setting does not count as one. `export CUDA_VISIBLE_DEVICES=
+    ${SOMETHING}` with SOMETHING unset leaves the variable present and empty,
+    which the driver reads as "no cards at all" -- a child that holds the card
+    and cannot use it. That is a broken wrapper, not an intent.
+
+    A setting naming a *different* card is still honoured, but not silently.
+    The lock is then held on one card while the command runs on another, which
+    is precisely the collision this pin exists to prevent; two claimants with
+    different --gpu-index can both land on card 0 while holding distinct locks.
+    We cannot tell that from a deliberate override, so we say so and continue.
     """
     env = dict(os.environ)
-    if "CUDA_VISIBLE_DEVICES" in env:
-        return env
     value = cuda_visible_value(gpu_index)
+    caller = env.get("CUDA_VISIBLE_DEVICES", "")
+    if caller.strip():
+        if value is not None and caller.strip() != value:
+            print(f"gpu-claim: warning: CUDA_VISIBLE_DEVICES={caller} was "
+                  f"already set and names a different card than the one "
+                  f"claimed ({value}); honouring your setting, so the lock "
+                  f"and the run may disagree", file=sys.stderr)
+        return env
     if value is not None:
         env["CUDA_VISIBLE_DEVICES"] = value
+    else:
+        env.pop("CUDA_VISIBLE_DEVICES", None)
     return env
 
 

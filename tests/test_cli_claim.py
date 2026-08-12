@@ -113,3 +113,58 @@ def test_runs_unpinned_when_no_uuid_is_available(tmp_path, monkeypatch):
     assert cli_claim.main(["--", "sh", "-c",
                            f"printf '%s' \"${{CUDA_VISIBLE_DEVICES-unset}}\" > {out}"]) == 0
     assert out.read_text() == "unset"
+
+
+def test_an_empty_caller_setting_is_treated_as_unset(tmp_path, monkeypatch):
+    # `export CUDA_VISIBLE_DEVICES=${SOMETHING}` with SOMETHING unset leaves
+    # the variable present but empty. Read as a deliberate setting it means
+    # "see no cards at all", so the child would hold the card and be unable
+    # to use it. Nobody expresses that on purpose while claiming a GPU.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(cli_claim, "cuda_visible_value",
+                        lambda index=0: f"GPU-{KEY}")
+    out = tmp_path / "pin.txt"
+    cli_claim.main(["--", "sh", "-c",
+                    f"printf '%s' \"$CUDA_VISIBLE_DEVICES\" > {out}"])
+    assert out.read_text() == f"GPU-{KEY}"
+
+
+def test_an_empty_caller_setting_is_removed_when_there_is_nothing_to_pin(
+        tmp_path, monkeypatch):
+    # Degraded must mean "as it was before pinning existed". Leaving the empty
+    # value in place would instead hand the child a card it cannot see.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(cli_claim, "cuda_visible_value", lambda index=0: None)
+    out = tmp_path / "pin.txt"
+    cli_claim.main(["--", "sh", "-c",
+                    f"printf '%s' \"${{CUDA_VISIBLE_DEVICES-unset}}\" > {out}"])
+    assert out.read_text() == "unset"
+
+
+def test_a_caller_setting_naming_another_card_is_honoured_but_warned_about(
+        tmp_path, monkeypatch, capsys):
+    # The caller still wins -- their environment is the only way they can
+    # express intent. But this is the exact shape of the collision the pin
+    # exists to prevent: the lock is taken on the claimed card while the
+    # command runs somewhere else, so it must not happen silently.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setattr(cli_claim, "cuda_visible_value",
+                        lambda index=0: f"GPU-{KEY}")
+    out = tmp_path / "pin.txt"
+    cli_claim.main(["--", "sh", "-c",
+                    f"printf '%s' \"$CUDA_VISIBLE_DEVICES\" > {out}"])
+    assert out.read_text() == "0"
+    err = capsys.readouterr().err
+    assert "CUDA_VISIBLE_DEVICES" in err
+    assert "0" in err and f"GPU-{KEY}" in err
+
+
+def test_a_caller_setting_naming_the_claimed_card_is_not_warned_about(
+        tmp_path, monkeypatch, capsys):
+    # Agreement is the common case for a wrapper that pins deliberately;
+    # warning about it would train people to ignore the warning.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", f"GPU-{KEY}")
+    monkeypatch.setattr(cli_claim, "cuda_visible_value",
+                        lambda index=0: f"GPU-{KEY}")
+    cli_claim.main(["--", "true"])
+    assert "CUDA_VISIBLE_DEVICES" not in capsys.readouterr().err
