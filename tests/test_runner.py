@@ -693,3 +693,90 @@ def test_usable_mb_is_none_when_the_card_reports_less_than_the_reserve(
     r.cfg.gpu_vram_reserve_mb = 512
     monkeypatch.setattr(rn, "total_vram_mb", lambda: 256)
     assert r._usable_mb() is None
+
+
+OOMS = ["sh", "-c", "sleep 0.3; echo 'CUDA out of memory' >&2; exit 1"]
+
+
+def _run_until_settled(r, job_id, limit=15.0):
+    deadline = time.monotonic() + limit
+    while job_id in r.active and time.monotonic() < deadline:
+        r.collect()
+        time.sleep(0.02)
+    assert job_id not in r.active, "job never settled"
+
+
+def test_an_oom_beside_a_convicted_co_tenant_is_retried(env, monkeypatch):
+    """With sharing, 'a CUDA OOM is your own configuration error' is only
+    true if the two cases can be told apart. Here they can."""
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: r.queue.work_dir(spec.id))
+    r.queue.work_dir("j1").mkdir(parents=True, exist_ok=True)
+    submit(r, sha, "j1", OOMS, lane="gpu", vram_mb=512)
+    assert r.admit() == ["j1"]
+    r._last_conviction = time.monotonic()   # a co-tenant convicted mid-run
+    _run_until_settled(r, "j1")
+    state, spec = r.queue.find("j1")
+    assert state == "pending"
+    assert spec.attempts == 1
+
+
+def test_an_ordinary_oom_is_still_not_retried(env, monkeypatch):
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: r.queue.work_dir(spec.id))
+    r.queue.work_dir("j1").mkdir(parents=True, exist_ok=True)
+    submit(r, sha, "j1", OOMS, lane="gpu", vram_mb=512)
+    r.admit()
+    _run_until_settled(r, "j1")
+    state, spec = r.queue.find("j1")
+    assert state == "failed"
+    assert "out of memory" in (spec.error or "").lower()
+
+
+def test_a_conviction_before_the_job_started_does_not_excuse_it(env, monkeypatch):
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: r.queue.work_dir(spec.id))
+    r.queue.work_dir("j1").mkdir(parents=True, exist_ok=True)
+    r._last_conviction = time.monotonic()   # before the job existed
+    submit(r, sha, "j1", OOMS, lane="gpu", vram_mb=512)
+    r.admit()
+    _run_until_settled(r, "j1")
+    assert r.queue.find("j1")[0] == "failed"
+
+
+def test_the_convicted_job_is_not_its_own_victim(env, monkeypatch):
+    """The over-user is killed, not retried: exceeding your own
+    declaration is a configuration error, the same class as an OOM."""
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: r.queue.work_dir(spec.id))
+    r.queue.work_dir("j1").mkdir(parents=True, exist_ok=True)
+    submit(r, sha, "j1", OOMS, lane="gpu", vram_mb=512)
+    r.admit()
+    r._last_conviction = time.monotonic()
+    r._convicted["j1"] = {"declared": 512, "used": 3070, "owner": "gpuq:j1"}
+    _run_until_settled(r, "j1")
+    state, spec = r.queue.find("j1")
+    assert state == "failed"
+    assert "exceeding its declaration" in spec.error
+
+
+def test_the_victim_is_retried_only_once(env, monkeypatch):
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: r.queue.work_dir(spec.id))
+    r.queue.work_dir("j1").mkdir(parents=True, exist_ok=True)
+    submit(r, sha, "j1", OOMS, lane="gpu", vram_mb=512)
+    r.admit()
+    r.active["j1"].running.spec.attempts = 1   # already used its retry
+    r._last_conviction = time.monotonic()
+    _run_until_settled(r, "j1")
+    assert r.queue.find("j1")[0] == "failed"

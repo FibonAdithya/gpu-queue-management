@@ -30,7 +30,7 @@ from .executor import (start_job, poll_job, kill_job, JobResult, RunningJob,
 from .gpuid import gpu_key, cuda_visible_value, total_vram_mb, GpuIdError
 from .preflight import preflight, PreflightFailed
 from .queue import QueueRoot, STATES
-from .reaper import reap
+from .reaper import reap, MAX_ATTEMPTS
 from .spec import JobSpec
 
 log = logging.getLogger("gpuqueue.runner")
@@ -490,6 +490,12 @@ class Runner:
         spec.pid = None
         spec.exit_code = result.exit_code
         ok = result.exit_code == 0 and not result.timed_out
+        if not ok and self._hit_by_a_convicted_co_tenant(spec, active, result):
+            self._remove_worktree(active)
+            self.queue.requeue(spec)
+            log.info("%s requeued: OOMed while a co-tenant was convicted of "
+                     "exceeding its declaration", spec.id)
+            return
         # Filing is deferred until after queue.finish (below), even though
         # the exception is caught right here. `_report_bug` can block for
         # ~250s on `gh`, and by this point the job is already out of
@@ -513,6 +519,25 @@ class Runner:
         if artifact_exc is not None:
             self._report_bug(artifact_exc, "artifacts", spec)
         log.info("%s %s", spec.id, "done" if ok else f"failed: {spec.error}")
+
+    def _hit_by_a_convicted_co_tenant(self, spec: JobSpec, active: Active,
+                                      result: JobResult) -> bool:
+        """An OOM this job did not cause.
+
+        `docs/design.md` says a CUDA OOM is a configuration error and is
+        never retried blindly. That stays true, and sharing does not
+        weaken it -- it only adds one case where the premise is false: the
+        job OOMed while the watchdog convicted a *different* holder of
+        over-using the card. That is a genuine transient, so it gets the
+        single retry `attempts` already bounds, and every other OOM
+        behaves exactly as before.
+        """
+        if not result.oom or spec.id in self._convicted:
+            return False
+        if self._last_conviction is None:
+            return False
+        return (self._last_conviction > active.started_mono
+                and spec.attempts < MAX_ATTEMPTS)
 
     def _collect_artifacts(self, spec: JobSpec, project: ProjectConfig,
                            workdir: Path) -> None:
