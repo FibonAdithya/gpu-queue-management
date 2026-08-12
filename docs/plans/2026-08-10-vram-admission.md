@@ -2199,14 +2199,28 @@ Capacity and usable memory:
     def _usable_mb(self) -> int | None:
         """Cached: a card's total does not change, and this would otherwise
         run nvidia-smi on every admit, on the loop that also polls jobs."""
-        if not self._usable_asked:
-            self._usable_asked = True
-            total = self.cfg.gpu_vram_mb
+        # Cache a SUCCESS, never a failure. Latching `_usable_asked` on
+        # the first call regardless of outcome means one transient
+        # nvidia-smi hiccup -- not exotic on a box whose purpose is GPU
+        # work -- degrades the lane to exclusive-only for the life of the
+        # daemon, silently and with no way back short of a restart.
+        if self._usable_asked:
+            return self._usable_mb_cache
+        total = self.cfg.gpu_vram_mb
+        if total is None:
+            total = total_vram_mb()
             if total is None:
-                total = total_vram_mb()
-            self._usable_mb_cache = (None if total is None
-                                     else total - self.cfg.gpu_vram_reserve_mb)
-        return self._usable_mb_cache
+                return None          # uncached: try again next admit
+        usable = total - self.cfg.gpu_vram_reserve_mb
+        # config rejects reserve >= gpu_vram_mb, but only on the explicit
+        # path -- it has no card to check against. A negative here would
+        # make `want_mb > usable_mb` true for every claim and admit
+        # nothing, silently. Static and reproducible, so it is cached.
+        if usable <= 0:
+            usable = None
+        self._usable_asked = True
+        self._usable_mb_cache = usable
+        return usable
 
     def _capacity(self, lane: str) -> int:
         limit = (self.cfg.cpu_slots if lane == "cpu"
