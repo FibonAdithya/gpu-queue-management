@@ -49,6 +49,19 @@ class MutexTimeout(ClaimBusy):
     """
 
 
+class CannotEverFit(ClaimBusy):
+    """The declaration exceeds the whole card -- permanent, not busy.
+
+    A subclass for the same reason `MutexTimeout` is one: every existing
+    `except ClaimBusy` must keep catching it. The distinction it offers a
+    caller who asks for it is permanence. "Busy" invites waiting, and every
+    waiter here polls for room to appear; room for a claim larger than the
+    card never does, so a caller told only "busy" hangs forever. `gpu_claim`
+    raises this before its wait loop rather than inside it, and `gpu-claim`
+    reports it as unavailable (69) rather than a temporary failure (75).
+    """
+
+
 @dataclass
 class Record:
     path: Path

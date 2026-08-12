@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import pytest
 from gpuqueue import ledger as lg
 from gpuqueue.claim import (gpu_claim, ClaimBusy, MutexTimeout, read_claim,
@@ -206,6 +207,66 @@ def test_default_usable_mb_is_none_when_the_reserve_swallows_the_card(
     guard as Runner._usable_mb, applied to this sibling path."""
     monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: 256)
     assert default_usable_mb() is None
+
+
+def test_an_explicit_usable_none_is_not_re_derived(tmp_path, monkeypatch):
+    """`usable_mb=None` from a caller means "I asked the card and it would
+    not say", which `ledger.fits` turns into exclusive-only admission. It
+    must not be read as "the caller said nothing" and quietly replaced by a
+    capacity this claim was never meant to be admitted against.
+
+    The runner passes `Runner._usable_mb()` straight through, so when that
+    returns None the runner logs "exclusive-only" while gpu-claim would go
+    on sharing the card against `total - DEFAULT_RESERVE_MB` -- ignoring the
+    configured gpu_vram_reserve_mb, and disagreeing with the runner exactly
+    when the card is the thing that cannot be trusted."""
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: 8188)
+    with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512, usable_mb=None):
+        with pytest.raises(ClaimBusy):
+            with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512,
+                           usable_mb=None):
+                pass
+
+
+def test_an_omitted_usable_is_still_derived_from_the_card(tmp_path,
+                                                          monkeypatch):
+    """The other half of the same distinction: a caller that says nothing
+    (a hand-run `gpu-claim --vram-mb 512`) still gets capacity discovery."""
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: 8188)
+    with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512):
+        with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512) as second:
+            assert second.vram_mb == 512
+
+
+def test_a_declaration_larger_than_the_card_fails_instead_of_waiting(tmp_path):
+    """`--wait` polls for room to appear. Room for a claim bigger than the
+    whole card never appears, so waiting is a silent hang -- and the
+    explanation `busy_message` would have given is swallowed by the loop.
+    The runner already fails such a job rather than queueing it forever;
+    this is the same judgement on the direct path.
+
+    Run on a thread with a deadline rather than asserted directly: before
+    the fix this call never returns, and a test that hangs the suite
+    forever is not a useful way to report that.
+    """
+    outcome = {}
+
+    def attempt():
+        try:
+            with gpu_claim(key=KEY, directory=tmp_path, vram_mb=99999,
+                           usable_mb=7676, wait=True):
+                outcome["result"] = "admitted"
+        except BaseException as e:      # noqa: BLE001 - recorded, then asserted
+            outcome["result"] = e
+
+    t = threading.Thread(target=attempt, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive(), ("gpu-claim --wait is polling for room that can "
+                              "never appear")
+    assert isinstance(outcome["result"], ClaimBusy)
+    assert "99999" in str(outcome["result"])
+    assert "7676" in str(outcome["result"])
 
 
 def test_job_orphaned_when_the_runner_is_gone():

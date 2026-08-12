@@ -7,7 +7,8 @@ import os
 import subprocess
 import sys
 
-from .claim import gpu_claim, ClaimBusy, release_stale, list_claims
+from .claim import (gpu_claim, ClaimBusy, CannotEverFit, release_stale,
+                    list_claims)
 from .gpuid import gpu_key, cuda_visible_value, GpuIdError
 from .preflight import preflight, PreflightFailed
 
@@ -113,6 +114,11 @@ def main(argv: list[str] | None = None) -> int:
         with gpu_claim(key=key, owner=args.owner, cmd=cmd, wait=args.wait,
                        vram_mb=args.vram_mb):
             return subprocess.run(cmd, env=_child_env(args.gpu_index)).returncode
+    except CannotEverFit as e:
+        # Ahead of ClaimBusy, which it subclasses: 75 means "try again
+        # later" and there is no later in which this declaration fits.
+        print(f"gpu-claim: {e}", file=sys.stderr)
+        return EX_UNAVAILABLE
     except ClaimBusy as e:
         print(f"gpu-claim: {e}", file=sys.stderr)
         return EX_TEMPFAIL

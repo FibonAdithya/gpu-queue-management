@@ -80,6 +80,16 @@ def test_no_gpu_exits_69(monkeypatch, capsys):
     assert cli_claim.main(["--", "true"]) == 69
     assert "no CUDA device" in capsys.readouterr().err
 
+def test_an_impossible_declaration_is_unavailable_not_tempfail(monkeypatch,
+                                                               capsys):
+    """75 (EX_TEMPFAIL) tells a wrapper "this may work later". There is no
+    later in which a claim bigger than the whole card fits, and a wrapper
+    that believes 75 would poll forever -- the same silent hang as --wait."""
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: 8188)
+    assert cli_claim.main(["--vram-mb", "99999", "--", "true"]) == 69
+    assert "never be admitted" in capsys.readouterr().err
+
+
 def test_status_prints_claims_as_json(tmp_path, capsys):
     (tmp_path / "x.lock.json").write_text(json.dumps(
         {"pid": 1, "owner": "me", "cmd": ["t"], "started_at": "2026-08-05T00:00:00Z"}))

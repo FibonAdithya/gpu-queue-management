@@ -526,6 +526,17 @@ class Runner:
         spec.pid = None
         spec.exit_code = result.exit_code
         ok = result.exit_code == 0 and not result.timed_out
+        if ok and spec.id in self._convicted:
+            # A conviction outranks a clean exit. `_kill_tree` SIGTERMs the
+            # holder's tree before it SIGKILLs it, so a trainer that
+            # checkpoints on SIGTERM exits 0 -- and judged on the exit code
+            # alone the job we just killed for over-using the card is filed
+            # under done/. `_describe_failure` would never run, so the one
+            # thing conviction exists to produce (the job dying while naming
+            # its own declaration) is lost, and the `_convicted` entry leaks
+            # to disqualify this id from the co-tenant retry for the life of
+            # the runner.
+            ok = False
         if not ok and self._hit_by_a_convicted_co_tenant(spec, active, result):
             self._remove_worktree(active)
             self.queue.requeue(spec)

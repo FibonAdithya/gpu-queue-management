@@ -16,11 +16,15 @@ from pathlib import Path
 
 from . import ledger
 from .gpuid import gpu_key, total_vram_mb
-from .ledger import ClaimBusy, MutexTimeout  # re-exported: callers use these
+# re-exported: callers use these
+from .ledger import ClaimBusy, MutexTimeout, CannotEverFit
 from .procs import pid_alive           # re-exported for the same reason
 
 DEFAULT_CLAIM_DIR = "/var/lock/gpu"
 WAIT_POLL_S = 0.5
+
+# `usable_mb` omitted, as distinct from an explicit None. See gpu_claim.
+_ASK_THE_CARD = object()
 
 # A MutexTimeout means an old-style gpu-claim is holding LOCK_EX for its
 # whole run, which can be hours -- a different condition from "the card is
@@ -104,11 +108,22 @@ def release_stale(directory: Path | None = None) -> list[dict]:
 def gpu_claim(key: str | None = None, owner: str | None = None,
               cmd: list[str] | None = None, wait: bool = False,
               directory: Path | None = None, vram_mb: int | None = None,
-              usable_mb: int | None = None, own_usage: bool = True):
+              usable_mb: int | None | object = _ASK_THE_CARD,
+              own_usage: bool = True):
     """Hold a share of the card. `vram_mb=None` means the whole of it.
 
     `own_usage=False` is for the runner, which takes the card before the
     job process exists and fills the usage pid in after launch.
+
+    `usable_mb` distinguishes three cases, which is why its default is a
+    sentinel rather than None. Omitted means "you work out the capacity"
+    and we ask the card. An int is that capacity. None means "I asked and
+    the card would not say" -- `ledger.fits` reads that as exclusive-only
+    admission, and it must survive being passed in. The runner hands us
+    `Runner._usable_mb()` straight through, so conflating its None with
+    "omitted" would have the runner logging exclusive-only while this
+    function went on sharing the card against a rediscovered capacity that
+    ignores the configured reserve.
 
     `wait` polls capacity rather than blocking on flock: the mutex is
     released the instant `acquire` returns, so there is no longer a kernel
@@ -122,8 +137,15 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
     """
     d = Path(directory) if directory else claim_dir()
     key = key or gpu_key()
-    if usable_mb is None:
+    if usable_mb is _ASK_THE_CARD:
         usable_mb = default_usable_mb()
+    if ledger.exceeds_capacity(vram_mb, usable_mb):
+        # Before the wait loop, not inside it: every waiter below polls for
+        # room to appear, and room for a claim larger than the whole card
+        # never does. `_take_card` makes the same call for the same reason.
+        raise ledger.CannotEverFit(
+            f"GPU {key}: declared {vram_mb} MiB but only {usable_mb} MiB is "
+            "usable on this card; it can never be admitted")
     warned = False
     while True:
         try:

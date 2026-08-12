@@ -807,6 +807,30 @@ def test_a_hang_after_an_oom_line_beside_a_conviction_is_not_retried(
     assert spec.attempts == 0
 
 
+def test_a_convicted_job_that_exits_cleanly_is_still_a_failure(env, monkeypatch):
+    """The watchdog SIGTERMs the holder's tree before it SIGKILLs it, so a
+    trainer that checkpoints on SIGTERM exits 0. Judged on exit code alone
+    that is a success: filed under done/, `_describe_failure` never called,
+    so the conviction is never surfaced and its `_convicted` entry leaks --
+    which then disqualifies that job id from the co-tenant retry forever.
+
+    Attribution is the entire point of convicting a holder; losing it on
+    the one path where the job dies tidily is the worst place to lose it."""
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: r.queue.work_dir(spec.id))
+    r.queue.work_dir("j1").mkdir(parents=True, exist_ok=True)
+    submit(r, sha, "j1", ["true"], lane="gpu", vram_mb=512)
+    assert r.admit() == ["j1"]
+    r._convicted["j1"] = {"declared": 512, "used": 3070, "owner": "gpuq:j1"}
+    _run_until_settled(r, "j1")
+    state, spec = r.queue.find("j1")
+    assert state == "failed"
+    assert "exceeding its declaration" in (spec.error or "")
+    assert "j1" not in r._convicted
+
+
 @pytest.fixture
 def gpu_env(env, monkeypatch):
     """`env` with a card big enough to share and git stubbed out, so these

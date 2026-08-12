@@ -197,6 +197,14 @@ milliseconds needed to read the holders, decide, and rename one record into
 place — never for the duration of a run. `vram_mb: null` means exclusive:
 it fits only into an empty ledger and nothing fits alongside it.
 
+A refusal and a permanent refusal are different answers. "The card is full"
+clears when a holder exits, so waiting for it is reasonable and `--wait`
+polls. A declaration larger than the whole card never fits however empty the
+ledger gets, so it is refused up front rather than waited on: `gpu-claim`
+exits 69 (unavailable) rather than 75 (try again later), and the runner fails
+such a job instead of leaving it pending. An implementation that reports the
+permanent case as ordinary busyness gives its callers a loop with no exit.
+
 One record per holder rather than one document listing them, because the
 property that matters when something is stuck is that `ls` shows who is on
 the card and `rm` clears one wedged holder. A shared mutated document gives
