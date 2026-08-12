@@ -28,7 +28,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reap", action="store_true", help="release dead claims")
     p.add_argument("--vram-mb", dest="vram_mb", type=int, default=None,
                    help="VRAM this command needs, in MiB as nvidia-smi "
-                        "reports it. Omit to take the whole card.")
+                        "reports it (so including the ~250 MiB CUDA "
+                        "context and the allocator's high-water mark, "
+                        "not torch's max_memory_allocated). Omit to "
+                        "take the whole card.")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     return p
 
