@@ -85,6 +85,34 @@ class RunnerConfig:
     autofix: AutofixConfig = field(default_factory=AutofixConfig)
 
 
+_TRUE = {"true", "yes", "on", "1"}
+_FALSE = {"false", "no", "off", "0"}
+
+
+def _as_bool(value, key: str, default: bool) -> bool:
+    """A TOML bool, or a spelling of one -- never `bool(value)`.
+
+    `enforce_vram = "false"` (quoted, which TOML accepts as a string) went
+    through `bool("false")` and came out True, switching the watchdog *on*
+    for an operator who wrote it to turn the killing off, and who was told
+    by gpuq.example.toml that it was an off switch. Anything that is not
+    obviously one or the other is a ConfigError: a config this file cannot
+    read is worth a loud failure at startup, where guessing is worth a
+    dead job hours later.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in _TRUE:
+            return True
+        if s in _FALSE:
+            return False
+    raise ConfigError(f"{key} must be true or false, got {value!r}")
+
+
 def default_config_path() -> Path:
     return Path(os.environ.get("GPUQ_CONFIG", "/workspace/gpuq.toml"))
 
@@ -168,10 +196,16 @@ def load_config(path: Path) -> RunnerConfig:
         gpu_vram_mb=gpu_vram_mb,
         gpu_vram_reserve_mb=gpu_vram_reserve_mb,
         gpu_max_jobs=gpu_max_jobs,
-        enforce_vram=bool(queue.get("enforce_vram", True)),
+        # The two keys that decide whether gpuq kills something. Every
+        # other bool here still goes through bool(), where a quoted
+        # "false" means a feature quietly stays on rather than a job
+        # being killed -- worth fixing, not worth widening this change.
+        enforce_vram=_as_bool(queue.get("enforce_vram"),
+                              "[queue].enforce_vram", True),
         poll_interval_s=float(queue.get("poll_interval_s", 2.0)),
         claim_dir=Path(claim_dir) if claim_dir else None,
-        kill_orphan_cuda=bool(queue.get("kill_orphan_cuda", True)),
+        kill_orphan_cuda=_as_bool(queue.get("kill_orphan_cuda"),
+                                  "[queue].kill_orphan_cuda", True),
         orphan_cuda_interval_s=float(queue.get("orphan_cuda_interval_s", 60.0)),
         projects=projects,
         autofix=autofix,

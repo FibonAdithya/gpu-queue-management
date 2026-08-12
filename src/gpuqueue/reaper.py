@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import signal
-from pathlib import Path
+import time
 
 from . import ledger
 from .claim import release_stale, claim_dir
@@ -17,12 +17,16 @@ from .queue import QueueRoot
 MAX_ATTEMPTS = 1
 
 
-def _kill(pid: int) -> bool:
+def _signal(pid: int, sig: int) -> bool:
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, sig)
         return True
     except OSError:
         return False
+
+
+def _kill(pid: int) -> bool:
+    return _signal(pid, signal.SIGKILL)
 
 
 def requeue_orphans(queue: QueueRoot,
@@ -55,6 +59,21 @@ def kill_orphan_cuda(protect: set[int], records: list, apps: list[dict]) -> list
     a second, subtly different pid set.
     """
     _, unledgered = ledger.attribute(apps, records)
+    # Two directories on purpose, and the divergence is load-bearing.
+    # `records` came from `cfg.claim_dir`; bare `own_pids()` reads
+    # `$GPU_CLAIM_DIR`. That is safe only because `own_pids` is a strict
+    # superset of what `attribute` owns, so disagreement can only add
+    # exemptions, never remove one -- and this call is the only thing
+    # standing between a direct `gpu-claim` user's trainer and SIGKILL when
+    # the two paths genuinely differ, which they can: with a non-default
+    # GPUQ_PREFIX, `bootstrap.sh` templates GPU_CLAIM_DIR into the
+    # supervisor environment but not into gpuq.toml.
+    #
+    # So do not "clean this up" by passing `cfg.claim_dir` into
+    # `own_pids()`, and do not route it through `attribute()`. Either
+    # removes that accidental protection. The real fix is making the two
+    # configs agree, which is a bootstrap change, not a directory
+    # plumbed through here.
     exempt = set(protect) | own_pids()
     killed = []
     for app in unledgered:
@@ -90,18 +109,63 @@ def clean_partials(queue: QueueRoot) -> list[str]:
 WATCHDOG_STRIKES = 2
 
 
+def _exited(pid: int) -> bool:
+    """Gone, or a zombie the runner has not `wait`ed for yet.
+
+    `pid_alive` is `kill(pid, 0)`, which a zombie answers. The runner is
+    the parent of the job it convicts and does not reap it until
+    `collect()`, a phase later, so without this every conviction would
+    spend both grace periods below waiting for a process that has already
+    exited. `executor._kill_group` does not need this because `proc.poll()`
+    reaps its child; here there is no Popen to poll.
+    """
+    if not pid_alive(pid):
+        return True
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            stat = fh.read()
+    except OSError:
+        return True
+    # The comm field can contain spaces and parentheses; state is the
+    # first field after the last ')'.
+    fields = stat.rpartition(")")[2].split()
+    return bool(fields) and fields[0] == "Z"
+
+
 def _kill_tree(pid: int) -> bool:
-    """Kill a holder's whole tree, by pid rather than by process group.
+    """SIGTERM a holder's whole tree, then SIGKILL what survives, by pid
+    rather than by process group.
 
     killpg would be shorter and is wrong here: a `gpu-claim` launched from
     a script shares its group, so the group is not reliably the holder's
     own. Enumerating descendants kills exactly what the record is charged
     for and nothing else.
+
+    The grace period is not decoration: a convicted trainer that gets only
+    SIGKILL flushes no logs and writes no checkpoint, so the operator loses
+    the run *and* the evidence. Grace periods match
+    `executor._kill_group`'s.
+
+    This blocks the runner's single thread, so the total is bounded at
+    10s + 5s per conviction and cannot grow: the tree is enumerated once,
+    up front, and both loops exit early once everything in it has exited.
+    A card still held by a dying trainer is not the moment to admit more
+    work anyway -- the same trade `_kill_group` documents.
     """
-    ok = False
-    for p in {pid} | descendants(pid):
-        ok = _kill(p) or ok
-    return ok
+    tree = {pid} | descendants(pid)
+    signalled = False
+    for sig, grace in ((signal.SIGTERM, 10.0), (signal.SIGKILL, 5.0)):
+        alive = [p for p in tree if not _exited(p)]
+        if not alive:
+            break
+        for p in alive:
+            signalled = _signal(p, sig) or signalled
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if all(_exited(p) for p in tree):
+                break
+            time.sleep(0.1)
+    return signalled
 
 
 def check_vram(records: list, apps: list[dict],
@@ -140,9 +204,11 @@ def check_vram(records: list, apps: list[dict],
         strikes[key] = strikes.get(key, 0) + 1
         if strikes[key] >= WATCHDOG_STRIKES:
             strikes.pop(key, None)
+            # No "record" field: it carried `rec.name`, the bare filename
+            # this function has just finished explaining is ambiguous, and
+            # nothing consumed it. `owner` is what identifies the holder.
             convicted.append({"owner": rec.owner, "declared": rec.vram_mb,
-                              "used": used, "usage_pid": rec.usage_pid,
-                              "record": rec.name})
+                              "used": used, "usage_pid": rec.usage_pid})
     for key in list(strikes):
         if key not in seen:
             strikes.pop(key)  # the holder is gone; its strikes go with it
@@ -172,9 +238,13 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
     # neither on every timer tick.
     if include_orphan_cuda and (cfg.kill_orphan_cuda or cfg.enforce_vram):
         apps = compute_apps()
-        d = cfg.claim_dir if cfg.claim_dir else claim_dir()
-        records = ledger.live_records(ledger.all_records(d))
         if apps is not None:
+            # Inside the guard: with no visible process list neither
+            # consumer runs, and walking the claim directory to build
+            # records nothing will read is pure cost on every sweep of a
+            # box where nvidia-smi is broken.
+            d = cfg.claim_dir if cfg.claim_dir else claim_dir()
+            records = ledger.live_records(ledger.all_records(d))
             if cfg.kill_orphan_cuda:
                 protect = {s.pid for s in queue.list_state("running") if s.pid}
                 killed = kill_orphan_cuda(protect, records, apps)

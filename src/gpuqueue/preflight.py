@@ -14,7 +14,7 @@ from pathlib import Path
 from . import ledger
 from .claim import claim_dir, list_claims          # noqa: F401 (list_claims
                                                    # kept for callers)
-from .procs import descendants, pid_alive
+from .procs import descendants
 
 
 class PreflightFailed(RuntimeError):
@@ -57,8 +57,12 @@ def compute_apps() -> list[dict] | None:
 def own_pids(directory=None) -> set[int]:
     """Every pid the claim protocol accounts for, plus this process's own.
 
-    Kept because `reaper` and callers outside this package use it. The
-    finer question -- which *record* owns a pid -- is `ledger.attribute`.
+    Kept for `reaper.kill_orphan_cuda` and the tests covering it -- an
+    earlier docstring justified it by callers outside this package, and
+    grep finds none. The finer question -- which *record* owns a pid --
+    is `ledger.attribute`. This one is deliberately coarser: it is the
+    last exemption before a SIGKILL, so over-exempting is the safe way to
+    be wrong.
     """
     pids = {os.getpid(), os.getppid()} | descendants(os.getpid())
     d = Path(directory) if directory else claim_dir()

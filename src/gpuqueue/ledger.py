@@ -229,7 +229,13 @@ def _take_mutex(fd: int, timeout_s: float) -> None:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return
-        except OSError:
+        except BlockingIOError:
+            # Only "someone else holds it". A bare `except OSError` also
+            # swallowed EBADF, ENOLCK and EINTR and reported them below as
+            # "an older gpu-claim is holding this card -- wait for it",
+            # sending an operator to wait hours on a condition that will
+            # never clear. Those are bugs or a broken filesystem and must
+            # come out as themselves.
             if time.monotonic() >= deadline:
                 raise MutexTimeout(
                     f"could not take the ledger mutex within {timeout_s:g}s: "
@@ -292,11 +298,21 @@ def attribute(apps: list[dict],
     A record with no `usage_pid` has been admitted but not launched. It
     owns nothing, and must not adopt a stranger's process.
     """
+    # `records` is not filtered on `usage_pid` liveness, and need not be:
+    # for gpu-claim and legacy records `pid == usage_pid`, so `live_records`
+    # has already dropped them; for a runner record `_settle` removes the
+    # record in the same tick the process is reaped, so a stale one can
+    # accrue at most one of the two strikes a conviction needs.
     trees = {str(r.path): {r.usage_pid} | descendants(r.usage_pid)
              for r in records if r.usage_pid is not None}
     owned: dict[str, list[dict]] = {}
     unledgered: list[dict] = []
     for app in apps:
+        # First match wins. If two records' trees overlap (a holder that
+        # forked another holder), the process is charged to whichever
+        # record sorts first and the other reads `used=0` -- under its
+        # declaration, so the overlap can only fail to convict, never
+        # convict the wrong holder.
         for path, tree in trees.items():
             if app["pid"] in tree:
                 owned.setdefault(path, []).append(app)

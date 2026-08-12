@@ -287,6 +287,7 @@ runner silently ignoring a declaration and admitting on wrong numbers.
 | A job that spikes past its declaration for under two sweeps | Not convicted. May still have OOMed a co-tenant, which then looks like the co-tenant's own fault. |
 | Fragmentation | Two 4000 MiB declarations fit an 8188 MiB card on paper and may still OOM. `gpu_vram_reserve_mb` is the only lever. |
 | Reservation without usage | A record between acquire and launch holds VRAM budget it is not using. Bounded by how long `_prepare_workdir` takes. |
+| A convicted direct `gpu-claim` holder is never told why | A queued job gets `_describe_failure`, which writes "declared 512 MiB, actually using 3070" into `spec.error` where `gpuq show` prints it. A direct `gpu-claim -- ...` holder has no equivalent: its command is SIGTERMed then SIGKILLed, the user sees exit 137 and an empty stderr, and the conviction reason exists only in the runner's log — which is not where that user is looking. Accepted rather than fixed: a new user-facing channel for one case is more machinery than the case is worth. Documented so the next person to see an unexplained 137 on this box knows where to look. |
 
 ## 10. Verification
 

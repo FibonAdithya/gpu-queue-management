@@ -62,7 +62,9 @@ class Runner:
         self._usable_asked = False
         # Logged once, not once per admit: see _usable_mb.
         self._usable_query_warned = False
-        # record name -> consecutive sweeps over its declaration
+        # str(record path) -> consecutive sweeps over its declaration. The
+        # full path, never the bare filename: `reaper.check_vram` explains
+        # why one is not unique across `<key>.lock.d` directories.
         self._vram_strikes: dict[str, int] = {}
         # job id -> the conviction that killed it, so _describe_failure can
         # say "declared 512 MiB, using 3070" instead of "exit -9"
@@ -303,6 +305,17 @@ class Runner:
         pending = sorted(self.queue.list_state("pending"),
                          key=lambda s: (s.submitted_at, s.id))
         started = []
+        # A MutexTimeout cannot resolve inside one pass: the thing holding
+        # the ledger mutex that long is a pre-ledger `gpu-claim`, which
+        # holds it for its whole training run. Paying `MUTEX_WAIT_S` again
+        # for the next pending GPU job buys nothing and costs 10s each --
+        # five queued jobs stall `admit` for the best part of a minute, and
+        # `collect` does not run in that window, so a hung job outlives its
+        # `timeout_s`. That is the stall `_report_bug` calls worse than a
+        # crash. One timeout ends this pass's GPU admissions; the next tick
+        # tries again. Not fixed by lowering `ledger.MUTEX_WAIT_S`, which
+        # the interactive `gpu-claim` path legitimately needs.
+        mutex_blocked = False
         for spec in pending:
             project = self.cfg.projects.get(spec.project)
             if project is None:
@@ -316,7 +329,17 @@ class Runner:
             # running/ needs no unwinding if the card is busy.
             claim_cm = claim_record = None
             if spec.lane == "gpu":
-                taken = self._take_card(spec)
+                if mutex_blocked:
+                    continue
+                try:
+                    taken = self._take_card(spec)
+                except ledger.MutexTimeout as e:
+                    # Logged here rather than per job, so one wedged holder
+                    # writes one line per pass instead of one per pending
+                    # job.
+                    mutex_blocked = True
+                    log.warning("GPU admissions deferred this pass: %s", e)
+                    continue
                 if taken is None:
                     continue
                 claim_cm, claim_record = taken
@@ -333,11 +356,18 @@ class Runner:
     def _take_card(self, spec: JobSpec):
         """Enter a gpu_claim by hand so it can be held across ticks.
 
-        Non-blocking on purpose: `wait=True` in a single-threaded loop would
-        stall the CPU lane behind whoever holds the card.
+        Never waits on *capacity*: `wait=True` in a single-threaded loop
+        would stall the CPU lane behind whoever holds the card. A full card
+        returns `None` and the job stays pending. It can still block for up
+        to `ledger.MUTEX_WAIT_S` on the ledger mutex, which is a different
+        thing -- a participant holds that only for a directory read and one
+        rename, so the wait is short unless a pre-ledger `gpu-claim` is
+        holding `flock` for its whole run. That case raises `MutexTimeout`,
+        and `admit` stops trying for the rest of the pass.
 
         Returns `(claim_cm, record)` on success, or `None` when the job
-        should stay pending or has just been failed outright.
+        should stay pending or has just been failed outright. Raises
+        `ledger.MutexTimeout`.
         """
         try:
             # The runner's configured claim dir, not $GPU_CLAIM_DIR. These
@@ -371,6 +401,12 @@ class Runner:
                        own_usage=False)
         try:
             record = cm.__enter__()
+        except ledger.MutexTimeout:
+            # Out to `admit`, which ends this pass's GPU admissions. Before
+            # the general ClaimBusy clause below because MutexTimeout is a
+            # subclass of it, and "the ledger is unreadable" is not "the
+            # card is full".
+            raise
         except ClaimBusy as e:
             log.info("%s waiting: %s", spec.id, e)
             return None

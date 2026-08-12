@@ -184,7 +184,7 @@ Four things must be pinned for independent implementations to interoperate:
 | | |
 |---|---|
 | Lock path | fixed directory (`$GPU_CLAIM_DIR`, default `/var/lock/gpu`), file named by GPU UUID |
-| Key derivation | `torch.cuda.get_device_properties(dev).uuid`; fall back to `name-index` on builds without `.uuid` |
+| Key derivation | the card's UUID, lowercased with any `GPU-`/`MIG-` prefix stripped; fall back to `name-index` where no UUID is reported. gpuq reads it from `nvidia-smi` and never imports torch (see `gpuid.py`); an implementation that reads `torch.cuda.get_device_properties(dev).uuid` gets the bare hex where nvidia-smi gives `GPU-<hex>`, and `gpuid.normalize_gpu_uuid` is what makes those one key rather than two locks on one card |
 | Ledger | `<key>.lock.d/<pid>.<token>.json` per holder: `pid`, `usage_pid`, `vram_mb`, `owner`, `cmd`, `started_at`, `key` |
 | Mutex | `<key>.lock`, `flock`ed only while reading the ledger and writing one record |
 

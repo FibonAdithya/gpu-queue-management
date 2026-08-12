@@ -172,3 +172,38 @@ def test_reserve_may_not_swallow_the_whole_card(tmp_path):
             gpu_vram_mb = 1024
             gpu_vram_reserve_mb = 1024
         """)
+
+
+def test_a_quoted_false_switches_the_watchdog_off_not_on(tmp_path):
+    """`bool("false")` is True. Read that way, an operator who wrote the
+    off switch gets a watchdog that kills jobs."""
+    cfg = write_and_load(tmp_path, """
+        [queue]
+        root = "/q"
+        enforce_vram = "false"
+        kill_orphan_cuda = "off"
+    """)
+    assert cfg.enforce_vram is False
+    assert cfg.kill_orphan_cuda is False
+
+
+def test_quoted_true_spellings_still_mean_true(tmp_path):
+    cfg = write_and_load(tmp_path, """
+        [queue]
+        root = "/q"
+        enforce_vram = "yes"
+        kill_orphan_cuda = "1"
+    """)
+    assert cfg.enforce_vram is True
+    assert cfg.kill_orphan_cuda is True
+
+
+def test_an_unreadable_bool_is_an_error_not_a_guess(tmp_path):
+    """Loud at startup beats a job killed hours later by a setting its
+    author believed said otherwise."""
+    with pytest.raises(ConfigError, match=r"\[queue\].enforce_vram"):
+        write_and_load(tmp_path, """
+            [queue]
+            root = "/q"
+            enforce_vram = "sometimes"
+        """)

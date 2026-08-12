@@ -868,3 +868,70 @@ def test_an_undeclared_gpu_job_still_runs_alone(gpu_env):
     submit(r, sha, "j2", ["sleep", "5"], lane="gpu", vram_mb=100)
     assert r.admit() == ["j1"]
     assert r.queue.find("j2")[0] == "pending"
+
+
+def test_a_wedged_mutex_costs_one_timeout_per_pass_not_one_per_job(
+        gpu_env, monkeypatch):
+    """The upgrade window, on the runner's single thread.
+
+    A pre-ledger `gpu-claim` holds LOCK_EX for its whole run, so every
+    `acquire` in a pass waits the full `MUTEX_WAIT_S` and fails. At the
+    shipped 10s, five pending GPU jobs is the best part of a minute in
+    which `collect()` never runs, so a hung job outlives its `timeout_s`.
+    The timeout cannot resolve mid-pass -- the holder is holding for its
+    whole run -- so the first one ends this pass's GPU admissions.
+    """
+    import fcntl
+    import os as _os
+    from gpuqueue import ledger as lg
+    r, sha = gpu_env
+    monkeypatch.setattr(lg, "MUTEX_WAIT_S", 0.4)
+    for i in range(5):
+        r.queue.work_dir(f"j{i}").mkdir(parents=True, exist_ok=True)
+        submit(r, sha, f"j{i}", ["sleep", "5"], lane="gpu", vram_mb=100)
+
+    path = lg.mutex_path("test-uuid", r.cfg.claim_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = _os.open(path, _os.O_CREAT | _os.O_RDWR, 0o666)
+    fcntl.flock(fd, fcntl.LOCK_EX)      # the old holder, for the whole run
+    try:
+        started = time.monotonic()
+        assert r.admit() == []
+        elapsed = time.monotonic() - started
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        _os.close(fd)
+
+    assert elapsed < 2 * lg.MUTEX_WAIT_S, (
+        f"paid {elapsed:.2f}s: one timeout per pending job, not one per "
+        "pass")
+    for i in range(5):
+        assert r.queue.find(f"j{i}")[0] == "pending"
+
+
+def test_the_mutex_timeout_is_logged_once_per_pass(gpu_env, monkeypatch,
+                                                   caplog):
+    """One wedged holder, one line -- not one line per pending job."""
+    import fcntl
+    import logging
+    import os as _os
+    from gpuqueue import ledger as lg
+    r, sha = gpu_env
+    monkeypatch.setattr(lg, "MUTEX_WAIT_S", 0.2)
+    for i in range(4):
+        r.queue.work_dir(f"j{i}").mkdir(parents=True, exist_ok=True)
+        submit(r, sha, f"j{i}", ["sleep", "5"], lane="gpu", vram_mb=100)
+
+    path = lg.mutex_path("test-uuid", r.cfg.claim_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = _os.open(path, _os.O_CREAT | _os.O_RDWR, 0o666)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+            r.admit()
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        _os.close(fd)
+
+    lines = [x for x in caplog.messages if "deferred this pass" in x]
+    assert len(lines) == 1, lines

@@ -401,3 +401,41 @@ def test_enforce_vram_off_convicts_nobody(q, tmp_path, monkeypatch):
     strikes = {}
     reap(q, cfg, vram_strikes=strikes)
     assert reap(q, cfg, vram_strikes=strikes)["convicted"] == []
+
+
+def test_a_convicted_holder_is_sigtermed_before_sigkill(monkeypatch):
+    """The spec's §6: a convicted holder is SIGTERMed then SIGKILLed. Kill
+    it outright and a trainer flushes no logs and writes no checkpoint, so
+    the run and the evidence are both lost."""
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    sent = []
+    real = rp._signal
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append(sig) or real(pid, sig))
+    proc = _sp.Popen(["sleep", "30"])
+    try:
+        assert rp._kill_tree(proc.pid) is True
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    assert sent == [_signal.SIGTERM], "escalated past SIGTERM needlessly"
+
+
+def test_kill_tree_does_not_wait_out_a_zombie(monkeypatch):
+    """`pid_alive` is kill(pid, 0), which a zombie answers. The runner is
+    the parent of what it convicts and does not reap it until `collect()`,
+    so without the /proc check every conviction would burn both grace
+    periods waiting for a process that has already exited."""
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    proc = _sp.Popen(["sh", "-c", "exit 0"])
+    deadline = _time.monotonic() + 5
+    while _live(proc.pid) and _time.monotonic() < deadline:
+        _time.sleep(0.02)          # a zombie: exited, not yet waited for
+    try:
+        started = _time.monotonic()
+        rp._kill_tree(proc.pid)
+        assert _time.monotonic() - started < 1.0
+    finally:
+        proc.wait(timeout=5)
