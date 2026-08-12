@@ -35,10 +35,12 @@ def env(tmp_path, monkeypatch):
     r = Runner(cfg)
     return r, sha
 
-def submit(r, sha, job_id, cmd, lane="cpu", artifacts=(), timeout_s=30):
+def submit(r, sha, job_id, cmd, lane="cpu", artifacts=(), timeout_s=30,
+          vram_mb=None):
     r.queue.submit(JobSpec.from_dict(dict(
         id=job_id, lane=lane, project="p", commit=sha, branch="main",
-        cmd=list(cmd), artifacts=list(artifacts), timeout_s=timeout_s)))
+        cmd=list(cmd), artifacts=list(artifacts), timeout_s=timeout_s,
+        vram_mb=vram_mb)))
 
 def drain(r, limit=30.0):
     """Tick until nothing is pending or running — what run_forever does,
@@ -237,7 +239,8 @@ def test_the_cuda_sweep_is_throttled(env, monkeypatch):
     r, sha = env
     calls = []
     monkeypatch.setattr(rn, "reap",
-                        lambda q, c, active_ids=None, include_orphan_cuda=True:
+                        lambda q, c, active_ids=None, include_orphan_cuda=True,
+                              vram_strikes=None:
                         calls.append(include_orphan_cuda) or {})
     r.cfg.orphan_cuda_interval_s = 3600
     for _ in range(5):
@@ -250,7 +253,8 @@ def test_the_cuda_sweep_runs_again_once_the_interval_passes(env, monkeypatch):
     r, sha = env
     calls = []
     monkeypatch.setattr(rn, "reap",
-                        lambda q, c, active_ids=None, include_orphan_cuda=True:
+                        lambda q, c, active_ids=None, include_orphan_cuda=True,
+                              vram_strikes=None:
                         calls.append(include_orphan_cuda) or {})
     r.cfg.orphan_cuda_interval_s = 0    # everything is always due
     r.tick(); r.tick()
@@ -356,7 +360,7 @@ def test_a_preflight_failure_files_only_the_inner_phase(env, filed,
     r, sha = env
     _enable(r)
     monkeypatch.setattr(rn, "preflight",
-                        lambda: (_ for _ in ()).throw(
+                        lambda allow=None, directory=None: (_ for _ in ()).throw(
                             RuntimeError("preflight exploded")))
     submit(r, sha, "j1", ["true"], lane="gpu")
     with pytest.raises(RuntimeError, match="preflight exploded"):
@@ -596,3 +600,83 @@ def test_the_job_may_override_the_pin(env, tmp_path, monkeypatch):
            lane="gpu")
     drain(r)
     assert out.read_text() == "7"
+
+
+# --- capacity-based admission -------------------------------------------------
+
+def test_gpu_lane_admits_up_to_gpu_max_jobs(env):
+    r, _ = env
+    r.cfg.gpu_max_jobs = 2
+    assert r._capacity("gpu") == 2
+
+
+def test_usable_mb_holds_back_the_reserve(env):
+    r, _ = env
+    r.cfg.gpu_vram_mb = 8188
+    r.cfg.gpu_vram_reserve_mb = 512
+    assert r._usable_mb() == 7676
+
+
+def test_usable_mb_asks_the_card_when_unconfigured(env, monkeypatch):
+    r, _ = env
+    r.cfg.gpu_vram_mb = None
+    monkeypatch.setattr(rn, "total_vram_mb", lambda: 8188)
+    assert r._usable_mb() == 8188 - r.cfg.gpu_vram_reserve_mb
+
+
+def test_usable_mb_is_queried_once(env, monkeypatch):
+    """Otherwise this is an nvidia-smi subprocess on every admit, on the
+    single loop that also polls every running job."""
+    r, _ = env
+    r.cfg.gpu_vram_mb = None
+    calls = []
+    monkeypatch.setattr(rn, "total_vram_mb", lambda: calls.append(1) or 8188)
+    r._usable_mb()
+    r._usable_mb()
+    assert len(calls) == 1
+
+
+def test_a_declaration_bigger_than_the_card_fails_rather_than_queues(env):
+    """A permanent condition. Leaving it pending queues it forever, which
+    is the mistake `_take_card` already avoids for a box with no GPU."""
+    r, sha = env
+    r.cfg.gpu_vram_mb = 1024
+    r.cfg.gpu_vram_reserve_mb = 512
+    submit(r, sha, "j1", ["true"], lane="gpu", vram_mb=4096)
+    r.admit()
+    state, got = r.queue.find("j1")
+    assert state == "failed"
+    assert "never be admitted" in got.error
+
+
+def test_launch_charges_the_record_to_the_job(env, monkeypatch):
+    """The card is taken before the job process exists, so the record is
+    only attributable once there is a pid to charge it to."""
+    from gpuqueue import ledger as lg
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: r.queue.work_dir(spec.id))
+    (r.queue.work_dir("j1")).mkdir(parents=True, exist_ok=True)
+    submit(r, sha, "j1", ["sleep", "5"], lane="gpu", vram_mb=512)
+    assert r.admit() == ["j1"]
+    try:
+        (record,) = lg.all_records(r.cfg.claim_dir)
+        assert record.usage_pid == r.active["j1"].running.pid
+        assert record.vram_mb == 512
+    finally:
+        r.shutdown()
+
+
+def test_usable_mb_is_none_when_the_card_reports_less_than_the_reserve(
+        env, monkeypatch):
+    """The default 'ask the card' path has no config-time guard the way an
+    explicit gpu_vram_mb does (see config.load_config). A card that reports
+    less total memory than the reserve must not hand a negative usable_mb
+    down into `ledger.fits`/`exceeds_capacity` -- treat it the same as
+    'the card could not be queried': degraded, exclusive-only admission."""
+    r, _ = env
+    r.cfg.gpu_vram_mb = None
+    r.cfg.gpu_vram_reserve_mb = 512
+    monkeypatch.setattr(rn, "total_vram_mb", lambda: 256)
+    assert r._usable_mb() is None

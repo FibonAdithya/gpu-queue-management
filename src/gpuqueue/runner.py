@@ -21,12 +21,13 @@ from pathlib import Path
 
 from . import bugfiler
 from . import git_ops
+from . import ledger
 from .bugreport import CallerError, signature
 from .claim import gpu_claim, ClaimBusy
 from .config import RunnerConfig, ProjectConfig
 from .executor import (start_job, poll_job, kill_job, JobResult, RunningJob,
                        StartFailed)
-from .gpuid import gpu_key, cuda_visible_value, GpuIdError
+from .gpuid import gpu_key, cuda_visible_value, total_vram_mb, GpuIdError
 from .preflight import preflight, PreflightFailed
 from .queue import QueueRoot, STATES
 from .reaper import reap
@@ -40,7 +41,9 @@ class Active:
     running: RunningJob
     project: ProjectConfig
     workdir: Path
-    claim_cm: object | None = None  # entered gpu_claim, released on settle
+    claim_cm: object | None = None       # entered gpu_claim, released on settle
+    claim_record: object | None = None   # its ledger.Record, for usage_pid
+    started_mono: float = 0.0            # for the watchdog's victim retry
 
 
 class Runner:
@@ -55,6 +58,14 @@ class Runner:
         # signature -> time.monotonic() of the last report. See the
         # cooldown check in _report_bug for why this exists.
         self._report_cooldowns: dict[str, float] = {}
+        self._usable_mb_cache: int | None = None
+        self._usable_asked = False
+        # record name -> consecutive sweeps over its declaration
+        self._vram_strikes: dict[str, int] = {}
+        # job id -> the conviction that killed it, so _describe_failure can
+        # say "declared 512 MiB, using 3070" instead of "exit -9"
+        self._convicted: dict[str, dict] = {}
+        self._last_conviction: float | None = None
 
     # --- lifecycle ----------------------------------------------------
     def run_forever(self) -> None:
@@ -185,8 +196,15 @@ class Runner:
         now = time.monotonic()
         sweep = (self._last_cuda_sweep is None
                  or now - self._last_cuda_sweep >= self.cfg.orphan_cuda_interval_s)
-        reap(self.queue, self.cfg, active_ids=set(self.active),
-             include_orphan_cuda=sweep)
+        result = reap(self.queue, self.cfg, active_ids=set(self.active),
+                      include_orphan_cuda=sweep,
+                      vram_strikes=self._vram_strikes)
+        for c in result.get("convicted", []):
+            self._last_conviction = time.monotonic()
+            log.warning("killed %s: declared %s MiB, using %s MiB",
+                        c["owner"], c["declared"], c["used"])
+            if c["owner"].startswith("gpuq:"):
+                self._convicted[c["owner"][len("gpuq:"):]] = c
         if sweep:
             self._last_cuda_sweep = now
 
@@ -223,8 +241,35 @@ class Runner:
             log.info("stopped %s for shutdown; left for the reaper", job_id)
 
     # --- admission ----------------------------------------------------
+    def _usable_mb(self) -> int | None:
+        """Cached: a card's total does not change, and this would otherwise
+        run nvidia-smi on every admit, on the loop that also polls jobs."""
+        if not self._usable_asked:
+            self._usable_asked = True
+            total = self.cfg.gpu_vram_mb
+            if total is None:
+                total = total_vram_mb()
+            usable = (None if total is None
+                      else total - self.cfg.gpu_vram_reserve_mb)
+            # config.load_config rejects a reserve >= gpu_vram_mb, but only
+            # on that explicit path -- it has no card to check against. On
+            # the default "ask the card" path a card that genuinely reports
+            # less than the reserve is possible, and a negative number here
+            # would flow straight into ledger.fits/exceeds_capacity, where
+            # `want_mb > usable_mb` is always true and nothing is ever
+            # admitted -- silently, with no error to explain why. Folding
+            # it into "the card could not be queried" gets the same
+            # degraded, exclusive-only posture preflight already takes,
+            # with a legible cause instead of a card that mysteriously
+            # never admits.
+            if usable is not None and usable <= 0:
+                usable = None
+            self._usable_mb_cache = usable
+        return self._usable_mb_cache
+
     def _capacity(self, lane: str) -> int:
-        limit = self.cfg.cpu_slots if lane == "cpu" else 1
+        limit = (self.cfg.cpu_slots if lane == "cpu"
+                 else self.cfg.gpu_max_jobs)
         in_lane = sum(1 for a in self.active.values()
                       if a.running.spec.lane == lane)
         return limit - in_lane
@@ -246,18 +291,19 @@ class Runner:
 
             # Take the card before the rename: a job that never reached
             # running/ needs no unwinding if the card is busy.
-            claim_cm = None
+            claim_cm = claim_record = None
             if spec.lane == "gpu":
-                claim_cm = self._take_card(spec)
-                if claim_cm is None:
+                taken = self._take_card(spec)
+                if taken is None:
                     continue
+                claim_cm, claim_record = taken
 
             claimed = self.queue.claim(spec.id)
             if claimed is None:  # cancelled, or another process won the rename
                 self._exit_claim(claim_cm)
                 continue
 
-            if self._launch(claimed, project, claim_cm):
+            if self._launch(claimed, project, claim_cm, claim_record):
                 started.append(claimed.id)
         return started
 
@@ -266,9 +312,16 @@ class Runner:
 
         Non-blocking on purpose: `wait=True` in a single-threaded loop would
         stall the CPU lane behind whoever holds the card.
+
+        Returns `(claim_cm, record)` on success, or `None` when the job
+        should stay pending or has just been failed outright.
         """
         try:
-            preflight()
+            # The runner's configured claim dir, not $GPU_CLAIM_DIR. These
+            # were already two different answers to "where are the
+            # claims?"; now that preflight decides contention by reading
+            # them, disagreeing means a co-tenant reads as an intruder.
+            preflight(directory=self.cfg.claim_dir)
         except PreflightFailed as e:
             log.warning("%s waiting: %s", spec.id, e)
             return None
@@ -281,14 +334,24 @@ class Runner:
             # No card will appear on a box that has none; do not queue forever.
             self._fail_pending(spec, f"no usable GPU: {e}")
             return None
+        usable = self._usable_mb()
+        if ledger.exceeds_capacity(spec.vram_mb, usable):
+            # Permanent, so failing beats queueing forever -- the same call
+            # this function already makes for a box with no GPU.
+            self._fail_pending(
+                spec, f"declared {spec.vram_mb} MiB but only {usable} MiB is "
+                      "usable on this card; it can never be admitted")
+            return None
         cm = gpu_claim(key=key, owner=f"gpuq:{spec.id}", cmd=spec.cmd,
-                       wait=False, directory=self.cfg.claim_dir)
+                       wait=False, directory=self.cfg.claim_dir,
+                       vram_mb=spec.vram_mb, usable_mb=usable,
+                       own_usage=False)
         try:
-            cm.__enter__()
+            record = cm.__enter__()
         except ClaimBusy as e:
             log.info("%s waiting: %s", spec.id, e)
             return None
-        return cm
+        return cm, record
 
     def _card_pin(self, spec: JobSpec) -> dict:
         """CUDA_VISIBLE_DEVICES for a gpu job, naming the card it was given.
@@ -318,7 +381,8 @@ class Runner:
             return {}
         return {"CUDA_VISIBLE_DEVICES": value}
 
-    def _launch(self, spec: JobSpec, project: ProjectConfig, claim_cm) -> bool:
+    def _launch(self, spec: JobSpec, project: ProjectConfig, claim_cm,
+               claim_record=None) -> bool:
         try:
             workdir = self._prepare_workdir(spec, project)  # git, on the loop
         except Exception as e:
@@ -351,7 +415,14 @@ class Runner:
         spec.runner_pid = os.getpid()
         self.queue.update(spec)  # the reaper reads this to tell live from dead
         self.active[spec.id] = Active(running=running, project=project,
-                                      workdir=workdir, claim_cm=claim_cm)
+                                      workdir=workdir, claim_cm=claim_cm,
+                                      claim_record=claim_record,
+                                      started_mono=time.monotonic())
+        if claim_record is not None:
+            # The card was taken before this process existed. Charging the
+            # record to it now is what lets the watchdog and the orphan
+            # sweep tell this job's VRAM from a co-tenant's.
+            ledger.set_usage_pid(claim_record, running.pid)
         log.info("started %s (%s lane, pid %d)", spec.id, spec.lane, running.pid)
         return True
 
@@ -439,6 +510,12 @@ class Runner:
                                      f"artifacts: {spec.id}", job_id=spec.id)
 
     def _describe_failure(self, spec: JobSpec, result: JobResult) -> str:
+        guilty = self._convicted.pop(spec.id, None)
+        if guilty:
+            return (f"killed for exceeding its declaration: --vram-mb "
+                    f"{guilty['declared']}, actually using {guilty['used']} "
+                    "MiB. Declare what the job really needs, measured as "
+                    "nvidia-smi reports it. Not retried.")
         if result.timed_out:
             return (f"timeout after {spec.timeout_s}s; killed. A hung job "
                     "is a bug, not a transient — not retried.")
