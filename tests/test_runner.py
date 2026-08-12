@@ -805,3 +805,66 @@ def test_a_hang_after_an_oom_line_beside_a_conviction_is_not_retried(
     state, spec = r.queue.find("j1")
     assert state == "failed"
     assert spec.attempts == 0
+
+
+@pytest.fixture
+def gpu_env(env, monkeypatch):
+    """`env` with a card big enough to share and git stubbed out, so these
+    assert on admission rather than on checkout."""
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    r.cfg.gpu_vram_reserve_mb = 512
+    r.cfg.gpu_max_jobs = 2
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: r.queue.work_dir(spec.id))
+    try:
+        yield r, sha
+    finally:
+        r.shutdown()   # no `sleep 5` outliving the test
+
+
+def test_two_declared_gpu_jobs_run_at_once(gpu_env):
+    """Issue #8, end to end: two small jobs share the card where one used
+    to hold all of it."""
+    from gpuqueue import ledger as lg
+    r, sha = gpu_env
+    for i in (1, 2):
+        r.queue.work_dir(f"j{i}").mkdir(parents=True, exist_ok=True)
+        submit(r, sha, f"j{i}", ["sleep", "5"], lane="gpu", vram_mb=3000)
+
+    assert sorted(r.admit()) == ["j1", "j2"]
+    assert len(r.active) == 2
+    records = lg.all_records(r.cfg.claim_dir)
+    assert sorted(x.vram_mb for x in records) == [3000, 3000]
+    assert all(x.usage_pid for x in records), "records must be attributable"
+
+
+def test_a_third_job_waits_on_gpu_max_jobs(gpu_env):
+    r, sha = gpu_env
+    for i in (1, 2, 3):
+        r.queue.work_dir(f"j{i}").mkdir(parents=True, exist_ok=True)
+        submit(r, sha, f"j{i}", ["sleep", "5"], lane="gpu", vram_mb=100)
+    assert len(r.admit()) == 2
+    assert r.queue.find("j3")[0] == "pending"
+
+
+def test_a_fourth_job_waits_on_vram_even_under_the_job_cap(gpu_env):
+    """The safety axis, distinct from the latency one."""
+    r, sha = gpu_env
+    r.cfg.gpu_max_jobs = 4
+    for i in (1, 2, 3):
+        r.queue.work_dir(f"j{i}").mkdir(parents=True, exist_ok=True)
+        submit(r, sha, f"j{i}", ["sleep", "5"], lane="gpu", vram_mb=3000)
+    assert len(r.admit()) == 2          # 3000 + 3000 fits 7676; a third does not
+    assert r.queue.find("j3")[0] == "pending"
+
+
+def test_an_undeclared_gpu_job_still_runs_alone(gpu_env):
+    """The backward-compatibility guarantee, byte for byte."""
+    r, sha = gpu_env
+    for i in (1, 2):
+        r.queue.work_dir(f"j{i}").mkdir(parents=True, exist_ok=True)
+    submit(r, sha, "j1", ["sleep", "5"], lane="gpu")            # undeclared
+    submit(r, sha, "j2", ["sleep", "5"], lane="gpu", vram_mb=100)
+    assert r.admit() == ["j1"]
+    assert r.queue.find("j2")[0] == "pending"
