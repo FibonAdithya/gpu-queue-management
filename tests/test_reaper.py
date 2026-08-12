@@ -296,3 +296,108 @@ def test_an_unledgered_process_is_still_killed(q, tmp_path, monkeypatch):
     killed = []
     monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
     assert reap(q, cfg)["killed_pids"] == [4321]
+
+
+# --- the VRAM watchdog ---------------------------------------------------
+
+def _rec(tmp_path, name, usage_pid, vram_mb, owner="gpuq:j1"):
+    from gpuqueue import ledger as lg
+    return lg.Record(path=lg.ledger_dir("k", tmp_path) / name, pid=_os.getpid(),
+                     usage_pid=usage_pid, vram_mb=vram_mb, owner=owner,
+                     cmd=["python", "t.py"], started_at="2026-08-10T00:00:00Z",
+                     key="k")
+
+
+def test_one_sweep_over_the_line_does_not_convict(tmp_path, monkeypatch):
+    """The caching allocator's high-water mark moves in steps; one sample
+    over is not evidence of a persistent overage."""
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    strikes = {}
+    apps = [{"pid": 500, "used_mb": 3070, "name": "t.py"}]
+    assert rp.check_vram([r], apps, strikes) == []
+    assert strikes[str(r.path)] == 1
+
+
+def test_two_consecutive_sweeps_convict(tmp_path, monkeypatch):
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    strikes = {}
+    apps = [{"pid": 500, "used_mb": 3070, "name": "t.py"}]
+    rp.check_vram([r], apps, strikes)
+    (guilty,) = rp.check_vram([r], apps, strikes)
+    assert guilty["declared"] == 512 and guilty["used"] == 3070
+    assert guilty["owner"] == "gpuq:j1" and guilty["usage_pid"] == 500
+
+
+def test_a_sweep_back_under_the_line_clears_the_strike(tmp_path, monkeypatch):
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    strikes = {}
+    rp.check_vram([r], [{"pid": 500, "used_mb": 3070, "name": "t"}], strikes)
+    rp.check_vram([r], [{"pid": 500, "used_mb": 400, "name": "t"}], strikes)
+    assert strikes == {}
+
+
+def test_an_exclusive_holder_is_never_over(tmp_path, monkeypatch):
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, None)
+    apps = [{"pid": 500, "used_mb": 8000, "name": "t.py"}]
+    rp.check_vram([r], apps, {})
+    assert rp.check_vram([r], apps, {}) == []
+
+
+def test_a_holders_children_count_toward_its_declaration(tmp_path, monkeypatch):
+    """A trainer's dataloader workers hold VRAM under the same record."""
+    from gpuqueue import ledger as lg
+    # ledger.attribute() resolves `descendants` from ledger's own module
+    # namespace (`from .procs import descendants`), not reaper's -- so the
+    # reaper-side stub below never reaches it, and the tree must be stubbed
+    # there too or the test would pass on a check_vram that ignores
+    # descendants entirely. See the identical note in
+    # test_a_ledgered_co_tenants_process_is_not_an_orphan above.
+    monkeypatch.setattr(rp, "descendants",
+                        lambda pid: {501, 502} if pid == 500 else set())
+    monkeypatch.setattr(lg, "descendants",
+                        lambda pid: {501, 502} if pid == 500 else set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    apps = [{"pid": 500, "used_mb": 200, "name": "t"},
+            {"pid": 501, "used_mb": 200, "name": "w"},
+            {"pid": 502, "used_mb": 200, "name": "w"}]
+    strikes = {}
+    rp.check_vram([r], apps, strikes)
+    (guilty,) = rp.check_vram([r], apps, strikes)
+    assert guilty["used"] == 600
+
+
+def test_broken_attribution_convicts_nobody(tmp_path, monkeypatch):
+    """Under MPS nvidia-smi reports the server, not its clients, so every
+    process looks unledgered. That is a broken measurement, not a box full
+    of intruders."""
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    apps = [{"pid": 9999, "used_mb": 8000, "name": "nvidia-cuda-mps-server"}]
+    strikes = {}
+    rp.check_vram([r], apps, strikes)
+    assert rp.check_vram([r], apps, strikes) == []
+    assert strikes == {}
+
+
+def test_a_departed_holder_stops_accruing_strikes(tmp_path, monkeypatch):
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    strikes = {}
+    rp.check_vram([r], [{"pid": 500, "used_mb": 3070, "name": "t"}], strikes)
+    assert rp.check_vram([], [], strikes) == []
+    assert strikes == {}
+
+
+def test_enforce_vram_off_convicts_nobody(q, tmp_path, monkeypatch):
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path,
+                       kill_orphan_cuda=False, enforce_vram=False)
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 500, "used_mb": 8000, "name": "t"}])
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    strikes = {}
+    reap(q, cfg, vram_strikes=strikes)
+    assert reap(q, cfg, vram_strikes=strikes)["convicted"] == []

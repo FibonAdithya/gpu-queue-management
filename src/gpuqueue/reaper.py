@@ -87,30 +87,103 @@ def clean_partials(queue: QueueRoot) -> list[str]:
     return cleaned
 
 
+WATCHDOG_STRIKES = 2
+
+
+def _kill_tree(pid: int) -> bool:
+    """Kill a holder's whole tree, by pid rather than by process group.
+
+    killpg would be shorter and is wrong here: a `gpu-claim` launched from
+    a script shares its group, so the group is not reliably the holder's
+    own. Enumerating descendants kills exactly what the record is charged
+    for and nothing else.
+    """
+    ok = False
+    for p in {pid} | descendants(pid):
+        ok = _kill(p) or ok
+    return ok
+
+
+def check_vram(records: list, apps: list[dict],
+               strikes: dict[str, int]) -> list[dict]:
+    """Convict holders using more than they declared.
+
+    Attribution, not prevention. The victim of an overage OOMs in
+    milliseconds and this convicts in up to two sweeps -- what it buys is
+    that the failure is legible afterwards, instead of two jobs sharing a
+    bare CUDA OOM with nothing to say whose fault it was.
+    """
+    owned, unledgered = ledger.attribute(apps, records)
+    if unledgered and not owned and any(r.usage_pid for r in records):
+        # Every visible process is unattributable while records claim to
+        # own trees: the measurement is broken, not the box overrun. Under
+        # MPS nvidia-smi reports the server rather than its clients, which
+        # looks exactly like this. Convicting here would kill the box's
+        # own work.
+        strikes.clear()
+        return []
+
+    convicted, seen = [], set()
+    for rec in records:
+        if rec.vram_mb is None:
+            continue  # declared the whole card, so it cannot exceed it
+        # Keyed by full path, matching ledger.attribute. A bare filename
+        # is not unique across <key>.lock.d directories, and these strikes
+        # persist across sweeps -- a collision would charge one holder's
+        # strikes to another and kill the wrong job.
+        key = str(rec.path)
+        seen.add(key)
+        used = ledger.used_mb(owned.get(key, []))
+        if used <= rec.vram_mb:
+            strikes.pop(key, None)
+            continue
+        strikes[key] = strikes.get(key, 0) + 1
+        if strikes[key] >= WATCHDOG_STRIKES:
+            strikes.pop(key, None)
+            convicted.append({"owner": rec.owner, "declared": rec.vram_mb,
+                              "used": used, "usage_pid": rec.usage_pid,
+                              "record": rec.name})
+    for key in list(strikes):
+        if key not in seen:
+            strikes.pop(key)  # the holder is gone; its strikes go with it
+    return convicted
+
+
 def reap(queue: QueueRoot, cfg: RunnerConfig,
          active_ids: set[str] | None = None,
-         include_orphan_cuda: bool = True) -> dict:
+         include_orphan_cuda: bool = True,
+         vram_strikes: dict[str, int] | None = None) -> dict:
     """Recover what a dead runner left behind.
 
     Split by cost. Releasing claims, requeueing abandoned jobs and removing
     debris are file operations, cheap enough to run on every tick — and they
     are the recovery path, so they should be. Killing orphaned CUDA processes
-    shells out to nvidia-smi and walks the process tree with ps; it is a
-    safety net with no latency requirement, so the runner puts it on a timer
-    and passes include_orphan_cuda=False the rest of the time.
+    and running the VRAM watchdog both shell out to nvidia-smi and walk the
+    process tree with ps; they are a safety net with no latency requirement,
+    so the runner puts them on a timer and passes include_orphan_cuda=False
+    the rest of the time.
     """
     stale = release_stale(cfg.claim_dir)
     requeued, failed = requeue_orphans(queue, active_ids)
-    killed = []
-    apps = None
-    records = []
-    if include_orphan_cuda:
+    killed, convicted = [], []
+    # Both consumers below need one nvidia-smi call and one ledger scan.
+    # Gate that shared cost on whether either consumer is switched on --
+    # a box with kill_orphan_cuda and enforce_vram both off should pay for
+    # neither on every timer tick.
+    if include_orphan_cuda and (cfg.kill_orphan_cuda or cfg.enforce_vram):
         apps = compute_apps()
         d = cfg.claim_dir if cfg.claim_dir else claim_dir()
         records = ledger.live_records(ledger.all_records(d))
-        if apps is not None and cfg.kill_orphan_cuda:
-            protect = {s.pid for s in queue.list_state("running") if s.pid}
-            killed = kill_orphan_cuda(protect, records, apps)
+        if apps is not None:
+            if cfg.kill_orphan_cuda:
+                protect = {s.pid for s in queue.list_state("running") if s.pid}
+                killed = kill_orphan_cuda(protect, records, apps)
+            if cfg.enforce_vram and vram_strikes is not None:
+                convicted = check_vram(records, apps, vram_strikes)
+                for c in convicted:
+                    if c["usage_pid"]:
+                        _kill_tree(c["usage_pid"])
     cleaned = clean_partials(queue)
     return {"stale_claims": stale, "requeued": requeued, "failed": failed,
-            "killed_pids": killed, "cleaned_paths": cleaned}
+            "killed_pids": killed, "cleaned_paths": cleaned,
+            "convicted": convicted}
