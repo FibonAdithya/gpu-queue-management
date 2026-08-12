@@ -70,10 +70,18 @@ def default_usable_mb() -> int | None:
 
     None when the card cannot be queried, which `ledger.fits` turns into
     exclusive-only admission -- degraded, and the same posture preflight
-    already takes when it cannot enumerate the card.
+    already takes when it cannot enumerate the card. Also None when the
+    card's total is smaller than DEFAULT_RESERVE_MB: an uncapped
+    subtraction would go negative, and `want_mb > usable_mb` in
+    `ledger.fits`/`exceeds_capacity` is then true for every claim,
+    silently admitting nothing instead of degrading the same way a
+    query failure does.
     """
     total = total_vram_mb()
-    return None if total is None else total - ledger.DEFAULT_RESERVE_MB
+    if total is None:
+        return None
+    usable = total - ledger.DEFAULT_RESERVE_MB
+    return usable if usable > 0 else None
 
 
 def list_claims(directory: Path | None = None) -> list[tuple[Path, dict]]:

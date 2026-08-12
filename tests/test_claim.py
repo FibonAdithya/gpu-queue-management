@@ -198,6 +198,16 @@ def test_default_usable_mb_is_none_when_the_card_cannot_be_queried(monkeypatch):
     assert default_usable_mb() is None
 
 
+def test_default_usable_mb_is_none_when_the_reserve_swallows_the_card(
+        monkeypatch):
+    """A card smaller than DEFAULT_RESERVE_MB must not hand a negative
+    usable_mb to ledger.fits/exceeds_capacity, where `want_mb > usable_mb`
+    is then true for every claim -- silently admitting nothing. Same
+    guard as Runner._usable_mb, applied to this sibling path."""
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: 256)
+    assert default_usable_mb() is None
+
+
 def test_job_orphaned_when_the_runner_is_gone():
     """A live job whose runner is dead: nothing enforces its timeout and
     nothing will collect its result."""

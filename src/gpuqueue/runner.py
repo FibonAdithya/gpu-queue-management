@@ -60,6 +60,8 @@ class Runner:
         self._report_cooldowns: dict[str, float] = {}
         self._usable_mb_cache: int | None = None
         self._usable_asked = False
+        # Logged once, not once per admit: see _usable_mb.
+        self._usable_query_warned = False
         # record name -> consecutive sweeps over its declaration
         self._vram_strikes: dict[str, int] = {}
         # job id -> the conviction that killed it, so _describe_failure can
@@ -242,30 +244,51 @@ class Runner:
 
     # --- admission ----------------------------------------------------
     def _usable_mb(self) -> int | None:
-        """Cached: a card's total does not change, and this would otherwise
-        run nvidia-smi on every admit, on the loop that also polls jobs."""
-        if not self._usable_asked:
-            self._usable_asked = True
-            total = self.cfg.gpu_vram_mb
+        """Cached, but only once there is an answer worth caching.
+
+        A card's total does not change, so a query that succeeds is
+        cached -- otherwise this is an nvidia-smi subprocess on every
+        admit, on the loop that also polls every running job. A query
+        that *fails* is not cached: a subprocess hiccup, a timeout while
+        the box is under load, or brief driver contention is not exotic
+        on a box whose whole purpose is GPU jobs, and latching that as
+        "unqueryable forever" would silently degrade the GPU lane to
+        exclusive-only admission for the rest of the daemon's life, with
+        no way back short of a restart. Returning None uncached here
+        means the next admit tries again.
+        """
+        if self._usable_asked:
+            return self._usable_mb_cache
+        total = self.cfg.gpu_vram_mb
+        if total is None:
+            total = total_vram_mb()
             if total is None:
-                total = total_vram_mb()
-            usable = (None if total is None
-                      else total - self.cfg.gpu_vram_reserve_mb)
-            # config.load_config rejects a reserve >= gpu_vram_mb, but only
-            # on that explicit path -- it has no card to check against. On
-            # the default "ask the card" path a card that genuinely reports
-            # less than the reserve is possible, and a negative number here
-            # would flow straight into ledger.fits/exceeds_capacity, where
-            # `want_mb > usable_mb` is always true and nothing is ever
-            # admitted -- silently, with no error to explain why. Folding
-            # it into "the card could not be queried" gets the same
-            # degraded, exclusive-only posture preflight already takes,
-            # with a legible cause instead of a card that mysteriously
-            # never admits.
-            if usable is not None and usable <= 0:
-                usable = None
-            self._usable_mb_cache = usable
-        return self._usable_mb_cache
+                if not self._usable_query_warned:
+                    log.warning("could not query the card's VRAM total; "
+                               "GPU lane admits exclusive-only until this "
+                               "succeeds")
+                    self._usable_query_warned = True
+                return None
+        usable = total - self.cfg.gpu_vram_reserve_mb
+        # config.load_config rejects a reserve >= gpu_vram_mb, but only on
+        # that explicit path -- it has no card to check against. On the
+        # default "ask the card" path a card that genuinely reports less
+        # than the reserve is possible, and a negative number here would
+        # flow straight into ledger.fits/exceeds_capacity, where `want_mb
+        # > usable_mb` is always true and nothing is ever admitted --
+        # silently, with no error to explain why. This is a real, static
+        # answer (the query above succeeded), not a transient failure, so
+        # it is cached like any other successful query rather than
+        # re-querying every admit for the same result.
+        if usable <= 0:
+            log.warning("gpu_vram_reserve_mb (%s) leaves no usable VRAM "
+                       "out of %s MiB reported by the card; GPU lane "
+                       "admits exclusive-only", self.cfg.gpu_vram_reserve_mb,
+                       total)
+            usable = None
+        self._usable_asked = True
+        self._usable_mb_cache = usable
+        return usable
 
     def _capacity(self, lane: str) -> int:
         limit = (self.cfg.cpu_slots if lane == "cpu"

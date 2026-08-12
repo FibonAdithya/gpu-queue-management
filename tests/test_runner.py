@@ -636,6 +636,19 @@ def test_usable_mb_is_queried_once(env, monkeypatch):
     assert len(calls) == 1
 
 
+def test_usable_mb_retries_after_a_failed_query(env, monkeypatch):
+    """A failed query must not latch as 'unqueryable forever' -- a
+    transient nvidia-smi hiccup would otherwise degrade the GPU lane to
+    exclusive-only admission for the rest of the daemon's life. Only a
+    successful answer is cached."""
+    r, _ = env
+    r.cfg.gpu_vram_mb = None
+    answers = iter([None, 8188])
+    monkeypatch.setattr(rn, "total_vram_mb", lambda: next(answers))
+    assert r._usable_mb() is None
+    assert r._usable_mb() == 8188 - r.cfg.gpu_vram_reserve_mb
+
+
 def test_a_declaration_bigger_than_the_card_fails_rather_than_queues(env):
     """A permanent condition. Leaving it pending queues it forever, which
     is the mistake `_take_card` already avoids for a box with no GPU."""
