@@ -28,7 +28,6 @@ def test_compute_apps_missing_smi_means_cannot_see(monkeypatch):
 def test_foreign_excludes_allowed_pids(monkeypatch):
     monkeypatch.setattr(pf, "compute_apps",
                         lambda: [{"pid": 1234, "used_mb": 1, "name": "python"}])
-    monkeypatch.setattr(pf, "own_pids", lambda: set())
     assert foreign_processes(allow={1234}) == []
 
 def test_foreign_excludes_own_pids(monkeypatch):
@@ -39,13 +38,11 @@ def test_foreign_excludes_own_pids(monkeypatch):
 def test_foreign_reports_stranger(monkeypatch):
     monkeypatch.setattr(pf, "compute_apps",
                         lambda: [{"pid": 4321, "used_mb": 900, "name": "train.py"}])
-    monkeypatch.setattr(pf, "own_pids", lambda: set())
     assert [p["pid"] for p in foreign_processes()] == [4321]
 
 def test_preflight_raises_naming_pid_and_command(monkeypatch):
     monkeypatch.setattr(pf, "compute_apps",
                         lambda: [{"pid": 4321, "used_mb": 900, "name": "train.py"}])
-    monkeypatch.setattr(pf, "own_pids", lambda: set())
     with pytest.raises(PreflightFailed) as e:
         pf.preflight()
     assert "4321" in str(e.value) and "train.py" in str(e.value)
@@ -93,7 +90,16 @@ def test_a_ledgered_co_tenant_is_not_contention(tmp_path, monkeypatch):
     _record(tmp_path, os.getpid(), os.getpid())
     monkeypatch.setattr(pf, "compute_apps",
                         lambda: [{"pid": 5150, "used_mb": 400, "name": "co.py"}])
-    monkeypatch.setattr(pf, "descendants",
+    # descendants(os.getpid()) must stay empty so this process's own
+    # exempt set can't accidentally cover 5150 and let the test pass for
+    # the wrong reason.
+    monkeypatch.setattr(pf, "descendants", lambda pid: set())
+    # ledger.attribute() walks its *own* `descendants` (imported directly
+    # in ledger.py), never preflight's. Guarding on the record's
+    # usage_pid is what actually puts 5150 in the co-tenant's tree, so
+    # ledger attribution -- not the own-process exemption -- is what
+    # preflight relies on here.
+    monkeypatch.setattr(lg, "descendants",
                         lambda pid: {5150} if pid == os.getpid() else set())
     pf.preflight(directory=tmp_path)
 
