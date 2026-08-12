@@ -26,6 +26,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu-index", type=int, default=0)
     p.add_argument("--status", action="store_true", help="print live claims")
     p.add_argument("--reap", action="store_true", help="release dead claims")
+    p.add_argument("--vram-mb", dest="vram_mb", type=int, default=None,
+                   help="VRAM this command needs, in MiB as nvidia-smi "
+                        "reports it. Omit to take the whole card.")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     return p
 
@@ -104,7 +107,8 @@ def main(argv: list[str] | None = None) -> int:
             return EX_UNAVAILABLE
 
     try:
-        with gpu_claim(key=key, owner=args.owner, cmd=cmd, wait=args.wait):
+        with gpu_claim(key=key, owner=args.owner, cmd=cmd, wait=args.wait,
+                       vram_mb=args.vram_mb):
             return subprocess.run(cmd, env=_child_env(args.gpu_index)).returncode
     except ClaimBusy as e:
         print(f"gpu-claim: {e}", file=sys.stderr)

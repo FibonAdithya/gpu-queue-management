@@ -286,3 +286,30 @@ def test_bug_refuses_an_empty_body(cfg_file, reports, capsys):
     reports with no prose."""
     assert main(["bug", "--config", str(cfg_file), "t", "--body", "  "]) == 2
     assert reports == []
+
+
+def test_submit_records_the_declaration(tmp_path, capsys):
+    rc = main(["--queue-root", str(tmp_path), "submit", "--project", "p",
+               "--commit", "abc", "--branch", "main", "--lane", "gpu",
+               "--vram-mb", "512", "--", "python", "t.py"])
+    assert rc == 0
+    job_id = capsys.readouterr().out.strip()
+    body = json.loads((tmp_path / "pending" / f"{job_id}.json").read_text())
+    assert body["vram_mb"] == 512
+
+
+def test_submit_without_a_declaration_takes_the_whole_card(tmp_path, capsys):
+    main(["--queue-root", str(tmp_path), "submit", "--project", "p",
+          "--commit", "abc", "--branch", "main", "--lane", "gpu",
+          "--", "python", "t.py"])
+    job_id = capsys.readouterr().out.strip()
+    body = json.loads((tmp_path / "pending" / f"{job_id}.json").read_text())
+    assert body["vram_mb"] is None
+
+
+def test_submit_rejects_a_nonsense_declaration(tmp_path, capsys):
+    rc = main(["--queue-root", str(tmp_path), "submit", "--project", "p",
+               "--commit", "abc", "--branch", "main", "--lane", "gpu",
+               "--vram-mb", "0", "--", "python", "t.py"])
+    assert rc == 2
+    assert "vram_mb" in capsys.readouterr().err

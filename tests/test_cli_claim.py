@@ -28,6 +28,38 @@ def test_busy_exits_75(monkeypatch, capsys):
     assert cli_claim.main(["--", "true"]) == 75
     assert "999" in capsys.readouterr().err
 
+
+def test_gpu_claim_passes_the_declaration_through(tmp_path, monkeypatch):
+    seen = {}
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_claim(**kw):
+        seen.update(kw)
+        yield None
+
+    monkeypatch.setattr(cli_claim, "gpu_claim", fake_claim)
+    monkeypatch.setattr(cli_claim, "gpu_key", lambda index=0: "k")
+    monkeypatch.setattr(cli_claim, "preflight", lambda: None)
+    cli_claim.main(["--vram-mb", "512", "--", "true"])
+    assert seen["vram_mb"] == 512
+
+
+def test_gpu_claim_without_a_declaration_takes_the_whole_card(tmp_path, monkeypatch):
+    seen = {}
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_claim(**kw):
+        seen.update(kw)
+        yield None
+
+    monkeypatch.setattr(cli_claim, "gpu_claim", fake_claim)
+    monkeypatch.setattr(cli_claim, "gpu_key", lambda index=0: "k")
+    monkeypatch.setattr(cli_claim, "preflight", lambda: None)
+    cli_claim.main(["--", "true"])
+    assert seen["vram_mb"] is None
+
 def test_preflight_failure_exits_69(monkeypatch, capsys):
     def fail(allow=None, directory=None):
         raise PreflightFailed("pid 4321 train.py")

@@ -44,6 +44,7 @@ def _cmd_submit(args) -> int:
         artifacts=args.artifact,
         timeout_s=args.timeout_s,
         dedupe_key=args.dedupe_key,
+        vram_mb=args.vram_mb,
     )
     try:
         job_id = q.submit(spec)
@@ -193,6 +194,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--artifact", action="append", default=[])
     s.add_argument("--timeout-s", dest="timeout_s", type=int, default=3600)
     s.add_argument("--dedupe-key", dest="dedupe_key", default=None)
+    s.add_argument("--vram-mb", dest="vram_mb", type=int, default=None,
+                   help="VRAM this job needs, in MiB as nvidia-smi reports "
+                        "it (so including the ~250 MiB CUDA context and the "
+                        "allocator's high-water mark, not torch's "
+                        "max_memory_allocated). Omit to take the whole card.")
     s.add_argument("--wait", action="store_true",
                    help="block until the job finishes, then exit with its result")
     s.add_argument("--timeout", type=float, default=None,
