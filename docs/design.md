@@ -202,6 +202,18 @@ property that matters when something is stuck is that `ls` shows who is on
 the card and `rm` clears one wedged holder. A shared mutated document gives
 both up exactly then, since a torn write blinds every participant at once.
 
+Release is symmetric to acquire, and it is not optional: a holder removes
+its own record when it is done. `gpu_claim` does this in a `finally`, so a
+normal exit, an exception and a signal all release the same way. This has
+to be explicit because nothing else will do it — a live pid is a live
+holder as far as the ledger is concerned, so a process that keeps running
+after it is done with the card, but never removes its record, keeps its
+declared VRAM off the ledger for everyone else until it exits. Records
+left behind by a pid that is already dead are a different case, covered
+by cleanup rather than protocol: `release_stale` clears those every poll,
+which is recovery from a crash, not a substitute for a holder releasing
+itself.
+
 Enforcement stays advisory, with two additions. Preflight refuses to start
 when it finds a CUDA process no live record accounts for. And a watchdog on
 the reaper's sweep kills a holder using more than it declared, on two

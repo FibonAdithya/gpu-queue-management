@@ -25,7 +25,7 @@ same box should get scheduling without reimplementing it.
 
 | | |
 |---|---|
-| `gpu-claim` | Advisory lock keyed on the GPU UUID, with a preflight that refuses to start when foreign CUDA processes hold the card. Wraps any command. |
+| `gpu-claim` | Advisory lock keyed on the GPU UUID, with a preflight that refuses to start on an unledgered CUDA process. Wraps any command. |
 | `gpuq` | Submit, list, inspect and cancel jobs. |
 | `gpuq-runner` | Supervisor-managed daemon. Admits CPU jobs concurrently and GPU jobs against their declared VRAM, reaps dead claims, commits artifacts. |
 | `bootstrap.sh` | Takes a bare box to a working runner, idempotently. |
