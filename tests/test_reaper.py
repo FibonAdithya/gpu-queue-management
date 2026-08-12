@@ -27,6 +27,10 @@ def no_gpu_calls(monkeypatch):
     monkeypatch.setattr(rp, "release_stale", lambda directory=None: [])
     monkeypatch.setattr(rp, "compute_apps", lambda: [])
     monkeypatch.setattr(rp, "own_pids", lambda: set())
+    # Attribution now walks each record's process tree; without this every
+    # test using the stubbed compute_apps() would also need to know about
+    # ledger.attribute's internals.
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
 
 def test_requeues_running_job_with_dead_pid(q, cfg):
     q.submit(mkspec())
@@ -137,7 +141,8 @@ def test_reap_can_skip_the_expensive_cuda_sweep(tmp_path, monkeypatch):
     from gpuqueue.reaper import reap
     import gpuqueue.reaper as rp
     called = []
-    monkeypatch.setattr(rp, "kill_orphan_cuda", lambda protect: called.append(1) or [])
+    monkeypatch.setattr(rp, "kill_orphan_cuda",
+                        lambda protect, records, apps: called.append(1) or [])
     q = QueueRoot(tmp_path / "q"); q.ensure_dirs()
     cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path / "c")
     reap(q, cfg, include_orphan_cuda=False)
@@ -255,3 +260,39 @@ def test_does_not_kill_a_direct_gpu_claim_run(q, direct_claim, monkeypatch):
         _time.sleep(0.05)
     assert _live(child), "SIGKILLed a legitimate direct gpu-claim run"
     assert result["killed_pids"] == []
+
+
+def test_a_ledgered_co_tenants_process_is_not_an_orphan(q, tmp_path, monkeypatch):
+    """The whole point of sharing: a declared holder's CUDA process is
+    someone else's job, not debris."""
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    lg.write_record(lg.Record(
+        path=lg.ledger_dir("k", tmp_path) / f"{_os.getpid()}.aaa.json",
+        pid=_os.getpid(), usage_pid=_os.getpid(), vram_mb=512, owner="co",
+        cmd=[], started_at="2026-08-10T00:00:00Z", key="k"))
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 5150, "used_mb": 400, "name": "co.py"}])
+    monkeypatch.setattr(rp, "descendants",
+                        lambda pid: {5150} if pid == _os.getpid() else set())
+    # ledger.attribute() walks its *own* `descendants` (imported directly
+    # in ledger.py), never reaper's -- patching rp.descendants above
+    # cannot reach it. This is what actually puts 5150 in the co-tenant's
+    # tree; see the identical note in tests/test_preflight.py, which hit
+    # the same thing.
+    monkeypatch.setattr(lg, "descendants",
+                        lambda pid: {5150} if pid == _os.getpid() else set())
+    monkeypatch.setattr(rp, "_kill", lambda pid: pytest.fail("killed a co-tenant"))
+    assert reap(q, cfg)["killed_pids"] == []
+
+
+def test_an_unledgered_process_is_still_killed(q, tmp_path, monkeypatch):
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 4321, "used_mb": 900, "name": "x.py"}])
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    killed = []
+    monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
+    assert reap(q, cfg)["killed_pids"] == [4321]

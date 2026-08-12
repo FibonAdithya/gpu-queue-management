@@ -7,9 +7,11 @@ import shutil
 import signal
 from pathlib import Path
 
-from .claim import release_stale, pid_alive
+from . import ledger
+from .claim import release_stale, claim_dir
 from .config import RunnerConfig
 from .preflight import compute_apps, own_pids
+from .procs import descendants, pid_alive
 from .queue import QueueRoot
 
 MAX_ATTEMPTS = 1
@@ -44,13 +46,18 @@ def requeue_orphans(queue: QueueRoot,
     return requeued, failed
 
 
-def kill_orphan_cuda(protect: set[int]) -> list[int]:
-    apps = compute_apps()
-    if apps is None:
-        return []  # cannot see the list; killing blind is worse than leaking
+def kill_orphan_cuda(protect: set[int], records: list, apps: list[dict]) -> list[int]:
+    """Kill CUDA processes no live claim accounts for.
+
+    Takes `apps` rather than fetching them so one nvidia-smi call serves
+    both this and the VRAM watchdog; takes `records` so ownership is
+    decided by the same `ledger.attribute` preflight uses, rather than by
+    a second, subtly different pid set.
+    """
+    _, unledgered = ledger.attribute(apps, records)
     exempt = set(protect) | own_pids()
     killed = []
-    for app in apps:
+    for app in unledgered:
         if app["pid"] not in exempt and _kill(app["pid"]):
             killed.append(app["pid"])
     return killed
@@ -95,9 +102,15 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
     stale = release_stale(cfg.claim_dir)
     requeued, failed = requeue_orphans(queue, active_ids)
     killed = []
-    if include_orphan_cuda and cfg.kill_orphan_cuda:
-        protect = {s.pid for s in queue.list_state("running") if s.pid}
-        killed = kill_orphan_cuda(protect)
+    apps = None
+    records = []
+    if include_orphan_cuda:
+        apps = compute_apps()
+        d = cfg.claim_dir if cfg.claim_dir else claim_dir()
+        records = ledger.live_records(ledger.all_records(d))
+        if apps is not None and cfg.kill_orphan_cuda:
+            protect = {s.pid for s in queue.list_state("running") if s.pid}
+            killed = kill_orphan_cuda(protect, records, apps)
     cleaned = clean_partials(queue)
     return {"stale_claims": stale, "requeued": requeued, "failed": failed,
             "killed_pids": killed, "cleaned_paths": cleaned}
