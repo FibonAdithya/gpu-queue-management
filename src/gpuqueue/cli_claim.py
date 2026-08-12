@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 
 from .claim import gpu_claim, ClaimBusy, release_stale, list_claims
-from .gpuid import gpu_key, GpuIdError
+from .gpuid import gpu_key, cuda_visible_value, GpuIdError
 from .preflight import preflight, PreflightFailed
 
 EX_UNAVAILABLE = 69
@@ -27,6 +28,49 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reap", action="store_true", help="release dead claims")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     return p
+
+
+def _child_env(gpu_index: int) -> dict:
+    """The command's environment, pinned to the card we just claimed.
+
+    Holding the lock is what says the card is yours; the pin is what lets the
+    command act on that without guessing. It matters for consumers that refuse
+    to guess -- a trainer resolving `device: auto` under a strict policy has no
+    way to know which card it was given unless something says so.
+
+    An existing setting wins. The runner's jobs can override the pin from
+    inside their own command, but gpu-claim's caller can only express intent
+    through the environment they invoke us with, so treat that as deliberate.
+    Unset when no uuid is available, which leaves behaviour exactly as it was.
+
+    Two qualifications on "an existing setting wins":
+
+    An *empty* setting does not count as one. `export CUDA_VISIBLE_DEVICES=
+    ${SOMETHING}` with SOMETHING unset leaves the variable present and empty,
+    which the driver reads as "no cards at all" -- a child that holds the card
+    and cannot use it. That is a broken wrapper, not an intent.
+
+    A setting naming a *different* card is still honoured, but not silently.
+    The lock is then held on one card while the command runs on another, which
+    is precisely the collision this pin exists to prevent; two claimants with
+    different --gpu-index can both land on card 0 while holding distinct locks.
+    We cannot tell that from a deliberate override, so we say so and continue.
+    """
+    env = dict(os.environ)
+    value = cuda_visible_value(gpu_index)
+    caller = env.get("CUDA_VISIBLE_DEVICES", "")
+    if caller.strip():
+        if value is not None and caller.strip() != value:
+            print(f"gpu-claim: warning: CUDA_VISIBLE_DEVICES={caller} was "
+                  f"already set and names a different card than the one "
+                  f"claimed ({value}); honouring your setting, so the lock "
+                  f"and the run may disagree", file=sys.stderr)
+        return env
+    if value is not None:
+        env["CUDA_VISIBLE_DEVICES"] = value
+    else:
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+    return env
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -61,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with gpu_claim(key=key, owner=args.owner, cmd=cmd, wait=args.wait):
-            return subprocess.run(cmd).returncode
+            return subprocess.run(cmd, env=_child_env(args.gpu_index)).returncode
     except ClaimBusy as e:
         print(f"gpu-claim: {e}", file=sys.stderr)
         return EX_TEMPFAIL

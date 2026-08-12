@@ -56,3 +56,31 @@ def test_nvidia_smi_returns_none_when_missing(monkeypatch):
         raise FileNotFoundError("nvidia-smi")
     monkeypatch.setattr(gpuid, "_run", boom)
     assert gpuid.gpu_uuid_from_nvidia_smi(0) is None
+
+
+# --- pinning a job to the claimed card ---------------------------------------
+# `gpu_key` is deliberately normalized (lowercased, prefix stripped) because it
+# names a lock file. CUDA_VISIBLE_DEVICES is a different consumer: the driver
+# matches the uuid as the driver spells it, so the pin value must not be put
+# through that normalization.
+
+def test_cuda_visible_value_keeps_the_driver_spelling(monkeypatch):
+    monkeypatch.setattr(gpuid, "gpu_uuid_from_nvidia_smi",
+                        lambda i=0: f"GPU-{HEX.upper()}")
+    assert gpuid.cuda_visible_value() == f"GPU-{HEX.upper()}"
+
+
+def test_cuda_visible_value_is_none_without_a_uuid(monkeypatch):
+    # The name-index fallback is a usable *lock key* but not a thing the CUDA
+    # driver can resolve, so pinning must decline rather than emit garbage.
+    monkeypatch.setattr(gpuid, "gpu_uuid_from_nvidia_smi", lambda i=0: None)
+    monkeypatch.setattr(gpuid, "gpu_name_index_fallback",
+                        lambda i=0: "NVIDIA GeForce RTX 4060-0")
+    assert gpuid.cuda_visible_value() is None
+
+
+def test_cuda_visible_value_is_none_when_smi_is_missing(monkeypatch):
+    def boom(argv):
+        raise FileNotFoundError("nvidia-smi")
+    monkeypatch.setattr(gpuid, "_run", boom)
+    assert gpuid.cuda_visible_value() is None

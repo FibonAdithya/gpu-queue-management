@@ -78,5 +78,37 @@ def gpu_key(index: int = 0) -> str:
     )
 
 
+def cuda_visible_value(index: int = 0) -> str | None:
+    """What to put in CUDA_VISIBLE_DEVICES to pin a job to this card.
+
+    Deliberately *not* `gpu_key`. That one is normalized -- lowercased, prefix
+    stripped -- because it names a lock file, and two spellings of one card
+    have to collapse to one lock. The CUDA driver is a different consumer: it
+    resolves the uuid as the driver itself spells it, so this returns
+    nvidia-smi's own string untouched.
+
+    An index would be the obvious alternative and is wrong for the same reason
+    the lock is not keyed on one: it is not stable under a remap, so pinning
+    "0" means "whichever card this process happens to see first" -- the guess
+    the pin exists to eliminate.
+
+    Returns None when no uuid is available. `gpu_name_index_fallback` is good
+    enough to key a lock, since any shared string serializes the card, but it
+    is not something the driver can resolve. There is then nothing honest to
+    pin to and the caller should leave the variable alone.
+
+    Not MIG-aware. `--query-gpu=uuid` always reports the *physical* card's
+    "GPU-<hex>"; on a MIG-partitioned card CUDA only accepts the instance's
+    "MIG-<hex>" and a job pinned to the physical uuid sees no devices at all.
+    Note that the degraded path above does not save us there -- a uuid *is*
+    returned, just not one the driver will take. Nothing on this box uses MIG
+    (`_PREFIX` accepts the spelling only because a lock key may arrive from
+    another tool), so this is a note for whoever grows the fleet, not a bug
+    with a victim today.
+    """
+    raw = gpu_uuid_from_nvidia_smi(index)
+    return raw.strip() if raw and raw.strip() else None
+
+
 def lock_filename(key: str) -> str:
     return _UNSAFE.sub("-", key) + ".lock"
