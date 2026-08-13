@@ -42,7 +42,8 @@ producer (agent / human)
 $QUEUE_ROOT/pending/<id>.json
       │
       ├──► cpu lane ── N concurrent (default 4)
-      └──► gpu lane ── 1 slot, behind gpu-claim
+      └──► gpu lane ── admitted against declared VRAM,
+                       capped at gpu_max_jobs (default 2)
                           │
                           ▼
                      gpuq-runner
@@ -52,6 +53,26 @@ $QUEUE_ROOT/pending/<id>.json
 The CPU default is **4** rather than the core count. Typical CPU jobs here are
 BLAS-bound and already thread internally; admitting one per core
 oversubscribes and slows everything. Tune per box, and measure before tuning.
+
+The GPU lane admits against capacity rather than a count. A job declares
+`--vram-mb`; admission sums the declarations of current holders against the
+card's total less a reserve. A job that declares nothing takes the whole
+card, which is what makes the change invisible to anything written before
+it.
+
+Two dimensions, doing different jobs. Declared VRAM is a **safety** budget:
+it is what stops a co-tenant turning into an OOM. `gpu_max_jobs` is a
+**latency** budget: VRAM alone would admit sixteen 500 MiB jobs onto an 8 GB
+card, all time-slicing, each slower than it would have been queued — and
+with independent submitters that cost lands on a stranger.
+
+Both are enforced in the ledger, against every holder of the card. The
+runner's own `_capacity("gpu")` still refuses past `gpu_max_jobs`, but only
+as a cheap pre-filter that avoids taking the mutex — the authority is
+`ledger.acquire`, because a cap the runner applied to its own lane alone
+would leave four hand-run `gpu-claim`s on the card and the runner would then
+admit two more on top. "With independent submitters that cost lands on a
+stranger" is precisely the case where the submitters are not this runner.
 
 ## Queue
 
@@ -166,23 +187,55 @@ crash-looping job occupies the only card indefinitely.
 gpu-claim -- python -m src.train --config ...
 ```
 
-Three things must be pinned for independent implementations to interoperate:
+Four things must be pinned for independent implementations to interoperate:
 
 | | |
 |---|---|
 | Lock path | fixed directory (`$GPU_CLAIM_DIR`, default `/var/lock/gpu`), file named by GPU UUID |
-| Key derivation | `torch.cuda.get_device_properties(dev).uuid`; fall back to `name-index` on builds without `.uuid` |
-| Claim file | JSON alongside the lock: `pid`, `owner`, `cmd`, `started_at` |
+| Key derivation | the card's UUID, lowercased with any `GPU-`/`MIG-` prefix stripped; fall back to `name-index` where no UUID is reported. gpuq reads it from `nvidia-smi` and never imports torch (see `gpuid.py`); an implementation that reads `torch.cuda.get_device_properties(dev).uuid` gets the bare hex where nvidia-smi gives `GPU-<hex>`, and `gpuid.normalize_gpu_uuid` is what makes those one key rather than two locks on one card |
+| Ledger | `<key>.lock.d/<pid>.<token>.json` per holder: `pid`, `usage_pid`, `vram_mb`, `owner`, `cmd`, `started_at`, `key` |
+| Mutex | `<key>.lock`, `flock`ed only while reading the ledger and writing one record |
 
 Keying on the UUID rather than the index is not cosmetic. Two processes with
 different `CUDA_VISIBLE_DEVICES` mappings both see their card as index 0, so an
 index-keyed lock hands them different locks for the same physical GPU.
 
-Enforcement stays **advisory** — `flock` cannot be otherwise between
-unprivileged processes — with one addition. Preflight queries the card for
-foreign CUDA processes and refuses to start when it finds any, naming the pid
-and command. This cannot stop a determined direct run. It converts accidental
-contention into a fast, readable failure instead of an OOM half an hour in.
+`flock` guards the accounting, not the card. It is taken for the
+milliseconds needed to read the holders, decide, and rename one record into
+place — never for the duration of a run. `vram_mb: null` means exclusive:
+it fits only into an empty ledger and nothing fits alongside it.
+
+A refusal and a permanent refusal are different answers. "The card is full"
+clears when a holder exits, so waiting for it is reasonable and `--wait`
+polls. A declaration larger than the whole card never fits however empty the
+ledger gets, so it is refused up front rather than waited on: `gpu-claim`
+exits 69 (unavailable) rather than 75 (try again later), and the runner fails
+such a job instead of leaving it pending. An implementation that reports the
+permanent case as ordinary busyness gives its callers a loop with no exit.
+
+One record per holder rather than one document listing them, because the
+property that matters when something is stuck is that `ls` shows who is on
+the card and `rm` clears one wedged holder. A shared mutated document gives
+both up exactly then, since a torn write blinds every participant at once.
+
+Release is symmetric to acquire, and it is not optional: a holder removes
+its own record when it is done. `gpu_claim` does this in a `finally`, so a
+normal exit, an exception and a signal all release the same way. This has
+to be explicit because nothing else will do it — a live pid is a live
+holder as far as the ledger is concerned, so a process that keeps running
+after it is done with the card, but never removes its record, keeps its
+declared VRAM off the ledger for everyone else until it exits. Records
+left behind by a pid that is already dead are a different case, covered
+by cleanup rather than protocol: `release_stale` clears those every poll,
+which is recovery from a crash, not a substitute for a holder releasing
+itself.
+
+Enforcement stays advisory, with two additions. Preflight refuses to start
+when it finds a CUDA process no live record accounts for. And a watchdog on
+the reaper's sweep kills a holder using more than it declared, on two
+consecutive samples. Neither prevents an overage — the victim OOMs in
+milliseconds and conviction takes up to two sweeps. What they convert is an
+anonymous CUDA OOM into a named one.
 
 ### Pinning the job to the card
 
@@ -214,7 +267,7 @@ pinned, a warning is logged, and jobs run exactly as they did before.
 | Job exits non-zero | → `failed/`, stderr tail captured into the spec so a consumer reads it without ssh |
 | Runner dies mid-job | supervisor restarts; reaper requeues once via `attempts`, then fails |
 | Wall-clock exceeded | watchdog kills, marks failed, no retry — a hung job is a bug, not a transient |
-| CUDA OOM | detected distinctly and never retried blindly; it is a configuration error to surface |
+| CUDA OOM | a configuration error, not retried — except once, when a co-tenant was convicted of overuse; the convicted holder itself is never a victim |
 | Duplicate submission | deduplicated on `dedupe_key`, returns the existing id |
 | Box destroyed | everything under `$QUEUE_ROOT` is lost; committed artifacts survive in git |
 
@@ -242,3 +295,10 @@ plus a bootstrap run.
   that, retention is the consumer's problem.
 - **Authentication.** Anyone who can write to `$QUEUE_ROOT` can queue work.
   The box's ssh access is the security boundary.
+- **Hard per-process VRAM caps.** MPS (`CUDA_MPS_PINNED_DEVICE_MEM_LIMIT`)
+  or MIG would prevent an overage rather than convict it. MPS needs a
+  daemon; MIG is unavailable on consumer cards; and injecting
+  `torch.cuda.set_per_process_memory_fraction` would end this tool's
+  assuming nothing about what it runs.
+- **Compute or SM-share accounting.** No portable way to declare or measure
+  it. `gpu_max_jobs` is the crude substitute.

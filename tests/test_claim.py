@@ -2,79 +2,429 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import pytest
-from gpuqueue.claim import (gpu_claim, ClaimBusy, read_claim, pid_alive,
-                            list_claims, release_stale)
+from gpuqueue import ledger as lg
+from gpuqueue.claim import (gpu_claim, ClaimBusy, MutexTimeout, read_claim,
+                            pid_alive, list_claims, release_stale,
+                            default_usable_mb)
 
 KEY = "4b8f2c1a-0000-0000-0000-000000000001"
 
-def test_claim_writes_claim_file_with_pid_and_cmd(tmp_path):
+
+def test_claim_writes_a_record_with_pid_and_cmd(tmp_path):
     with gpu_claim(key=KEY, owner="me", cmd=["python", "t.py"],
-                   directory=tmp_path) as c:
-        assert c["pid"] == os.getpid()
+                   directory=tmp_path, usable_mb=7676) as c:
+        assert c.pid == os.getpid()
         (path, body), = list_claims(tmp_path)
         assert body["owner"] == "me"
         assert body["cmd"] == ["python", "t.py"]
         assert body["started_at"].endswith("Z")
 
-def test_claim_file_removed_on_exit(tmp_path):
-    with gpu_claim(key=KEY, directory=tmp_path):
+
+def test_an_undeclared_claim_is_exclusive(tmp_path):
+    """The default is the whole card, which is what keeps every caller
+    written before --vram-mb behaving exactly as it did."""
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676) as c:
+        assert c.vram_mb is None
+        with pytest.raises(ClaimBusy):
+            with gpu_claim(key=KEY, directory=tmp_path, vram_mb=16,
+                           usable_mb=7676):
+                pass
+
+
+def test_two_declared_claims_share_the_card(tmp_path):
+    with gpu_claim(key=KEY, owner="a", directory=tmp_path, vram_mb=3000,
+                   usable_mb=7676):
+        with gpu_claim(key=KEY, owner="b", directory=tmp_path, vram_mb=3000,
+                       usable_mb=7676):
+            assert len(list_claims(tmp_path)) == 2
+
+
+def test_a_declared_claim_is_refused_when_the_card_is_full(tmp_path):
+    with gpu_claim(key=KEY, directory=tmp_path, vram_mb=7000, usable_mb=7676):
+        with pytest.raises(ClaimBusy, match="MiB free"):
+            with gpu_claim(key=KEY, directory=tmp_path, vram_mb=1000,
+                           usable_mb=7676):
+                pass
+
+
+def test_claim_charges_its_own_tree_by_default(tmp_path):
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676) as c:
+        assert c.usage_pid == os.getpid()
+
+
+def test_own_usage_false_leaves_the_record_unattributed(tmp_path):
+    """The runner takes the card before the job process exists."""
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676,
+                   own_usage=False) as c:
+        assert c.usage_pid is None
+
+
+def test_record_removed_on_exit(tmp_path):
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676):
         pass
     assert list_claims(tmp_path) == []
 
-def test_claim_file_removed_on_exception(tmp_path):
+
+def test_record_removed_on_exception(tmp_path):
     with pytest.raises(ValueError):
-        with gpu_claim(key=KEY, directory=tmp_path):
+        with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676):
             raise ValueError("boom")
     assert list_claims(tmp_path) == []
 
-def test_second_claim_in_another_process_is_busy(tmp_path):
-    """flock is per-open-file-description; a real second process is the
-    only honest test of exclusion."""
-    holder = subprocess.Popen(
+
+def test_different_keys_do_not_collide(tmp_path):
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676):
+        with gpu_claim(key="other-uuid", directory=tmp_path, usable_mb=7676):
+            assert len(list_claims(tmp_path)) == 2
+
+
+def test_wait_blocks_until_there_is_room(tmp_path, monkeypatch):
+    """`wait` polls capacity now rather than blocking on flock, because the
+    mutex is released the instant acquire returns."""
+    monkeypatch.setattr("gpuqueue.claim.WAIT_POLL_S", 0.01)
+    holder = lg.acquire(KEY, vram_mb=7000, owner="a", cmd=[],
+                        directory=tmp_path, usable_mb=7676)
+    calls = []
+    real_sleep = __import__("time").sleep
+
+    def freeing_sleep(s):
+        calls.append(s)
+        if len(calls) == 2:
+            lg.remove(holder)
+        real_sleep(0)
+
+    monkeypatch.setattr("gpuqueue.claim.time.sleep", freeing_sleep)
+    with gpu_claim(key=KEY, directory=tmp_path, vram_mb=1000,
+                   usable_mb=7676, wait=True) as c:
+        assert c.vram_mb == 1000
+
+
+def _bounded_poll(limit=5):
+    """A `time.sleep` for the wait loop that fails instead of hanging.
+
+    The bug these two tests cover is a wait that never ends, so a naive
+    stub would regress into a suite that hangs rather than one that fails.
+    """
+    polls = []
+    real_sleep = __import__("time").sleep
+
+    def poll(s):
+        polls.append(s)
+        if len(polls) > limit:
+            raise AssertionError(
+                f"still waiting after {limit} polls: the failed capacity "
+                "query was latched for the whole wait")
+        real_sleep(0)
+    return poll
+
+
+def test_a_wait_re_asks_the_card_after_a_failed_capacity_query(tmp_path,
+                                                               monkeypatch):
+    """A capacity query that failed must not be latched for the whole wait.
+
+    `default_usable_mb` answers None for a card that would not say, and
+    `ledger.fits` reads that as exclusive-only -- so a waiter that asked
+    once, before the loop, polls until the card is *completely empty*.
+    That is hours on a shared box, over an nvidia-smi hiccup that cleared
+    on the next poll. `Runner._usable_mb` declines to cache a failed query
+    for exactly this reason.
+    """
+    lg.acquire(KEY, vram_mb=3000, owner="a", cmd=[], directory=tmp_path,
+               usable_mb=7676)          # a co-tenant, with room beside it
+    answers = iter([None, 7676])
+    monkeypatch.setattr("gpuqueue.claim.default_usable_mb",
+                        lambda index=0: next(answers, 7676))
+    monkeypatch.setattr("gpuqueue.claim.time.sleep", _bounded_poll())
+
+    # usable_mb omitted, so this claim is the one asking the card.
+    with gpu_claim(key=KEY, owner="b", directory=tmp_path, vram_mb=1000,
+                   wait=True) as c:
+        assert c.vram_mb == 1000
+        assert len(list_claims(tmp_path)) == 2
+
+
+def test_a_re_asked_capacity_that_rules_the_claim_out_stops_the_wait(
+        tmp_path, monkeypatch):
+    """The recovered answer gets the same permanence check the first one
+    did. Without it a declaration larger than the whole card, submitted
+    while the query was failing, waits forever for room that can never
+    appear -- the case `CannotEverFit` exists to end.
+    """
+    lg.acquire(KEY, vram_mb=3000, owner="a", cmd=[], directory=tmp_path,
+               usable_mb=7676)
+    answers = iter([None, 7676])
+    monkeypatch.setattr("gpuqueue.claim.default_usable_mb",
+                        lambda index=0: next(answers, 7676))
+    monkeypatch.setattr("gpuqueue.claim.time.sleep", _bounded_poll())
+
+    with pytest.raises(lg.CannotEverFit):
+        with gpu_claim(key=KEY, owner="b", directory=tmp_path, vram_mb=99999,
+                       wait=True):
+            pass
+
+
+def test_an_explicit_none_capacity_is_never_re_derived(tmp_path, monkeypatch):
+    """`usable_mb=None` from the caller means "I asked and the card would
+    not say" -- the distinction the `_ASK_THE_CARD` sentinel exists to
+    keep. Re-deriving a capacity here would have the runner logging
+    exclusive-only while this function shared the card against a number
+    that ignores the runner's configured reserve: one `<key>.lock.d`,
+    two capacities, a double-booked card.
+    """
+    monkeypatch.setattr("gpuqueue.claim.WAIT_POLL_S", 0.01)
+    asked = []
+    monkeypatch.setattr("gpuqueue.claim.default_usable_mb",
+                        lambda index=0: asked.append(1) or 7676)
+    holder = lg.acquire(KEY, vram_mb=3000, owner="a", cmd=[],
+                        directory=tmp_path, usable_mb=7676)
+    real_sleep = __import__("time").sleep
+
+    def freeing_sleep(s):
+        lg.remove(holder)      # only an empty card admits an exclusive claim
+        real_sleep(0)
+
+    monkeypatch.setattr("gpuqueue.claim.time.sleep", freeing_sleep)
+    with gpu_claim(key=KEY, owner="b", directory=tmp_path, vram_mb=1000,
+                   usable_mb=None, wait=True):
+        assert asked == []
+
+
+def _spawn_lock_ex_holder(tmp_path, sleep_s=30):
+    """A detached process holding the real `LOCK_EX` on the mutex path --
+    what a pre-ledger gpu-claim looks like from the outside. A real
+    second process is the only honest way to exercise `_take_mutex`'s
+    timeout: an in-process flock can't contend with itself."""
+    return subprocess.Popen(
         [sys.executable, "-c",
-         "import time,sys;from gpuqueue.claim import gpu_claim;"
-         f"ctx=gpu_claim(key={KEY!r},directory={str(tmp_path)!r});ctx.__enter__();"
-         "print('held',flush=True);time.sleep(30)"],
+         "import fcntl,os,time;"
+         f"fd=os.open({str(lg.mutex_path(KEY, tmp_path))!r},os.O_CREAT|os.O_RDWR,0o666);"
+         f"fcntl.flock(fd,fcntl.LOCK_EX);print('held',flush=True);time.sleep({sleep_s})"],
         stdout=subprocess.PIPE, text=True)
+
+
+def test_wait_true_warns_once_across_several_mutex_timeouts(
+        tmp_path, monkeypatch, capsys):
+    """A MutexTimeout means an old-style gpu-claim holds the mutex itself,
+    which can last hours -- worth one explanation, not one every retry.
+
+    `time.sleep` is not mocked here: `ledger._take_mutex`'s own internal
+    poll shares the one process-wide `time` module with `gpu_claim`'s
+    retry loop, so patching `time.sleep` globally (as the capacity-wait
+    test above does, safely, because that path never touches a real
+    flock) would also collapse `_take_mutex`'s internal polling and
+    change which branch fires. Real, scaled-down durations avoid that
+    trap entirely: the holder lives just long enough for several real
+    `MutexTimeout`s to occur before it exits on its own and the claim
+    goes through.
+    """
+    monkeypatch.setattr(lg, "MUTEX_WAIT_S", 0.03)
+    monkeypatch.setattr("gpuqueue.claim.MUTEX_WAIT_POLL_S", 0.03)
+    holder = _spawn_lock_ex_holder(tmp_path, sleep_s=0.4)
+
+    attempts = []
+    real_acquire = lg.acquire
+
+    def counting_acquire(*a, **kw):
+        attempts.append(1)
+        return real_acquire(*a, **kw)
+
+    monkeypatch.setattr(lg, "acquire", counting_acquire)
     try:
         assert holder.stdout.readline().strip() == "held"
-        with pytest.raises(ClaimBusy):
-            with gpu_claim(key=KEY, directory=tmp_path):
+        with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676,
+                       wait=True) as c:
+            assert c.vram_mb is None  # the claim eventually went through
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+        holder.wait()
+    assert len(attempts) >= 3  # several retries happened before it succeeded
+    err = capsys.readouterr().err
+    assert err.count("gpu-claim: warning:") == 1
+
+
+def test_wait_false_raises_immediately_on_mutex_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(lg, "MUTEX_WAIT_S", 0.05)
+    holder = _spawn_lock_ex_holder(tmp_path)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(MutexTimeout):
+            with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676):
                 pass
     finally:
         holder.kill()
         holder.wait()
 
-def test_different_keys_do_not_collide(tmp_path):
-    with gpu_claim(key=KEY, directory=tmp_path):
-        with gpu_claim(key="other-uuid", directory=tmp_path):
-            assert len(list_claims(tmp_path)) == 2
 
-def test_pid_alive_true_for_self():
-    assert pid_alive(os.getpid()) is True
+def test_release_stale_removes_dead_pid_records(tmp_path):
+    lg.write_record(lg.Record(
+        path=lg.ledger_dir(KEY, tmp_path) / "4000000.dead.json",
+        pid=4000000, usage_pid=4000000, vram_mb=512, owner="ghost",
+        cmd=["x"], started_at="2026-08-10T00:00:00Z", key=KEY))
+    assert [r["owner"] for r in release_stale(tmp_path)] == ["ghost"]
+    assert list_claims(tmp_path) == []
 
-def test_pid_alive_false_for_impossible_pid():
-    assert pid_alive(4000000) is False
 
-def test_release_stale_removes_dead_pid_claims(tmp_path):
-    stale = tmp_path / f"{KEY}.lock.json"
-    stale.write_text(json.dumps(
-        {"pid": 4000000, "owner": "ghost", "cmd": ["x"],
-         "started_at": "2026-08-05T00:00:00Z", "key": KEY}))
-    released = release_stale(tmp_path)
-    assert [r["owner"] for r in released] == ["ghost"]
-    assert not stale.exists()
-
-def test_release_stale_keeps_live_claims(tmp_path):
-    with gpu_claim(key=KEY, directory=tmp_path):
+def test_release_stale_keeps_live_records(tmp_path):
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676):
         assert release_stale(tmp_path) == []
         assert len(list_claims(tmp_path)) == 1
+
 
 def test_read_claim_returns_none_on_garbage(tmp_path):
     p = tmp_path / "bad.lock.json"
     p.write_text("{not json")
     assert read_claim(p) is None
+
+
+def test_default_usable_mb_holds_back_a_reserve(monkeypatch):
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 8188)
+    assert default_usable_mb() == 8188 - lg.DEFAULT_RESERVE_MB
+
+
+def test_default_usable_mb_is_none_when_the_card_cannot_be_queried(monkeypatch):
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: None)
+    assert default_usable_mb() is None
+
+
+def test_default_usable_mb_is_none_when_the_reserve_swallows_the_card(
+        monkeypatch):
+    """A card smaller than DEFAULT_RESERVE_MB must not hand a negative
+    usable_mb to ledger.fits/exceeds_capacity, where `want_mb > usable_mb`
+    is then true for every claim -- silently admitting nothing. Same
+    guard as Runner._usable_mb, applied to this sibling path."""
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 256)
+    assert default_usable_mb() is None
+
+
+def _config(tmp_path, monkeypatch, body):
+    p = tmp_path / "gpuq.toml"
+    p.write_text(body)
+    monkeypatch.setenv("GPUQ_CONFIG", str(p))
+    return p
+
+
+def test_default_usable_mb_follows_the_declared_card_size(tmp_path,
+                                                          monkeypatch):
+    """The runner and a standalone gpu-claim share one <key>.lock.d. An
+    operator who follows docs/deploying.md and declares a card smaller than
+    nvidia-smi reports must not leave the two of them admitting against
+    different totals into it -- that is the double-booking the ledger
+    exists to prevent."""
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 8188)
+    _config(tmp_path, monkeypatch,
+            '[queue]\nroot = "/q"\ngpu_vram_mb = 4096\n')
+    assert default_usable_mb() == 4096 - lg.DEFAULT_RESERVE_MB
+
+
+def test_default_usable_mb_follows_the_declared_reserve(tmp_path, monkeypatch):
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 8188)
+    _config(tmp_path, monkeypatch,
+            '[queue]\nroot = "/q"\ngpu_vram_reserve_mb = 1024\n')
+    assert default_usable_mb() == 8188 - 1024
+
+
+def test_default_usable_mb_sizes_the_card_it_was_asked_about(monkeypatch):
+    """`gpu-claim --gpu-index 1` keys the ledger on card 1 and pins the
+    child to it. Sizing it against card 0 admits a 16 GB claim onto the
+    8 GB card beside it."""
+    cards = {0: 24564, 1: 8188}
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb",
+                        lambda index=0: cards[index])
+    assert default_usable_mb(1) == 8188 - lg.DEFAULT_RESERVE_MB
+
+
+def test_a_declared_card_size_does_not_travel_to_another_index(tmp_path,
+                                                               monkeypatch):
+    """`gpu_vram_mb` describes the card the runner manages -- card 0, the
+    only one `gpu_key()` ever names. Applying it to card 1 would size a
+    card nobody declared. The reserve is a headroom policy rather than a
+    fact about one card, so it still applies."""
+    cards = {0: 24564, 1: 8188}
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb",
+                        lambda index=0: cards[index])
+    _config(tmp_path, monkeypatch,
+            '[queue]\nroot = "/q"\ngpu_vram_mb = 4096\n'
+            'gpu_vram_reserve_mb = 1024\n')
+    assert default_usable_mb(0) == 4096 - 1024
+    assert default_usable_mb(1) == 8188 - 1024
+
+
+def test_a_nonpositive_declaration_is_refused(tmp_path):
+    """A negative declaration *subtracts* from the accounted total in
+    `ledger.fits`, so a holder that declared -5000 lets the next claimant
+    be admitted 5 GB past the end of the card -- the OOM the ledger exists
+    to prevent. Zero is admitted without limit, which is the same failure
+    reached by an unbounded number of co-tenants. `JobSpec.validate`
+    already refuses both on the submit path."""
+    for bad in (0, -5000):
+        with pytest.raises(ValueError, match="positive"):
+            with gpu_claim(key=KEY, directory=tmp_path, vram_mb=bad,
+                           usable_mb=7676):
+                pass
+    assert list_claims(tmp_path) == []
+
+
+def test_an_explicit_usable_none_is_not_re_derived(tmp_path, monkeypatch):
+    """`usable_mb=None` from a caller means "I asked the card and it would
+    not say", which `ledger.fits` turns into exclusive-only admission. It
+    must not be read as "the caller said nothing" and quietly replaced by a
+    capacity this claim was never meant to be admitted against.
+
+    The runner passes `Runner._usable_mb()` straight through, so when that
+    returns None the runner logs "exclusive-only" while gpu-claim would go
+    on sharing the card against `total - DEFAULT_RESERVE_MB` -- ignoring the
+    configured gpu_vram_reserve_mb, and disagreeing with the runner exactly
+    when the card is the thing that cannot be trusted."""
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 8188)
+    with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512, usable_mb=None):
+        with pytest.raises(ClaimBusy):
+            with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512,
+                           usable_mb=None):
+                pass
+
+
+def test_an_omitted_usable_is_still_derived_from_the_card(tmp_path,
+                                                          monkeypatch):
+    """The other half of the same distinction: a caller that says nothing
+    (a hand-run `gpu-claim --vram-mb 512`) still gets capacity discovery."""
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 8188)
+    with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512):
+        with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512) as second:
+            assert second.vram_mb == 512
+
+
+def test_a_declaration_larger_than_the_card_fails_instead_of_waiting(tmp_path):
+    """`--wait` polls for room to appear. Room for a claim bigger than the
+    whole card never appears, so waiting is a silent hang -- and the
+    explanation `busy_message` would have given is swallowed by the loop.
+    The runner already fails such a job rather than queueing it forever;
+    this is the same judgement on the direct path.
+
+    Run on a thread with a deadline rather than asserted directly: before
+    the fix this call never returns, and a test that hangs the suite
+    forever is not a useful way to report that.
+    """
+    outcome = {}
+
+    def attempt():
+        try:
+            with gpu_claim(key=KEY, directory=tmp_path, vram_mb=99999,
+                           usable_mb=7676, wait=True):
+                outcome["result"] = "admitted"
+        except BaseException as e:      # noqa: BLE001 - recorded, then asserted
+            outcome["result"] = e
+
+    t = threading.Thread(target=attempt, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive(), ("gpu-claim --wait is polling for room that can "
+                              "never appear")
+    assert isinstance(outcome["result"], ClaimBusy)
+    assert "99999" in str(outcome["result"])
+    assert "7676" in str(outcome["result"])
 
 
 def test_job_orphaned_when_the_runner_is_gone():
@@ -97,3 +447,43 @@ def test_unknown_owner_is_not_reported_as_orphaned():
     owner is not evidence of an absent one."""
     from gpuqueue.claim import job_orphaned
     assert job_orphaned(os.getpid(), None) is False
+
+
+# --- the holder cap reaches the standalone gpu-claim path ---------------
+
+def test_gpu_claim_honours_the_configured_holder_cap(tmp_path, monkeypatch):
+    """The cap is a property of the card, so the participant with no config
+    of its own has to read the same key the runner does -- otherwise
+    `gpu_max_jobs = 2` is enforced against the runner's own jobs and nothing
+    else, which is the co-tenancy it exists to bound."""
+    import os
+    _config(tmp_path, monkeypatch,
+            '[queue]\nroot = "/q"\ngpu_max_jobs = 1\n')
+    d = tmp_path / "claims"
+    live = os.getpid()
+    lg.write_record(lg.Record(
+        path=lg.ledger_dir("k", d) / f"{live}.a.json", pid=live,
+        usage_pid=live, vram_mb=500, owner="alice", cmd=["train"],
+        started_at="2026-08-10T00:00:00Z", key="k"))
+    with pytest.raises(lg.ClaimBusy, match="1-job limit"):
+        with gpu_claim(key="k", owner="bob", cmd=["train"], directory=d,
+                       vram_mb=500, usable_mb=8000):
+            pass
+
+
+def test_gpu_claim_takes_an_explicit_cap_over_the_config(tmp_path,
+                                                         monkeypatch):
+    """The runner passes its own loaded `gpu_max_jobs` rather than letting
+    this re-read the file, for the same reason it passes `usable_mb`."""
+    import os
+    _config(tmp_path, monkeypatch,
+            '[queue]\nroot = "/q"\ngpu_max_jobs = 1\n')
+    d = tmp_path / "claims"
+    live = os.getpid()
+    lg.write_record(lg.Record(
+        path=lg.ledger_dir("k", d) / f"{live}.a.json", pid=live,
+        usage_pid=live, vram_mb=500, owner="alice", cmd=["train"],
+        started_at="2026-08-10T00:00:00Z", key="k"))
+    with gpu_claim(key="k", owner="bob", cmd=["train"], directory=d,
+                   vram_mb=500, usable_mb=8000, max_holders=4) as rec:
+        assert rec.owner == "bob"

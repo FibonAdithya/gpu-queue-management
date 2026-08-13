@@ -7,9 +7,16 @@ from pathlib import Path
 
 import tomllib  # stdlib from 3.11, which is why 3.11 is the floor
 
+from .ledger import DEFAULT_RESERVE_MB
+
 
 class ConfigError(ValueError):
     """The configuration file is missing or malformed."""
+
+
+# One source of truth with the standalone gpu-claim path, which reads the
+# same key through `max_holders` and has no config to default from.
+DEFAULT_MAX_HOLDERS = 2
 
 
 @dataclass
@@ -61,12 +68,127 @@ class AutofixConfig:
 class RunnerConfig:
     queue_root: Path
     cpu_slots: int = 4
+    # None means "ask the card". An explicit value is for boxes where the
+    # query is unavailable or reports something the driver will not
+    # actually hand out.
+    gpu_vram_mb: int | None = None
+    # One source of truth with the standalone gpu-claim path, which needs
+    # the same number and has no config to read it from.
+    gpu_vram_reserve_mb: int = DEFAULT_RESERVE_MB
+    # A latency budget, not a safety one. VRAM accounting alone would admit
+    # sixteen 500 MiB jobs onto an 8 GB card, all time-slicing, each slower
+    # than it would have been queued -- and with independent submitters
+    # that cost lands on a stranger. Two is what has been measured (15% to
+    # 62% utilization); raise it on a box that has measured more.
+    #
+    # Enforced in `ledger.acquire`, which counts every holder of the card,
+    # not just in `Runner._capacity`, which counts only this runner's own
+    # jobs. A budget the hand-run `gpu-claim` path walked past was not
+    # bounding the contention it was written to bound.
+    gpu_max_jobs: int = DEFAULT_MAX_HOLDERS
+    enforce_vram: bool = True
     poll_interval_s: float = 2.0
     claim_dir: Path | None = None
     kill_orphan_cuda: bool = True
     orphan_cuda_interval_s: float = 60.0
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     autofix: AutofixConfig = field(default_factory=AutofixConfig)
+
+
+_TRUE = {"true", "yes", "on", "1"}
+_FALSE = {"false", "no", "off", "0"}
+
+
+def _as_bool(value, key: str, default: bool) -> bool:
+    """A TOML bool, or a spelling of one -- never `bool(value)`.
+
+    `enforce_vram = "false"` (quoted, which TOML accepts as a string) went
+    through `bool("false")` and came out True, switching the watchdog *on*
+    for an operator who wrote it to turn the killing off, and who was told
+    by gpuq.example.toml that it was an off switch. Anything that is not
+    obviously one or the other is a ConfigError: a config this file cannot
+    read is worth a loud failure at startup, where guessing is worth a
+    dead job hours later.
+
+    `0` and `1` are accepted because `bool(value)` accepted them: a
+    stricter reader is worth an unreadable string, and not worth refusing
+    to start the daemon on a config that already worked before an upgrade.
+    Any other int is as unreadable as "sometimes".
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):     # before int: bool *is* an int
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in _TRUE:
+            return True
+        if s in _FALSE:
+            return False
+    raise ConfigError(f"{key} must be true or false, got {value!r}")
+
+
+def vram_policy(path: Path | None = None) -> tuple[int | None, int]:
+    """`(gpu_vram_mb, gpu_vram_reserve_mb)`, for callers that are not the runner.
+
+    A standalone `gpu-claim` shares one `<key>.lock.d` with the runner but
+    has no config of its own, so it sized the card from nvidia-smi while
+    the runner sized it from `[queue].gpu_vram_mb`. An operator who follows
+    docs/deploying.md and declares a card smaller than nvidia-smi reports
+    -- the documented fix for a driver that will not hand out what the
+    query claims -- then has two participants admitting against different
+    totals into the same ledger, which is the double-booking the ledger
+    exists to prevent.
+
+    Deliberately not `load_config`: a caller that only wants the card's
+    size must not be refused because `[queue].root` is missing or a project
+    is half-declared. It would fall back to a capacity the runner does not
+    share, which is the divergence this closes. For the same reason an
+    unreadable or absent file is the defaults rather than an error -- that
+    is a box with no runner deployed, and exactly what this path did before
+    there was a config to read.
+    """
+    p = Path(path) if path else default_config_path()
+    try:
+        queue = tomllib.loads(p.read_text()).get("queue") or {}
+        total = queue.get("gpu_vram_mb")
+        total = int(total) if total is not None else None
+        reserve = int(queue.get("gpu_vram_reserve_mb", DEFAULT_RESERVE_MB))
+    except Exception:
+        return None, DEFAULT_RESERVE_MB
+    # load_config rejects these outright, but this reader runs in a process
+    # that has no runner to refuse to start; a nonsense reserve falls back
+    # rather than propagating a negative capacity into ledger.fits.
+    if reserve < 0 or (total is not None and reserve >= total):
+        return total, DEFAULT_RESERVE_MB
+    return total, reserve
+
+
+def max_holders(path: Path | None = None) -> int:
+    """`[queue].gpu_max_jobs`, for callers that are not the runner.
+
+    The cap is a property of the card, not of the runner: it bounds how
+    many processes time-slice on it, and a hand-run `gpu-claim` occupies a
+    slot exactly as a queued job does. Enforced in `ledger.acquire` rather
+    than in `Runner._capacity` alone for that reason, which means this
+    reader is what a standalone claim admits against.
+
+    Defensive in the same three ways `vram_policy` is, and for the same
+    reasons: not `load_config`, an unreadable file is the default rather
+    than an error, and a value `load_config` would reject falls back
+    instead of propagating. A zero or negative cap here would refuse every
+    claim on the box, including the runner's -- silently, with no daemon
+    around to fail loudly at startup.
+    """
+    p = Path(path) if path else default_config_path()
+    try:
+        queue = tomllib.loads(p.read_text()).get("queue") or {}
+        n = int(queue.get("gpu_max_jobs", DEFAULT_MAX_HOLDERS))
+    except Exception:
+        return DEFAULT_MAX_HOLDERS
+    return n if n >= 1 else DEFAULT_MAX_HOLDERS
 
 
 def default_config_path() -> Path:
@@ -86,6 +208,21 @@ def load_config(path: Path) -> RunnerConfig:
     cpu_slots = int(queue.get("cpu_slots", 4))
     if cpu_slots < 1:
         raise ConfigError("[queue].cpu_slots must be >= 1")
+
+    gpu_vram_mb = queue.get("gpu_vram_mb")
+    gpu_vram_mb = int(gpu_vram_mb) if gpu_vram_mb is not None else None
+    gpu_vram_reserve_mb = int(queue.get("gpu_vram_reserve_mb",
+                                        DEFAULT_RESERVE_MB))
+    gpu_max_jobs = int(queue.get("gpu_max_jobs", DEFAULT_MAX_HOLDERS))
+    if gpu_max_jobs < 1:
+        raise ConfigError("[queue].gpu_max_jobs must be >= 1")
+    if gpu_vram_reserve_mb < 0:
+        raise ConfigError("[queue].gpu_vram_reserve_mb must be >= 0")
+    if gpu_vram_mb is not None and gpu_vram_reserve_mb >= gpu_vram_mb:
+        raise ConfigError(
+            f"[queue].gpu_vram_reserve_mb ({gpu_vram_reserve_mb}) must be "
+            f"less than gpu_vram_mb ({gpu_vram_mb}); a reserve that "
+            "swallows the card admits nothing and queues GPU jobs forever")
 
     projects: dict[str, ProjectConfig] = {}
     for name, p in (data.get("project") or {}).items():
@@ -134,9 +271,19 @@ def load_config(path: Path) -> RunnerConfig:
     return RunnerConfig(
         queue_root=Path(root),
         cpu_slots=cpu_slots,
+        gpu_vram_mb=gpu_vram_mb,
+        gpu_vram_reserve_mb=gpu_vram_reserve_mb,
+        gpu_max_jobs=gpu_max_jobs,
+        # The two keys that decide whether gpuq kills something. Every
+        # other bool here still goes through bool(), where a quoted
+        # "false" means a feature quietly stays on rather than a job
+        # being killed -- worth fixing, not worth widening this change.
+        enforce_vram=_as_bool(queue.get("enforce_vram"),
+                              "[queue].enforce_vram", True),
         poll_interval_s=float(queue.get("poll_interval_s", 2.0)),
         claim_dir=Path(claim_dir) if claim_dir else None,
-        kill_orphan_cuda=bool(queue.get("kill_orphan_cuda", True)),
+        kill_orphan_cuda=_as_bool(queue.get("kill_orphan_cuda"),
+                                  "[queue].kill_orphan_cuda", True),
         orphan_cuda_interval_s=float(queue.get("orphan_cuda_interval_s", 60.0)),
         projects=projects,
         autofix=autofix,

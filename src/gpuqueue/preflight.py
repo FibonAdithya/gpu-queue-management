@@ -9,12 +9,16 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from pathlib import Path
 
-from .claim import list_claims, pid_alive
+from . import ledger
+from .claim import claim_dir, list_claims          # noqa: F401 (list_claims
+                                                   # kept for callers)
+from .procs import descendants
 
 
 class PreflightFailed(RuntimeError):
-    """Foreign CUDA processes hold the card."""
+    """CUDA processes hold the card that no live ledger record claims."""
 
 
 def _run(argv: list[str]) -> str:
@@ -50,55 +54,53 @@ def compute_apps() -> list[dict] | None:
     return apps
 
 
-def own_pids() -> set[int]:
-    """Every pid the claim protocol accounts for, including their children.
+def own_pids(directory=None) -> set[int]:
+    """Every pid the claim protocol accounts for, plus this process's own.
 
-    A claim names the process that took the lock, but the process actually
-    on the card is normally its child: `gpu-claim` runs the command as a
-    subprocess, and the runner starts jobs the same way. Expanding only our
-    own tree exempted a direct `gpu-claim` run's recorded pid while leaving
-    the trainer underneath it covered by nothing — so `kill_orphan_cuda`
-    SIGKILLed a legitimate run as an orphan, and preflight read it as
-    foreign contention.
-
-    Roots are collected before they are walked so that the common case —
-    a claim whose pid *is* this process — does not walk the same tree twice.
+    Kept for `reaper.kill_orphan_cuda` and the tests covering it -- an
+    earlier docstring justified it by callers outside this package, and
+    grep finds none. The finer question -- which *record* owns a pid --
+    is `ledger.attribute`. This one is deliberately coarser: it is the
+    last exemption before a SIGKILL, so over-exempting is the safe way to
+    be wrong.
     """
-    roots = {os.getpid()}
-    for _, body in list_claims():
-        pid = int(body.get("pid", -1))
-        if pid > 0 and pid_alive(pid):
-            roots.add(pid)
-    pids = roots | {os.getppid()}
-    for root in roots:
-        pids.update(_descendants(root))
+    pids = {os.getpid(), os.getppid()} | descendants(os.getpid())
+    d = Path(directory) if directory else claim_dir()
+    for rec in ledger.live_records(ledger.all_records(d)):
+        pids.add(rec.pid)
+        if rec.usage_pid is not None:
+            pids.add(rec.usage_pid)
+            pids.update(descendants(rec.usage_pid))
+        else:
+            pids.update(descendants(rec.pid))
     return pids
 
 
-def _descendants(pid: int) -> set[int]:
-    try:
-        out = _run(["ps", "-o", "pid=", "--ppid", str(pid)])
-    except Exception:
-        return set()
-    kids = {int(l) for l in out.split() if l.strip().isdigit()}
-    for k in list(kids):
-        kids |= _descendants(k)
-    return kids
+def unledgered_processes(allow: set[int] | None = None,
+                         directory=None) -> list[dict]:
+    """CUDA processes no live ledger record accounts for.
 
-
-def _foreign(apps: list[dict], allow: set[int] | None) -> list[dict]:
-    exempt = set(allow or set()) | own_pids()
-    return [a for a in apps if a["pid"] not in exempt]
-
-
-def foreign_processes(allow: set[int] | None = None) -> list[dict]:
+    This replaces "foreign", which was the right question when the card
+    admitted one job: with sharing, a declared co-tenant's process is
+    someone else's and entirely legitimate. What is still contention is a
+    process nobody has claimed capacity for.
+    """
     apps = compute_apps()
     if apps is None:
         return []
-    return _foreign(apps, allow)
+    d = Path(directory) if directory else claim_dir()
+    records = ledger.live_records(ledger.all_records(d))
+    _, unledgered = ledger.attribute(apps, records)
+    exempt = set(allow or set()) | {os.getpid(), os.getppid()}
+    exempt |= descendants(os.getpid())
+    return [a for a in unledgered if a["pid"] not in exempt]
 
 
-def preflight(allow: set[int] | None = None) -> None:
+# The old name, kept so nothing importing it breaks.
+foreign_processes = unledgered_processes
+
+
+def preflight(allow: set[int] | None = None, directory=None) -> None:
     # One query, not two: asking twice costs a second nvidia-smi and lets
     # the "can we see the list?" check and the "who is on the card?" check
     # disagree about what they saw.
@@ -107,9 +109,15 @@ def preflight(allow: set[int] | None = None) -> None:
         print("gpu-claim: warning: cannot enumerate CUDA processes on this "
               "box; proceeding on the advisory lock alone", file=sys.stderr)
         return
-    foreign = _foreign(apps, allow)
-    if foreign:
+    d = Path(directory) if directory else claim_dir()
+    records = ledger.live_records(ledger.all_records(d))
+    _, unledgered = ledger.attribute(apps, records)
+    exempt = set(allow or set()) | {os.getpid(), os.getppid()}
+    exempt |= descendants(os.getpid())
+    stray = [a for a in unledgered if a["pid"] not in exempt]
+    if stray:
         lines = [f"  pid {a['pid']:>7}  {a['used_mb'] or '?'} MiB  {a['name']}"
-                 for a in foreign]
+                 for a in stray]
         raise PreflightFailed(
-            "foreign CUDA processes hold this GPU:\n" + "\n".join(lines))
+            "CUDA processes hold this GPU with no claim on it:\n"
+            + "\n".join(lines))

@@ -64,7 +64,14 @@ if [ "$DRY_RUN" -eq 1 ]; then
 elif [ -f "$GPUQ_CONFIG" ]; then
   say "config exists, leaving it alone: $GPUQ_CONFIG"
 else
+  # claim_dir for the same reason as root: the example hardcodes the
+  # default prefix, and on a box with another one the runner would write
+  # its ledger somewhere no bare `gpu-claim` reads. One card, two ledgers,
+  # each admitting against a total the other's holders are missing from.
+  # `cli_runner` warns about exactly this at startup; not creating it is
+  # better.
   sed -e "s|^root = .*|root = \"$QUEUE_ROOT\"|" \
+      -e "s|^claim_dir = .*|claim_dir = \"$GPU_CLAIM_DIR\"|" \
       "$REPO_DIR/gpuq.example.toml" > "$GPUQ_CONFIG"
   say "wrote $GPUQ_CONFIG — declare your projects in it, then rerun"
 fi

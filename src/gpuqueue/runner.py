@@ -21,18 +21,30 @@ from pathlib import Path
 
 from . import bugfiler
 from . import git_ops
+from . import ledger
 from .bugreport import CallerError, signature
 from .claim import gpu_claim, ClaimBusy
 from .config import RunnerConfig, ProjectConfig
 from .executor import (start_job, poll_job, kill_job, JobResult, RunningJob,
                        StartFailed)
-from .gpuid import gpu_key, cuda_visible_value, GpuIdError
+from .gpuid import gpu_key, cuda_visible_value, total_vram_mb, GpuIdError
 from .preflight import preflight, PreflightFailed
 from .queue import QueueRoot, STATES
-from .reaper import reap
+from .reaper import reap, MAX_ATTEMPTS, WATCHDOG_STRIKES
 from .spec import JobSpec
 
 log = logging.getLogger("gpuqueue.runner")
+
+# Consecutive passes that must fail to identify the card before the pending
+# GPU backlog is failed outright. See `admit`.
+GPUID_STRIKES = 3
+
+# How long a preflight verdict is reused before the card is asked again.
+# Not tied to `orphan_cuda_interval_s`, which is the cadence of the sweep
+# that clears the condition preflight detects: an operator who sets that to
+# an hour would be admitting jobs against hour-old contention data. See
+# `_preflight_cached`.
+PREFLIGHT_TTL_S = 10.0
 
 
 @dataclass
@@ -40,7 +52,9 @@ class Active:
     running: RunningJob
     project: ProjectConfig
     workdir: Path
-    claim_cm: object | None = None  # entered gpu_claim, released on settle
+    claim_cm: object | None = None       # entered gpu_claim, released on settle
+    claim_record: object | None = None   # its ledger.Record, for usage_pid
+    started_mono: float = 0.0            # for the watchdog's victim retry
 
 
 class Runner:
@@ -55,6 +69,29 @@ class Runner:
         # signature -> time.monotonic() of the last report. See the
         # cooldown check in _report_bug for why this exists.
         self._report_cooldowns: dict[str, float] = {}
+        self._usable_mb_cache: int | None = None
+        self._usable_asked = False
+        # The card's identity, cached for the same reason its total is: a
+        # second nvidia-smi subprocess for an answer that cannot change
+        # without a reboot. See _card_key_cached.
+        self._card_key: str | None = None
+        # Logged once, not once per admit: see _usable_mb.
+        self._usable_query_warned = False
+        # str(record path) -> consecutive sweeps over its declaration. The
+        # full path, never the bare filename: `reaper.check_vram` explains
+        # why one is not unique across `<key>.lock.d` directories.
+        self._vram_strikes: dict[str, int] = {}
+        # job id -> the conviction that killed it, so _describe_failure can
+        # say "declared 512 MiB, using 3070" instead of "exit -9"
+        self._convicted: dict[str, dict] = {}
+        self._last_conviction: float | None = None
+        # Consecutive admit passes that could not identify the card. See
+        # the GpuIdError branch in `admit`.
+        self._gpuid_strikes = 0
+        # The last preflight verdict and when it was reached, so a pass
+        # inside PREFLIGHT_TTL_S reuses it. See _preflight_cached.
+        self._preflight_at: float | None = None
+        self._preflight_result: PreflightFailed | None = None
 
     # --- lifecycle ----------------------------------------------------
     def run_forever(self) -> None:
@@ -185,8 +222,31 @@ class Runner:
         now = time.monotonic()
         sweep = (self._last_cuda_sweep is None
                  or now - self._last_cuda_sweep >= self.cfg.orphan_cuda_interval_s)
-        reap(self.queue, self.cfg, active_ids=set(self.active),
-             include_orphan_cuda=sweep)
+        result = reap(self.queue, self.cfg, active_ids=set(self.active),
+                      include_orphan_cuda=sweep,
+                      vram_strikes=self._vram_strikes)
+        for c in result.get("convicted", []):
+            # Only a conviction that got the holder off the card stamps the
+            # co-tenant window -- which `_kill_tree` reports for a holder
+            # that had already exited on its own, not just for one it
+            # signalled. This directory is shared with hand-run `gpu-claim`
+            # jobs, so a convicted holder can belong to another user and
+            # `_kill_tree` fails on EPERM -- that holder goes on over-using
+            # the card, so the OOM it causes is not a transient. Excusing it
+            # would requeue a job into the same full card and burn a second
+            # full GPU run on the blind retry `docs/design.md` forbids.
+            #
+            # `self._convicted` below is deliberately *not* gated: it means
+            # "this job was convicted", which is true whether or not the
+            # kill landed, and it is what `_describe_failure` uses to say
+            # what actually happened.
+            if c.get("killed"):
+                self._last_conviction = time.monotonic()
+            log.warning("%s %s: declared %s MiB, using %s MiB",
+                        "killed" if c.get("killed") else "COULD NOT KILL",
+                        c["owner"], c["declared"], c["used"])
+            if c["owner"].startswith("gpuq:"):
+                self._convicted[c["owner"][len("gpuq:"):]] = c
         if sweep:
             self._last_cuda_sweep = now
 
@@ -223,8 +283,56 @@ class Runner:
             log.info("stopped %s for shutdown; left for the reaper", job_id)
 
     # --- admission ----------------------------------------------------
+    def _usable_mb(self) -> int | None:
+        """Cached, but only once there is an answer worth caching.
+
+        A card's total does not change, so a query that succeeds is
+        cached -- otherwise this is an nvidia-smi subprocess on every
+        admit, on the loop that also polls every running job. A query
+        that *fails* is not cached: a subprocess hiccup, a timeout while
+        the box is under load, or brief driver contention is not exotic
+        on a box whose whole purpose is GPU jobs, and latching that as
+        "unqueryable forever" would silently degrade the GPU lane to
+        exclusive-only admission for the rest of the daemon's life, with
+        no way back short of a restart. Returning None uncached here
+        means the next admit tries again.
+        """
+        if self._usable_asked:
+            return self._usable_mb_cache
+        total = self.cfg.gpu_vram_mb
+        if total is None:
+            total = total_vram_mb()
+            if total is None:
+                if not self._usable_query_warned:
+                    log.warning("could not query the card's VRAM total; "
+                               "GPU lane admits exclusive-only until this "
+                               "succeeds")
+                    self._usable_query_warned = True
+                return None
+        usable = total - self.cfg.gpu_vram_reserve_mb
+        # config.load_config rejects a reserve >= gpu_vram_mb, but only on
+        # that explicit path -- it has no card to check against. On the
+        # default "ask the card" path a card that genuinely reports less
+        # than the reserve is possible, and a negative number here would
+        # flow straight into ledger.fits/exceeds_capacity, where `want_mb
+        # > usable_mb` is always true and nothing is ever admitted --
+        # silently, with no error to explain why. This is a real, static
+        # answer (the query above succeeded), not a transient failure, so
+        # it is cached like any other successful query rather than
+        # re-querying every admit for the same result.
+        if usable <= 0:
+            log.warning("gpu_vram_reserve_mb (%s) leaves no usable VRAM "
+                       "out of %s MiB reported by the card; GPU lane "
+                       "admits exclusive-only", self.cfg.gpu_vram_reserve_mb,
+                       total)
+            usable = None
+        self._usable_asked = True
+        self._usable_mb_cache = usable
+        return usable
+
     def _capacity(self, lane: str) -> int:
-        limit = self.cfg.cpu_slots if lane == "cpu" else 1
+        limit = (self.cfg.cpu_slots if lane == "cpu"
+                 else self.cfg.gpu_max_jobs)
         in_lane = sum(1 for a in self.active.values()
                       if a.running.spec.lane == lane)
         return limit - in_lane
@@ -235,6 +343,63 @@ class Runner:
         pending = sorted(self.queue.list_state("pending"),
                          key=lambda s: (s.submitted_at, s.id))
         started = []
+        # A MutexTimeout cannot resolve inside one pass: the thing holding
+        # the ledger mutex that long is a pre-ledger `gpu-claim`, which
+        # holds it for its whole training run. Paying `MUTEX_WAIT_S` again
+        # for the next pending GPU job buys nothing and costs 10s each --
+        # five queued jobs stall `admit` for the best part of a minute, and
+        # `collect` does not run in that window, so a hung job outlives its
+        # `timeout_s`. That is the stall `_report_bug` calls worse than a
+        # crash. One timeout ends this pass's GPU admissions; the next tick
+        # tries again. Not fixed by lowering `ledger.MUTEX_WAIT_S`, which
+        # the interactive `gpu-claim` path legitimately needs.
+        mutex_blocked = False
+        # Nor can a *closed* card resolve inside one pass -- the runner is
+        # what would have to release something, and it is in this loop. The
+        # per-job half of the fit check is deliberately not hoisted into
+        # `_ready_card` (see there) so a small job can still slot in beside
+        # a big one, but that only argues for walking the queue while some
+        # declaration could still get past. When none can -- at the job
+        # limit, an exclusive holder, no free VRAM -- every remaining GPU
+        # spec pays a mkdir, a flock and a directory scan to be told the
+        # same thing, and logs a multi-line holder dump saying so. With the
+        # default `vram_mb=None` that is the *common* case, not a corner:
+        # 30 queued jobs at `poll_interval_s = 2.0` is 15 flock round-trips
+        # and 30 multi-line records a second, forever. Before capacity-based
+        # admission `_capacity("gpu")` returned 0 here and the loop skipped
+        # them for nothing.
+        card_closed = False
+        # Asked once, before the loop, because the answer is the same for
+        # every pending GPU job and costs two nvidia-smi subprocesses plus
+        # a recursive `ps` walk per ledger record to get. See `_ready_card`.
+        card_key = card_error = None
+        if any(s.lane == "gpu" for s in pending) and self._capacity("gpu") > 0:
+            card_key, card_error = self._ready_card()
+        if isinstance(card_error, PreflightFailed):
+            # One line per pass, not one per pending job: the same
+            # reasoning `mutex_blocked` applies below to a card-wide
+            # condition nobody in this pass can get past.
+            log.warning("GPU admissions deferred this pass: %s", card_error)
+        if isinstance(card_error, GpuIdError):
+            # Counted per pass, not per job: the strike is a property
+            # of this pass's one `gpu_key` call.
+            self._gpuid_strikes += 1
+            if self._gpuid_strikes < GPUID_STRIKES:
+                log.warning("GPU admissions deferred this pass "
+                            "(%s/%s): %s", self._gpuid_strikes,
+                            GPUID_STRIKES, card_error)
+        else:
+            # Reset on every pass that did not see a GpuIdError -- including
+            # the passes that never asked, which is the whole point of doing
+            # this outside the `if`. GPUID_STRIKES counts *consecutive*
+            # failures, and a pass skips the check whenever there is no GPU
+            # work pending with room for it, which can be hours or days.
+            # Resetting only on a successful `_ready_card` froze a strike
+            # instead of ageing it out: a hiccup this morning, the job that
+            # was waiting on it cancelled, and tonight's backlog starts one
+            # hiccup nearer being failed outright -- the exact outcome the
+            # strike count exists to prevent.
+            self._gpuid_strikes = 0
         for spec in pending:
             project = self.cfg.projects.get(spec.project)
             if project is None:
@@ -246,49 +411,234 @@ class Runner:
 
             # Take the card before the rename: a job that never reached
             # running/ needs no unwinding if the card is busy.
-            claim_cm = None
+            claim_cm = claim_record = None
             if spec.lane == "gpu":
-                claim_cm = self._take_card(spec)
-                if claim_cm is None:
+                if (mutex_blocked or card_closed
+                        or isinstance(card_error, PreflightFailed)):
                     continue
+                if card_error is not None:      # GpuIdError
+                    # Card-wide like the above, and eventually permanent:
+                    # no card will appear on a box that has none, so
+                    # deferring forever would queue these forever. But
+                    # `gpuid` cannot tell that box apart from a working one
+                    # whose nvidia-smi just timed out under load or exited
+                    # non-zero on a driver hiccup -- both swallow into the
+                    # same `GpuIdError`. Failing on the first one moves the
+                    # entire pending backlog to failed/ over a condition
+                    # that clears two seconds later, which is what
+                    # `_card_key_cached` refuses to do to itself when it
+                    # declines to cache a failure. So the box has to say so
+                    # `GPUID_STRIKES` passes running, which a genuinely
+                    # cardless box does immediately and a hiccup does not.
+                    if self._gpuid_strikes < GPUID_STRIKES:
+                        continue
+                    self._fail_pending(spec, f"no usable GPU: {card_error}")
+                    continue
+                try:
+                    taken = self._take_card(spec, card_key)
+                except ledger.CardClosed as e:
+                    # One line per pass, like the two below, and for the
+                    # same reason: nothing this pass does can clear it.
+                    card_closed = True
+                    log.info("GPU admissions deferred this pass: %s", e)
+                    continue
+                except ledger.MutexTimeout as e:
+                    # Logged here rather than per job, so one wedged holder
+                    # writes one line per pass instead of one per pending
+                    # job.
+                    mutex_blocked = True
+                    log.warning("GPU admissions deferred this pass: %s", e)
+                    continue
+                if taken is None:
+                    continue
+                claim_cm, claim_record = taken
 
             claimed = self.queue.claim(spec.id)
             if claimed is None:  # cancelled, or another process won the rename
                 self._exit_claim(claim_cm)
                 continue
 
-            if self._launch(claimed, project, claim_cm):
+            if self._launch(claimed, project, claim_cm, claim_record):
                 started.append(claimed.id)
         return started
 
-    def _take_card(self, spec: JobSpec):
+    def _ready_card(self) -> tuple[str | None, Exception | None]:
+        """Is the card usable, and which card is it -- asked once per pass.
+
+        Both halves answer the same for every pending GPU job, and both are
+        expensive: `preflight` is an nvidia-smi subprocess with a 15s
+        timeout plus a recursive `ps` walk per ledger record, and `gpu_key`
+        is a second nvidia-smi. Per job that used to cost nothing, because
+        `_capacity("gpu")` returned 0 the moment one GPU job ran and the
+        loop skipped every other pending GPU job without asking. A lane
+        that admits `gpu_max_jobs` still has capacity while the card is
+        VRAM-full, so all of them now reach `_take_card`: 20 queued jobs at
+        `poll_interval_s = 2.0` is ~40 nvidia-smi invocations every two
+        seconds, and `collect` cannot run while `admit` does, so a hung job
+        outlives its `timeout_s`. That is the stall `_report_bug` calls
+        worse than a crash.
+
+        Returns `(key, None)` when the card can be handed out, else
+        `(None, error)`: `PreflightFailed` to defer the pass, `GpuIdError`
+        to defer it and count a strike, failing the jobs rather than
+        queueing them forever once `GPUID_STRIKES` passes agree.
+
+        What is deliberately *not* hoisted is the per-job half -- whether
+        this declaration fits in the room that is left. Short-circuiting
+        the pass on a full card would mean a 500 MiB job never slots in
+        beside the 6 GB one running, because a 7 GB job queued ahead of it
+        did not fit, which is the head-of-line blocking that per-job VRAM
+        accounting exists to remove.
+        """
+        failure = self._preflight_cached()
+        if failure is not None:
+            return None, failure
+        try:
+            return self._card_key_cached(), None
+        except GpuIdError as e:
+            return None, e
+
+    def _preflight_cached(self) -> PreflightFailed | None:
+        """`preflight()`, at a bounded cadence rather than once per pass.
+
+        Hoisting it out of the per-job loop bounded the cost per *job* but
+        left a steady-state one that did not exist before, the same one
+        `_card_key_cached` documents: a lane admitting `gpu_max_jobs` still
+        has capacity while the card is VRAM-full, so a pending job that
+        does not fit leaves `_capacity` positive and this runs every
+        `poll_interval_s`, indefinitely. Each call is an nvidia-smi with a
+        15s timeout plus a recursive `ps` per process in every tree it
+        walks -- roughly 20 process spawns every 2s for one trainer with 8
+        dataloader workers, on the thread that also enforces `timeout_s`.
+
+        A TTL rather than the outright cache the card's uuid gets, because
+        unlike the uuid this measures contention *now*: what it costs is
+        that a stray process appearing is noticed up to `PREFLIGHT_TTL_S`
+        late, and a stray that has gone away defers admissions for that
+        much longer. Both are bounded and small next to the 15s subprocess
+        the cache is there to stop repeating.
+
+        Returns the `PreflightFailed` to defer the pass on, or None when
+        the card is clear. Anything else is a gpuq bug and goes out
+        unfiltered and uncached -- a verdict was never reached.
+        """
+        now = time.monotonic()
+        if (self._preflight_at is not None
+                and now - self._preflight_at < PREFLIGHT_TTL_S):
+            return self._preflight_result
+        try:
+            # The runner's configured claim dir, not $GPU_CLAIM_DIR. These
+            # were already two different answers to "where are the
+            # claims?"; now that preflight decides contention by reading
+            # them, disagreeing means a co-tenant reads as an intruder.
+            preflight(directory=self.cfg.claim_dir)
+            result = None
+        except PreflightFailed as e:
+            result = e
+        except Exception as e:
+            self._report_bug(e, "preflight")
+            raise
+        self._preflight_at = now
+        self._preflight_result = result
+        return result
+
+    def _card_key_cached(self) -> str:
+        """`gpu_key()`, asked once per daemon rather than once per pass.
+
+        Hoisting `_ready_card` out of the per-job loop bounded the cost per
+        *job*, but introduced a steady-state one that did not exist before:
+        a lane admitting `gpu_max_jobs` still has capacity while the card is
+        VRAM-full, so a pending job that does not fit leaves `_capacity`
+        positive and this whole function runs every `poll_interval_s`,
+        indefinitely, on the thread that also enforces `timeout_s`.
+
+        Cached outright, where `_preflight_cached` only gets a TTL: the
+        card's uuid cannot change without a reboot, which restarts this
+        daemon anyway, while preflight is measuring contention right now.
+        Same trade `_usable_mb` makes for the card's total, and a failure
+        is not cached for the same reason it is not there: a transient
+        nvidia-smi hiccup must not latch this lane off for the life of the
+        process.
+        """
+        if self._card_key is None:
+            self._card_key = gpu_key()
+        return self._card_key
+
+    def _take_card(self, spec: JobSpec, key: str):
         """Enter a gpu_claim by hand so it can be held across ticks.
 
-        Non-blocking on purpose: `wait=True` in a single-threaded loop would
-        stall the CPU lane behind whoever holds the card.
+        `key` comes from `_ready_card`, which has already established that
+        the card is usable; this is only the part that depends on `spec`.
+
+        Never waits on *capacity*: `wait=True` in a single-threaded loop
+        would stall the CPU lane behind whoever holds the card. A full card
+        returns `None` and the job stays pending. It can still block for up
+        to `ledger.MUTEX_WAIT_S` on the ledger mutex, which is a different
+        thing -- a participant holds that only for a directory read and one
+        rename, so the wait is short unless a pre-ledger `gpu-claim` is
+        holding `flock` for its whole run. That case raises `MutexTimeout`,
+        and `admit` stops trying for the rest of the pass.
+
+        Returns `(claim_cm, record)` on success, or `None` when the job
+        should stay pending or has just been failed outright. Raises
+        `ledger.MutexTimeout` and `ledger.CardClosed`, both of which end
+        this pass's GPU admissions rather than this job's.
         """
-        try:
-            preflight()
-        except PreflightFailed as e:
-            log.warning("%s waiting: %s", spec.id, e)
-            return None
-        except Exception as e:
-            self._report_bug(e, "preflight", spec)
-            raise
-        try:
-            key = gpu_key()
-        except GpuIdError as e:
-            # No card will appear on a box that has none; do not queue forever.
-            self._fail_pending(spec, f"no usable GPU: {e}")
+        usable = self._usable_mb()
+        if ledger.exceeds_capacity(spec.vram_mb, usable):
+            # Permanent, so failing beats queueing forever -- the same call
+            # this function already makes for a box with no GPU.
+            self._fail_pending(
+                spec, f"declared {spec.vram_mb} MiB but only {usable} MiB is "
+                      "usable on this card; it can never be admitted")
             return None
         cm = gpu_claim(key=key, owner=f"gpuq:{spec.id}", cmd=spec.cmd,
-                       wait=False, directory=self.cfg.claim_dir)
+                       wait=False, directory=self.cfg.claim_dir,
+                       vram_mb=spec.vram_mb, usable_mb=usable,
+                       own_usage=False,
+                       # Passed rather than left to gpu_claim's default,
+                       # which re-reads the config file: this runner has
+                       # already loaded the key, and `_capacity` is only a
+                       # cheap pre-filter -- the ledger is what enforces
+                       # the cap against holders this process cannot see.
+                       max_holders=self.cfg.gpu_max_jobs)
         try:
-            cm.__enter__()
+            record = cm.__enter__()
+        except ledger.MutexTimeout:
+            # Out to `admit`, which ends this pass's GPU admissions. Before
+            # the general ClaimBusy clause below because MutexTimeout is a
+            # subclass of it, and "the ledger is unreadable" is not "the
+            # card is full".
+            raise
+        except ledger.CardClosed:
+            # Likewise out to `admit`, and likewise before the general
+            # clause it subclasses: "no declaration fits" is a fact about
+            # the card that the rest of this pass's pending GPU jobs would
+            # each pay a flock and a directory scan to rediscover, where
+            # the plain ClaimBusy below is a fact about *this* spec and the
+            # next one may well fit.
+            raise
         except ClaimBusy as e:
             log.info("%s waiting: %s", spec.id, e)
             return None
-        return cm
+        except ValueError as e:
+            # A declaration `gpu_claim` refuses outright. `JobSpec.validate`
+            # rejects the same values, but only on the submit path --
+            # `QueueRoot._read` builds a spec with `from_dict`, which does
+            # not validate, and `docs/design.md` makes hand-editing a
+            # pending job an explicitly supported repair. So an operator
+            # who lowers a declaration after an OOM and types `"vram_mb":
+            # 0` puts a spec on disk that this call raises on.
+            #
+            # Uncaught, that leaves `admit` and `_phase` re-raises by
+            # design, so the process dies -- and supervisor restarts it
+            # onto the same pending spec, forever, taking the cpu lane down
+            # with it. One bad job must not be able to do that, so fail the
+            # job, exactly as the `exceeds_capacity` branch above does for
+            # the other permanently-unadmittable declaration.
+            self._fail_pending(spec, f"invalid vram_mb: {e}")
+            return None
+        return cm, record
 
     def _card_pin(self, spec: JobSpec) -> dict:
         """CUDA_VISIBLE_DEVICES for a gpu job, naming the card it was given.
@@ -318,7 +668,8 @@ class Runner:
             return {}
         return {"CUDA_VISIBLE_DEVICES": value}
 
-    def _launch(self, spec: JobSpec, project: ProjectConfig, claim_cm) -> bool:
+    def _launch(self, spec: JobSpec, project: ProjectConfig, claim_cm,
+               claim_record=None) -> bool:
         try:
             workdir = self._prepare_workdir(spec, project)  # git, on the loop
         except Exception as e:
@@ -351,7 +702,14 @@ class Runner:
         spec.runner_pid = os.getpid()
         self.queue.update(spec)  # the reaper reads this to tell live from dead
         self.active[spec.id] = Active(running=running, project=project,
-                                      workdir=workdir, claim_cm=claim_cm)
+                                      workdir=workdir, claim_cm=claim_cm,
+                                      claim_record=claim_record,
+                                      started_mono=time.monotonic())
+        if claim_record is not None:
+            # The card was taken before this process existed. Charging the
+            # record to it now is what lets the watchdog and the orphan
+            # sweep tell this job's VRAM from a co-tenant's.
+            ledger.set_usage_pid(claim_record, running.pid)
         log.info("started %s (%s lane, pid %d)", spec.id, spec.lane, running.pid)
         return True
 
@@ -396,6 +754,23 @@ class Runner:
         spec.pid = None
         spec.exit_code = result.exit_code
         ok = result.exit_code == 0 and not result.timed_out
+        if ok and spec.id in self._convicted:
+            # A conviction outranks a clean exit. `_kill_tree` SIGTERMs the
+            # holder's tree before it SIGKILLs it, so a trainer that
+            # checkpoints on SIGTERM exits 0 -- and judged on the exit code
+            # alone the job we just killed for over-using the card is filed
+            # under done/. `_describe_failure` would never run, so the one
+            # thing conviction exists to produce (the job dying while naming
+            # its own declaration) is lost, and the `_convicted` entry leaks
+            # to disqualify this id from the co-tenant retry for the life of
+            # the runner.
+            ok = False
+        if not ok and self._hit_by_a_convicted_co_tenant(spec, active, result):
+            self._remove_worktree(active)
+            self.queue.requeue(spec)
+            log.info("%s requeued: OOMed while a co-tenant was convicted of "
+                     "exceeding its declaration", spec.id)
+            return
         # Filing is deferred until after queue.finish (below), even though
         # the exception is caught right here. `_report_bug` can block for
         # ~250s on `gh`, and by this point the job is already out of
@@ -420,6 +795,67 @@ class Runner:
             self._report_bug(artifact_exc, "artifacts", spec)
         log.info("%s %s", spec.id, "done" if ok else f"failed: {spec.error}")
 
+    def _hit_by_a_convicted_co_tenant(self, spec: JobSpec, active: Active,
+                                      result: JobResult) -> bool:
+        """An OOM this job did not cause.
+
+        `docs/design.md` says a CUDA OOM is a configuration error and is
+        never retried blindly. That stays true, and sharing does not
+        weaken it -- it only adds one case where the premise is false: the
+        job OOMed while the watchdog convicted a *different* holder of
+        over-using the card. That is a genuine transient, so it gets the
+        single retry `attempts` already bounds, and every other OOM
+        behaves exactly as before.
+
+        Branch order mirrors `_describe_failure`: convicted, then
+        timed_out, then oom -- so the two cannot drift apart. A job can
+        print an OOM-looking line and then hang (e.g. in NCCL teardown);
+        `result.timed_out` there is still true, and a hang is a bug, not
+        a transient, no matter what a co-tenant did at the same moment.
+        Checking timed_out before oom, same as _describe_failure does,
+        keeps that job out of the retry path.
+
+        The conviction has to be recent as well as after this job started.
+        "After it started" alone is nearly free for a long run: a six-hour
+        job that OOMs on its own misconfiguration at hour six is still
+        `> started_mono` behind a conviction from minute five, so it would
+        be requeued and burn another six hours -- exactly the blind retry
+        the first paragraph says stays forbidden. See `_conviction_window_s`
+        for the bound.
+        """
+        if spec.id in self._convicted:
+            return False
+        if result.timed_out:
+            return False
+        if not result.oom:
+            return False
+        if self._last_conviction is None:
+            return False
+        if spec.attempts >= MAX_ATTEMPTS:
+            return False
+        if self._last_conviction <= active.started_mono:
+            return False
+        return (time.monotonic() - self._last_conviction
+                <= self._conviction_window_s())
+
+    def _conviction_window_s(self) -> float:
+        """How long after a conviction an OOM can still be blamed on it.
+
+        Derived from the watchdog's own cadence rather than picked: an
+        overage is convicted only on `WATCHDOG_STRIKES` consecutive sweeps
+        `orphan_cuda_interval_s` apart, so the overage that OOMed the
+        victim may have begun that far before the kill landed. The victim
+        then dies in milliseconds but is not `_settle`d until `collect`
+        next runs, which is why a couple of poll intervals of slack are
+        added on top.
+
+        Computed rather than stored so that an operator who retunes
+        `orphan_cuda_interval_s` does not silently leave this window
+        describing the old cadence.
+        """
+        return (WATCHDOG_STRIKES * self.cfg.orphan_cuda_interval_s
+                + 2 * self.cfg.poll_interval_s)
+
     def _collect_artifacts(self, spec: JobSpec, project: ProjectConfig,
                            workdir: Path) -> None:
         if not spec.artifacts:
@@ -439,6 +875,12 @@ class Runner:
                                      f"artifacts: {spec.id}", job_id=spec.id)
 
     def _describe_failure(self, spec: JobSpec, result: JobResult) -> str:
+        guilty = self._convicted.pop(spec.id, None)
+        if guilty:
+            return (f"killed for exceeding its declaration: --vram-mb "
+                    f"{guilty['declared']}, actually using {guilty['used']} "
+                    "MiB. Declare what the job really needs, measured as "
+                    "nvidia-smi reports it. Not retried.")
         if result.timed_out:
             return (f"timeout after {spec.timeout_s}s; killed. A hung job "
                     "is a bug, not a transient — not retried.")

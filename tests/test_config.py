@@ -1,5 +1,9 @@
+import textwrap
+
 import pytest
-from gpuqueue.config import load_config, ConfigError
+from gpuqueue.config import (load_config, vram_policy, max_holders,
+                             ConfigError)
+from gpuqueue.ledger import DEFAULT_RESERVE_MB
 
 TOML = """
 [queue]
@@ -17,6 +21,11 @@ def _write(tmp_path, text):
     p = tmp_path / "gpuq.toml"
     p.write_text(text)
     return p
+
+def write_and_load(tmp_path, body):
+    # Indented triple-quoted TOML in the test body needs dedenting before
+    # it's valid at column 0; _write() alone doesn't do that.
+    return load_config(_write(tmp_path, textwrap.dedent(body)))
 
 def test_loads_queue_settings(tmp_path):
     cfg = load_config(_write(tmp_path, TOML))
@@ -123,3 +132,171 @@ def test_a_repo_must_look_like_owner_slash_name(tmp_path):
     text = TOML + '\n[autofix]\nenabled = true\nrepo = "https://github.com/a/b"\n'
     with pytest.raises(ConfigError, match="owner/name"):
         load_config(_write(tmp_path, text))
+
+
+def test_capacity_defaults(tmp_path):
+    cfg = write_and_load(tmp_path, """
+        [queue]
+        root = "/q"
+    """)
+    assert cfg.gpu_vram_mb is None      # discovered from nvidia-smi
+    assert cfg.gpu_vram_reserve_mb == 512
+    assert cfg.gpu_max_jobs == 2
+    assert cfg.enforce_vram is True
+
+
+def test_capacity_keys_are_read(tmp_path):
+    cfg = write_and_load(tmp_path, """
+        [queue]
+        root = "/q"
+        gpu_vram_mb = 8188
+        gpu_vram_reserve_mb = 1024
+        gpu_max_jobs = 4
+        enforce_vram = false
+    """)
+    assert (cfg.gpu_vram_mb, cfg.gpu_vram_reserve_mb) == (8188, 1024)
+    assert cfg.gpu_max_jobs == 4
+    assert cfg.enforce_vram is False
+
+
+def test_gpu_max_jobs_must_be_at_least_one(tmp_path):
+    with pytest.raises(ConfigError, match="gpu_max_jobs"):
+        write_and_load(tmp_path, '[queue]\nroot = "/q"\ngpu_max_jobs = 0\n')
+
+
+def test_reserve_may_not_swallow_the_whole_card(tmp_path):
+    """A reserve at or above capacity admits nothing and would leave every
+    GPU job pending forever, which is worse than refusing to start."""
+    with pytest.raises(ConfigError, match="gpu_vram_reserve_mb"):
+        write_and_load(tmp_path, """
+            [queue]
+            root = "/q"
+            gpu_vram_mb = 1024
+            gpu_vram_reserve_mb = 1024
+        """)
+
+
+def test_a_quoted_false_switches_the_watchdog_off_not_on(tmp_path):
+    """`bool("false")` is True. Read that way, an operator who wrote the
+    off switch gets a watchdog that kills jobs."""
+    cfg = write_and_load(tmp_path, """
+        [queue]
+        root = "/q"
+        enforce_vram = "false"
+        kill_orphan_cuda = "off"
+    """)
+    assert cfg.enforce_vram is False
+    assert cfg.kill_orphan_cuda is False
+
+
+def test_quoted_true_spellings_still_mean_true(tmp_path):
+    cfg = write_and_load(tmp_path, """
+        [queue]
+        root = "/q"
+        enforce_vram = "yes"
+        kill_orphan_cuda = "1"
+    """)
+    assert cfg.enforce_vram is True
+    assert cfg.kill_orphan_cuda is True
+
+
+def test_an_unreadable_bool_is_an_error_not_a_guess(tmp_path):
+    """Loud at startup beats a job killed hours later by a setting its
+    author believed said otherwise."""
+    with pytest.raises(ConfigError, match=r"\[queue\].enforce_vram"):
+        write_and_load(tmp_path, """
+            [queue]
+            root = "/q"
+            enforce_vram = "sometimes"
+        """)
+
+
+def test_an_integer_bool_is_still_read_as_one(tmp_path):
+    """`kill_orphan_cuda = 1` is valid TOML that the old `bool(...)` path
+    read as True. Rejecting it now would refuse to start the daemon after
+    an upgrade, with no change on the operator's side -- a stricter reader
+    is worth an unreadable *string*, not a config that already worked."""
+    cfg = write_and_load(tmp_path, """
+        [queue]
+        root = "/q"
+        enforce_vram = 0
+        kill_orphan_cuda = 1
+    """)
+    assert cfg.enforce_vram is False
+    assert cfg.kill_orphan_cuda is True
+
+
+def test_an_integer_that_is_not_a_bool_is_still_an_error(tmp_path):
+    """Widening to int is for the two values that spell a bool. `2` is as
+    unreadable as `"sometimes"`."""
+    with pytest.raises(ConfigError, match=r"\[queue\].enforce_vram"):
+        write_and_load(tmp_path, """
+            [queue]
+            root = "/q"
+            enforce_vram = 2
+        """)
+
+
+# --- vram_policy: the capacity keys, for participants that are not the runner
+
+
+def test_vram_policy_reads_the_capacity_keys(tmp_path):
+    p = _write(tmp_path, textwrap.dedent("""
+        [queue]
+        root = "/q"
+        gpu_vram_mb = 4096
+        gpu_vram_reserve_mb = 256
+    """))
+    assert vram_policy(p) == (4096, 256)
+
+
+def test_vram_policy_defaults_when_the_keys_are_absent(tmp_path):
+    assert vram_policy(_write(tmp_path, '[queue]\nroot = "/q"\n')) == (
+        None, DEFAULT_RESERVE_MB)
+
+
+def test_vram_policy_does_not_need_a_loadable_config(tmp_path):
+    """Deliberately not `load_config`. A caller that only wants the card's
+    size must not be refused because `[queue].root` is missing or a project
+    is half-declared -- it would fall back to a capacity the runner does not
+    share, which is the divergence this exists to close."""
+    p = _write(tmp_path, textwrap.dedent("""
+        [queue]
+        gpu_vram_mb = 4096
+
+        [project.p]
+        remote = "git@github.com:you/p.git"
+    """))
+    with pytest.raises(ConfigError):
+        load_config(p)
+    assert vram_policy(p) == (4096, DEFAULT_RESERVE_MB)
+
+
+def test_vram_policy_falls_back_when_there_is_no_config(tmp_path):
+    """The standalone `gpu-claim` path on a box with no runner deployed:
+    exactly what it did before there was a config to read."""
+    assert vram_policy(tmp_path / "absent.toml") == (None, DEFAULT_RESERVE_MB)
+    (tmp_path / "junk.toml").write_text("this is not toml [[[")
+    assert vram_policy(tmp_path / "junk.toml") == (None, DEFAULT_RESERVE_MB)
+
+
+# --- max_holders: the latency cap, for participants that are not the runner
+
+def test_max_holders_reads_the_key(tmp_path):
+    p = _write(tmp_path, '[queue]\nroot = "/q"\ngpu_max_jobs = 4\n')
+    assert max_holders(p) == 4
+
+
+def test_max_holders_defaults_when_the_key_is_absent(tmp_path):
+    assert max_holders(_write(tmp_path, '[queue]\nroot = "/q"\n')) == 2
+
+
+def test_max_holders_does_not_need_a_loadable_config(tmp_path):
+    """Same posture as vram_policy: a box with no runner deployed must
+    still be able to run gpu-claim."""
+    assert max_holders(tmp_path / "absent.toml") == 2
+
+
+def test_max_holders_falls_back_on_a_nonsense_value(tmp_path):
+    p = _write(tmp_path, '[queue]\nroot = "/q"\ngpu_max_jobs = 0\n')
+    assert max_holders(p) == 2

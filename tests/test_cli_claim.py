@@ -11,7 +11,11 @@ KEY = "4b8f2c1a-0000-0000-0000-000000000001"
 def fake_gpu(tmp_path, monkeypatch):
     monkeypatch.setenv("GPU_CLAIM_DIR", str(tmp_path))
     monkeypatch.setattr(cli_claim, "gpu_key", lambda index=0: KEY)
-    monkeypatch.setattr(cli_claim, "preflight", lambda allow=None: None)
+    monkeypatch.setattr(cli_claim, "preflight", lambda allow=None, directory=None: None)
+    # Otherwise every test here shells out to nvidia-smi for the capacity,
+    # and answers differently on a box that has a card than on one that
+    # does not.
+    monkeypatch.setattr(cli_claim, "default_usable_mb", lambda index=0: 7676)
 
 def test_runs_command_and_returns_its_exit_code():
     assert cli_claim.main(["--", "sh", "-c", "exit 0"]) == 0
@@ -19,7 +23,7 @@ def test_runs_command_and_returns_its_exit_code():
 
 def test_claim_released_after_command(tmp_path):
     cli_claim.main(["--", "true"])
-    assert list(tmp_path.glob("*.lock.json")) == []
+    assert list(tmp_path.glob("*.lock.d/*.json")) == []
 
 def test_busy_exits_75(monkeypatch, capsys):
     def busy(**kw):
@@ -28,15 +32,47 @@ def test_busy_exits_75(monkeypatch, capsys):
     assert cli_claim.main(["--", "true"]) == 75
     assert "999" in capsys.readouterr().err
 
+
+def test_gpu_claim_passes_the_declaration_through(tmp_path, monkeypatch):
+    seen = {}
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_claim(**kw):
+        seen.update(kw)
+        yield None
+
+    monkeypatch.setattr(cli_claim, "gpu_claim", fake_claim)
+    monkeypatch.setattr(cli_claim, "gpu_key", lambda index=0: "k")
+    monkeypatch.setattr(cli_claim, "preflight", lambda: None)
+    cli_claim.main(["--vram-mb", "512", "--", "true"])
+    assert seen["vram_mb"] == 512
+
+
+def test_gpu_claim_without_a_declaration_takes_the_whole_card(tmp_path, monkeypatch):
+    seen = {}
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_claim(**kw):
+        seen.update(kw)
+        yield None
+
+    monkeypatch.setattr(cli_claim, "gpu_claim", fake_claim)
+    monkeypatch.setattr(cli_claim, "gpu_key", lambda index=0: "k")
+    monkeypatch.setattr(cli_claim, "preflight", lambda: None)
+    cli_claim.main(["--", "true"])
+    assert seen["vram_mb"] is None
+
 def test_preflight_failure_exits_69(monkeypatch, capsys):
-    def fail(allow=None):
+    def fail(allow=None, directory=None):
         raise PreflightFailed("pid 4321 train.py")
     monkeypatch.setattr(cli_claim, "preflight", fail)
     assert cli_claim.main(["--", "true"]) == 69
     assert "4321" in capsys.readouterr().err
 
 def test_no_preflight_flag_skips_it(monkeypatch):
-    def fail(allow=None):
+    def fail(allow=None, directory=None):
         raise PreflightFailed("should not be called")
     monkeypatch.setattr(cli_claim, "preflight", fail)
     assert cli_claim.main(["--no-preflight", "--", "true"]) == 0
@@ -47,6 +83,16 @@ def test_no_gpu_exits_69(monkeypatch, capsys):
     monkeypatch.setattr(cli_claim, "gpu_key", boom)
     assert cli_claim.main(["--", "true"]) == 69
     assert "no CUDA device" in capsys.readouterr().err
+
+def test_an_impossible_declaration_is_unavailable_not_tempfail(monkeypatch,
+                                                               capsys):
+    """75 (EX_TEMPFAIL) tells a wrapper "this may work later". There is no
+    later in which a claim bigger than the whole card fits, and a wrapper
+    that believes 75 would poll forever -- the same silent hang as --wait."""
+    # 7676 usable, from the fake_gpu fixture.
+    assert cli_claim.main(["--vram-mb", "99999", "--", "true"]) == 69
+    assert "never be admitted" in capsys.readouterr().err
+
 
 def test_status_prints_claims_as_json(tmp_path, capsys):
     (tmp_path / "x.lock.json").write_text(json.dumps(
@@ -168,3 +214,33 @@ def test_a_caller_setting_naming_the_claimed_card_is_not_warned_about(
                         lambda index=0: f"GPU-{KEY}")
     cli_claim.main(["--", "true"])
     assert "CUDA_VISIBLE_DEVICES" not in capsys.readouterr().err
+
+
+def test_a_nonpositive_declaration_is_a_usage_error(tmp_path, capsys):
+    """A typo'd `--vram-mb -5000` is a declaration that *subtracts* from
+    the ledger's accounted total, so the next claimant is admitted past the
+    end of the card. `gpuq submit` refuses it via `JobSpec.validate`; this
+    path admitted it. Exit 2 rather than 69/75: nothing about the card is
+    wrong, the command line is."""
+    for bad in ("0", "-5000"):
+        assert cli_claim.main(["--vram-mb", bad, "--", "true"]) == 2
+        assert "--vram-mb" in capsys.readouterr().err
+    assert list(tmp_path.glob("*.lock.d/*.json")) == []
+
+
+def test_the_capacity_is_sized_for_the_card_being_claimed(monkeypatch):
+    """`--gpu-index 1` keys the ledger on card 1 and pins the child to it,
+    so the capacity it is admitted against has to be card 1's too."""
+    seen = {}
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_claim(**kw):
+        seen.update(kw)
+        yield None
+
+    monkeypatch.setattr(cli_claim, "default_usable_mb",
+                        lambda index=0: {0: 24052, 1: 7676}[index])
+    monkeypatch.setattr(cli_claim, "gpu_claim", fake_claim)
+    cli_claim.main(["--gpu-index", "1", "--vram-mb", "4000", "--", "true"])
+    assert seen["usable_mb"] == 7676

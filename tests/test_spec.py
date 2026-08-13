@@ -1,6 +1,19 @@
 import pytest
 from gpuqueue.spec import JobSpec, SpecError, utcnow_iso
 
+def mkspec(**over):
+    """Helper to construct a JobSpec with minimal required fields."""
+    d = {
+        "id": "myproject-v0-train-01",
+        "lane": "gpu",
+        "project": "myproject",
+        "commit": "a1b2c3d",
+        "branch": "experiment/v0",
+        "cmd": ["python", "-m", "src.train", "--config", "c.yaml"],
+    }
+    d.update(over)
+    return JobSpec.from_dict(d)
+
 def _minimal(**over):
     d = {
         "id": "myproject-v0-train-01",
@@ -73,3 +86,37 @@ def test_a_branch_qualified_commit_is_still_accepted():
 def test_utcnow_iso_format():
     assert utcnow_iso().endswith("Z")
     assert "T" in utcnow_iso()
+
+def test_vram_mb_defaults_to_none_meaning_the_whole_card():
+    assert mkspec().vram_mb is None
+
+
+def test_vram_mb_accepts_a_positive_int():
+    spec = mkspec(vram_mb=512)
+    spec.validate()
+    assert spec.vram_mb == 512
+    assert spec.to_dict()["vram_mb"] == 512
+
+
+@pytest.mark.parametrize("bad", [0, -1, "512", 512.0, True, False])
+def test_vram_mb_rejects_anything_but_a_positive_int(bad):
+    with pytest.raises(SpecError, match="vram_mb"):
+        mkspec(vram_mb=bad).validate()
+
+
+def test_vram_mb_round_trips_through_from_dict():
+    spec = JobSpec.from_dict(mkspec(vram_mb=512).to_dict())
+    assert spec.vram_mb == 512
+
+
+def test_vram_mb_is_rejected_on_the_cpu_lane():
+    """A cpu-lane job takes no card and writes no ledger record, so a
+    declaration on it is accepted, persisted and then ignored by `admit`
+    entirely -- the submitter gets a job that looks accounted-for and is
+    not. Almost always a mistyped lane."""
+    with pytest.raises(SpecError, match="vram_mb"):
+        mkspec(lane="cpu", vram_mb=8000).validate()
+
+
+def test_cpu_lane_without_a_declaration_is_still_fine():
+    mkspec(lane="cpu").validate()

@@ -32,12 +32,32 @@ The runner will already have been working through them.
 
 ## Which lane
 
-- `--lane gpu` — training, anything that calls CUDA. One at a time, box-wide.
+- `--lane gpu` — training, anything that calls CUDA. Declare `--vram-mb` and
+  it shares the card; without it, it takes the whole card alone.
 - `--lane cpu` — data fetching, profiling, analysis. Several at once.
 
 Putting CPU work in the GPU lane blocks everyone else's training for no
 reason. Putting GPU work in the CPU lane means several jobs hit the card at
 once, which is the failure this queue exists to prevent.
+
+## Say how much VRAM you need
+
+    gpuq submit … --lane gpu --vram-mb 900 -- python -m src.train
+
+Without `--vram-mb` your job holds the entire card and nothing else runs
+beside it — correct for a big training run, wasteful for a small one. With
+it, the queue admits your job alongside anyone else's whose declaration
+still fits, so two unrelated small jobs run at once instead of queueing.
+
+The unit is MiB **as `nvidia-smi` reports them** — run the thing once and
+read your process's memory out of `nvidia-smi` while it works. That number
+includes the ~250 MiB CUDA context and the caching allocator's high-water
+mark. `torch.cuda.max_memory_allocated()` counts live tensors only and is
+always too small; declare from it and your job gets killed.
+
+A job using more than it declared is killed, and the failure says what it
+declared and what it was using. So round up, and leave room for your
+largest batch — over-declaring only costs you a wait.
 
 ## Always pin the commit
 

@@ -7,6 +7,21 @@ root = "/workspace/queue"
 # thread internally, so one per core oversubscribes. Measure before tuning.
 cpu_slots = 4
 poll_interval_s = 2.0
+# Capacity for the GPU lane. Omit gpu_vram_mb to ask the card.
+# gpu_vram_mb = 8188
+# Held back from admission: two jobs that each fit exactly still have
+# their allocators fragmenting the same heap.
+gpu_vram_reserve_mb = 512
+# A latency budget, not a safety one. VRAM accounting alone would admit
+# many small jobs that then merely time-slice, each slower than it would
+# have been queued. 2 is what has been measured; raise it after measuring.
+# Counted over every holder of the card, hand-run gpu-claim included, so
+# gpu-claim reads this key too -- see the GPUQ_CONFIG note in
+# docs/deploying.md.
+gpu_max_jobs = 2
+# Kill a job using more VRAM than it declared. Turning this off does not
+# make over-use safe; it makes it unattributable.
+enforce_vram = true
 kill_orphan_cuda = true
 # How often to sweep for CUDA processes no live job owns. This shells out to
 # nvidia-smi, so it is throttled; the cheap recovery reaps run every poll.

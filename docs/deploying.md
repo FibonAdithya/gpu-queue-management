@@ -29,6 +29,8 @@ nvidia-smi -L || echo "NO nvidia-smi"
 nvidia-smi --query-gpu=uuid --format=csv,noheader
 echo "== can it enumerate CUDA processes? =="
 nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv,noheader
+echo "== does it report a total? (capacity discovery) =="
+nvidia-smi --query-gpu=memory.total --format=csv,noheader
 echo "== supervisor / git =="
 command -v supervisord supervisorctl; ls -d /etc/supervisor/conf.d; git --version
 echo "== workspace =="
@@ -43,8 +45,32 @@ What the answers mean:
 | A Python **3.11+** | stdlib `tomllib`; there is no `tomli` fallback | Use another interpreter on the box (step 3), or install one |
 | `nvidia-smi -L` | GPU identity comes from here — torch is never imported | Without it the GPU lane refuses every job, by design |
 | `--query-compute-apps` | Decides whether preflight is a real guard | See [Preflight](#preflight-is-only-as-good-as-nvidia-smi) below |
+| `--query-gpu=memory.total` | Capacity discovery for the GPU lane | Must print like `8188 MiB`. See [Capacity discovery](#capacity-discovery-fails-quietly) below |
 | supervisor + `conf.d` | How the runner is kept alive | `./bootstrap.sh --no-supervisor` and run `gpuq-runner` yourself |
 | `/workspace` writable | Default prefix for queue, locks, checkouts | Set `GPUQ_PREFIX` to somewhere writable |
+
+### Capacity discovery fails quietly
+
+Confirm on the box, once, before believing the GPU lane shares anything:
+
+```bash
+gpu-claim --status                       # should print an empty ledger, not an error
+python3 -c 'from gpuqueue.gpuid import total_vram_mb; print(total_vram_mb())'
+```
+
+The second command must print the card's total in MiB. If it prints `None`,
+`gpuq` cannot size the card, and **every GPU job is admitted exclusively** —
+the lane behaves exactly as it did before declarations existed. Nothing
+errors and nothing warns at submit time; jobs simply queue behind each other
+while `gpuq list` looks entirely healthy. That is the one failure in this
+feature that is invisible from the outside, which is why it is worth one
+command up front.
+
+`total_vram_mb` parses `nvidia-smi --query-gpu=memory.total`, expecting a
+line like `8188 MiB`. A driver that words it differently returns `None` by
+the same path as a missing binary. Set `[queue].gpu_vram_mb` explicitly to
+override, and prefer a number the driver will actually hand out rather than
+the nameplate total.
 
 ### Preflight is only as good as nvidia-smi
 
@@ -113,6 +139,16 @@ Flags: `--dry-run`, `--no-supervisor`.
 example placeholders and tells you to edit it, so there is nothing real to
 clone yet. It is not fatal and everything else still installs.
 
+### Upgrading past the VRAM ledger
+
+Upgrade the whole installation in one pass — `bootstrap.sh` does this, and
+it is why the README argues for one shared installation and never a
+vendored copy. A runner from before the ledger reads `<key>.lock.json` and
+cannot see `<key>.lock.d/`, so it treats a new `gpu-claim` holder's trainer
+as an orphan and kills it. The reverse direction is safe: new code reads an
+old holder's file as an exclusive claim, and a pre-ledger `gpu-claim`
+holding `flock` for its whole run is reported as such rather than hung on.
+
 ## 4. Declare your projects
 
 Edit `$GPUQ_CONFIG` on the box, then rerun `bootstrap.sh` to clone them:
@@ -122,6 +158,10 @@ Edit `$GPUQ_CONFIG` on the box, then rerun `bootstrap.sh` to clone them:
 root = "/workspace/queue"
 cpu_slots = 4          # not the core count; see docs/design.md
 claim_dir = "/workspace/lock/gpu"
+# gpu_vram_mb = 8188   # default: ask the card
+gpu_vram_reserve_mb = 512
+gpu_max_jobs = 2
+enforce_vram = true
 
 [project.myproject]
 remote   = "git@github.com:me/myproject.git"
@@ -129,6 +169,69 @@ checkout = "/workspace/checkouts/myproject"
 venv     = "/venv/main"      # jobs get this on PATH
 commit_artifacts = true
 ```
+
+The four GPU-capacity keys, all under `[queue]`:
+
+| Key | Default | |
+|---|---|---|
+| `gpu_vram_mb` | what `nvidia-smi` reports | Capacity override, for boxes where the query is unavailable or reports more than the driver will hand out. |
+| `gpu_vram_reserve_mb` | `512` | Held back from admission. Two jobs that each fit exactly still fragment the same heap; this is the only lever against that. |
+| `gpu_max_jobs` | `2` | A latency budget, not a safety one. VRAM alone would admit sixteen 500 MiB jobs onto an 8 GB card, all time-slicing and each slower than if it had waited. 2 is what has been measured (15% → 62% utilization); raise it on a box that has measured more. |
+| `enforce_vram` | `true` | Kill a job using more than it declared. Off does not make over-use safe — it makes it unattributable. Write it unquoted: `"false"` in quotes is a config error, not `false`. |
+
+The first three are read by `gpu-claim` as well as by the runner, because the
+two of them share one ledger and a capacity they disagree about is a card
+they will double-book. `gpu_max_jobs` is in that set because the cap is
+enforced in the ledger, against every holder of the card — a limit only the
+runner applied to its own jobs would leave four hand-run `gpu-claim`s
+time-slicing on an 8 GB card, which is the contention it exists to bound.
+
+`gpu-claim` finds this file at `$GPUQ_CONFIG`, or `/workspace/gpuq.toml`;
+where it finds neither it sizes the card from `nvidia-smi`, holds back the
+default 512 MiB and caps at the default 2 jobs, which is what a box with no
+runner deployed wants. So if you override any of the three on a box where
+people also run `gpu-claim` by hand, make sure `GPUQ_CONFIG` is exported in
+their environment too — otherwise they will admit against the nameplate total
+while the runner admits against yours.
+
+**`gpuq-runner --config` does not move `gpu-claim`.** A standalone claim has
+no way to know what flags the daemon was started with, so it reads
+`$GPUQ_CONFIG`/`/workspace/gpuq.toml` regardless. Starting the runner on some
+other path reopens exactly the divergence above: declare `gpu_vram_mb = 7000`
+in `/etc/gpuq-alt.toml`, pass it with `--config`, and the runner admits
+against 6488 MiB while `gpu-claim` sizes from `nvidia-smi`'s 8188 and admits
+against 7676 — 1188 MiB of over-admission into one ledger. The runner warns
+about this at startup; export `GPUQ_CONFIG` to the same path to clear it.
+
+**These three keys are read once, at startup.** The runner caches the card's
+total for the life of the daemon, where `gpu-claim` re-reads the file on every
+invocation. Raising `gpu_vram_reserve_mb` after an OOM without restarting the
+runner therefore splits the two views again — `gpu-claim` immediately admits
+against `total - 2048` while the runner keeps admitting against `total - 512`.
+Restart the runner after editing any of them.
+
+`gpu_vram_mb` describes the card the runner manages, which is always card 0.
+`gpu-claim --gpu-index 1` sizes card 1 from `nvidia-smi` regardless, and
+applies the reserve.
+
+### Telling submitters how to size `--vram-mb`
+
+A declaration is measured the way it is enforced: `nvidia-smi`'s per-pid used
+memory, in MiB. That number includes the ~250 MiB CUDA context and PyTorch's
+caching allocator high-water mark, not live tensor bytes. **A declaration
+sized from `torch.cuda.max_memory_allocated()` will be too small**, and the
+watchdog will kill the job for exceeding a figure its author thought was
+generous. Tell people to read the number off `nvidia-smi` during a run, and
+to round up.
+
+### The claim directory must be on a local filesystem
+
+The ledger's correctness rests on `flock` over `$GPU_CLAIM_DIR` and on
+`os.replace` being atomic within it. Both hold on a local filesystem. On NFS
+they are unverified here — `flock` is emulated via POSIX locks on Linux
+clients and its behaviour across a server restart is not something gpuq has
+been tested against. Keep the claim directory on local disk; there is no
+reason for it to be shared, since it describes one box's card.
 
 Set `venv` even if the runner already lives there. It is what puts `python` on
 a job's PATH — and on many images there is **no bare `python`**, only `python3`,

@@ -27,6 +27,10 @@ def no_gpu_calls(monkeypatch):
     monkeypatch.setattr(rp, "release_stale", lambda directory=None: [])
     monkeypatch.setattr(rp, "compute_apps", lambda: [])
     monkeypatch.setattr(rp, "own_pids", lambda: set())
+    # Attribution now walks each record's process tree; without this every
+    # test using the stubbed compute_apps() would also need to know about
+    # ledger.attribute's internals.
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
 
 def test_requeues_running_job_with_dead_pid(q, cfg):
     q.submit(mkspec())
@@ -137,7 +141,8 @@ def test_reap_can_skip_the_expensive_cuda_sweep(tmp_path, monkeypatch):
     from gpuqueue.reaper import reap
     import gpuqueue.reaper as rp
     called = []
-    monkeypatch.setattr(rp, "kill_orphan_cuda", lambda protect: called.append(1) or [])
+    monkeypatch.setattr(rp, "kill_orphan_cuda",
+                        lambda protect, records, apps: called.append(1) or [])
     q = QueueRoot(tmp_path / "q"); q.ensure_dirs()
     cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path / "c")
     reap(q, cfg, include_orphan_cuda=False)
@@ -150,7 +155,7 @@ def test_reap_can_skip_the_expensive_cuda_sweep(tmp_path, monkeypatch):
 #
 # The README advertises `gpu-claim -- <cmd>` as usable on its own. Its CUDA
 # process is the *child* of the pid recorded in the claim file, and
-# `preflight.own_pids` expands `_descendants()` only for the runner's own
+# `preflight.own_pids` expands `descendants()` only for the runner's own
 # pid -- so that child is exempted by nothing and `kill_orphan_cuda`
 # SIGKILLs a legitimate run. Every other test in this file stubs
 # `own_pids` to set(), which is why the suite cannot currently see this.
@@ -164,7 +169,7 @@ from pathlib import Path as _Path
 from gpuqueue import preflight as _pf
 
 # Detaches before spawning its child, so the pair is NOT in pytest's own
-# process tree. Without the double fork `_descendants(os.getpid())` exempts
+# process tree. Without the double fork `descendants(os.getpid())` exempts
 # them and these tests pass while the bug is fully present.
 _HOLDER = r'''
 import json, os, subprocess, sys, time
@@ -217,8 +222,8 @@ def direct_claim(tmp_path, monkeypatch):
         "started_at": "2026-08-10T00:00:00Z", "key": "GPU-test"}))
 
     # The whole reproduction rests on these two not being in pytest's tree.
-    assert holder not in _pf._descendants(_os.getpid())
-    assert child not in _pf._descendants(_os.getpid())
+    assert holder not in _pf.descendants(_os.getpid())
+    assert child not in _pf.descendants(_os.getpid())
     try:
         yield holder, child
     finally:
@@ -255,3 +260,329 @@ def test_does_not_kill_a_direct_gpu_claim_run(q, direct_claim, monkeypatch):
         _time.sleep(0.05)
     assert _live(child), "SIGKILLed a legitimate direct gpu-claim run"
     assert result["killed_pids"] == []
+
+
+def test_a_ledgered_co_tenants_process_is_not_an_orphan(q, tmp_path, monkeypatch):
+    """The whole point of sharing: a declared holder's CUDA process is
+    someone else's job, not debris."""
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    lg.write_record(lg.Record(
+        path=lg.ledger_dir("k", tmp_path) / f"{_os.getpid()}.aaa.json",
+        pid=_os.getpid(), usage_pid=_os.getpid(), vram_mb=512, owner="co",
+        cmd=[], started_at="2026-08-10T00:00:00Z", key="k"))
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 5150, "used_mb": 400, "name": "co.py"}])
+    monkeypatch.setattr(rp, "descendants",
+                        lambda pid: {5150} if pid == _os.getpid() else set())
+    # ledger.attribute() walks its *own* `descendants` (imported directly
+    # in ledger.py), never reaper's -- patching rp.descendants above
+    # cannot reach it. This is what actually puts 5150 in the co-tenant's
+    # tree; see the identical note in tests/test_preflight.py, which hit
+    # the same thing.
+    monkeypatch.setattr(lg, "descendants",
+                        lambda pid: {5150} if pid == _os.getpid() else set())
+    monkeypatch.setattr(rp, "_kill", lambda pid: pytest.fail("killed a co-tenant"))
+    assert reap(q, cfg)["killed_pids"] == []
+
+
+def test_an_unledgered_process_is_still_killed(q, tmp_path, monkeypatch):
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 4321, "used_mb": 900, "name": "x.py"}])
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    killed = []
+    monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
+    assert reap(q, cfg)["killed_pids"] == [4321]
+
+
+# --- the VRAM watchdog ---------------------------------------------------
+
+def _rec(tmp_path, name, usage_pid, vram_mb, owner="gpuq:j1"):
+    from gpuqueue import ledger as lg
+    return lg.Record(path=lg.ledger_dir("k", tmp_path) / name, pid=_os.getpid(),
+                     usage_pid=usage_pid, vram_mb=vram_mb, owner=owner,
+                     cmd=["python", "t.py"], started_at="2026-08-10T00:00:00Z",
+                     key="k")
+
+
+def test_one_sweep_over_the_line_does_not_convict(tmp_path, monkeypatch):
+    """The caching allocator's high-water mark moves in steps; one sample
+    over is not evidence of a persistent overage."""
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    strikes = {}
+    apps = [{"pid": 500, "used_mb": 3070, "name": "t.py"}]
+    assert rp.check_vram([r], apps, strikes) == []
+    assert strikes[str(r.path)] == 1
+
+
+def test_two_consecutive_sweeps_convict(tmp_path, monkeypatch):
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    strikes = {}
+    apps = [{"pid": 500, "used_mb": 3070, "name": "t.py"}]
+    rp.check_vram([r], apps, strikes)
+    (guilty,) = rp.check_vram([r], apps, strikes)
+    assert guilty["declared"] == 512 and guilty["used"] == 3070
+    assert guilty["owner"] == "gpuq:j1" and guilty["usage_pid"] == 500
+
+
+def test_a_sweep_back_under_the_line_clears_the_strike(tmp_path, monkeypatch):
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    strikes = {}
+    rp.check_vram([r], [{"pid": 500, "used_mb": 3070, "name": "t"}], strikes)
+    rp.check_vram([r], [{"pid": 500, "used_mb": 400, "name": "t"}], strikes)
+    assert strikes == {}
+
+
+def test_an_exclusive_holder_is_never_over(tmp_path, monkeypatch):
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, None)
+    apps = [{"pid": 500, "used_mb": 8000, "name": "t.py"}]
+    rp.check_vram([r], apps, {})
+    assert rp.check_vram([r], apps, {}) == []
+
+
+def test_a_holders_children_count_toward_its_declaration(tmp_path, monkeypatch):
+    """A trainer's dataloader workers hold VRAM under the same record."""
+    from gpuqueue import ledger as lg
+    # ledger.attribute() resolves `descendants` from ledger's own module
+    # namespace (`from .procs import descendants`), not reaper's -- so the
+    # reaper-side stub below never reaches it, and the tree must be stubbed
+    # there too or the test would pass on a check_vram that ignores
+    # descendants entirely. See the identical note in
+    # test_a_ledgered_co_tenants_process_is_not_an_orphan above.
+    monkeypatch.setattr(rp, "descendants",
+                        lambda pid: {501, 502} if pid == 500 else set())
+    monkeypatch.setattr(lg, "descendants",
+                        lambda pid: {501, 502} if pid == 500 else set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    apps = [{"pid": 500, "used_mb": 200, "name": "t"},
+            {"pid": 501, "used_mb": 200, "name": "w"},
+            {"pid": 502, "used_mb": 200, "name": "w"}]
+    strikes = {}
+    rp.check_vram([r], apps, strikes)
+    (guilty,) = rp.check_vram([r], apps, strikes)
+    assert guilty["used"] == 600
+
+
+def test_broken_attribution_convicts_nobody(tmp_path, monkeypatch):
+    """Under MPS nvidia-smi reports the server, not its clients, so every
+    process looks unledgered. That is a broken measurement, not a box full
+    of intruders."""
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    apps = [{"pid": 9999, "used_mb": 8000, "name": "nvidia-cuda-mps-server"}]
+    strikes = {}
+    rp.check_vram([r], apps, strikes)
+    assert rp.check_vram([r], apps, strikes) == []
+    assert strikes == {}
+
+
+def test_a_departed_holder_stops_accruing_strikes(tmp_path, monkeypatch):
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    r = _rec(tmp_path, "1.a.json", 500, 512)
+    strikes = {}
+    rp.check_vram([r], [{"pid": 500, "used_mb": 3070, "name": "t"}], strikes)
+    assert rp.check_vram([], [], strikes) == []
+    assert strikes == {}
+
+
+def test_enforce_vram_off_convicts_nobody(q, tmp_path, monkeypatch):
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path,
+                       kill_orphan_cuda=False, enforce_vram=False)
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 500, "used_mb": 8000, "name": "t"}])
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    strikes = {}
+    reap(q, cfg, vram_strikes=strikes)
+    assert reap(q, cfg, vram_strikes=strikes)["convicted"] == []
+
+
+def test_a_convicted_holder_is_sigtermed_before_sigkill(monkeypatch):
+    """The spec's §6: a convicted holder is SIGTERMed then SIGKILLed. Kill
+    it outright and a trainer flushes no logs and writes no checkpoint, so
+    the run and the evidence are both lost."""
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    sent = []
+    real = rp._signal
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append(sig) or real(pid, sig))
+    proc = _sp.Popen(["sleep", "30"])
+    try:
+        assert rp._kill_tree(proc.pid) is True
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    assert sent == [_signal.SIGTERM], "escalated past SIGTERM needlessly"
+
+
+def test_kill_tree_does_not_wait_out_a_zombie(monkeypatch):
+    """`pid_alive` is kill(pid, 0), which a zombie answers. The runner is
+    the parent of what it convicts and does not reap it until `collect()`,
+    so without the /proc check every conviction would burn both grace
+    periods waiting for a process that has already exited."""
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    proc = _sp.Popen(["sh", "-c", "exit 0"])
+    deadline = _time.monotonic() + 5
+    while _live(proc.pid) and _time.monotonic() < deadline:
+        _time.sleep(0.02)          # a zombie: exited, not yet waited for
+    try:
+        started = _time.monotonic()
+        rp._kill_tree(proc.pid)
+        assert _time.monotonic() - started < 1.0
+    finally:
+        proc.wait(timeout=5)
+
+
+def test_an_unreadable_proc_stat_is_not_read_as_exited(monkeypatch):
+    """The zombie check above must not turn into a blanket amnesty.
+
+    Under a `hidepid` /proc mount the stat file cannot be opened at all.
+    Reading that as "already exited" empties `_kill_tree`'s alive list on
+    the SIGKILL pass, so a convicted trainer that blocks SIGTERM survives
+    the watchdog outright. `pid_alive` is the authority on existence; an
+    unreadable stat only means the *state* is unknown.
+    """
+    def denied(path, *a, **k):
+        raise PermissionError(path)
+    monkeypatch.setattr(rp, "open", denied, raising=False)
+    assert rp._exited(_os.getpid()) is False
+
+
+def test_a_conviction_whose_kill_failed_is_not_reported_as_killed(
+        q, tmp_path, monkeypatch):
+    """Records live in a claim directory shared with hand-run `gpu-claim`
+    jobs, so a convicted holder can belong to another user. `_signal`
+    swallows the EPERM, so that holder keeps running and keeps over-using
+    the card -- while the runner logs `killed ...` and the sweep reports a
+    conviction indistinguishable from one that landed.
+    """
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path,
+                       kill_orphan_cuda=False, enforce_vram=True)
+    rec = _rec(tmp_path, "1.a.json", 500, 512, owner="alice")
+    monkeypatch.setattr(lg, "all_records", lambda d: [rec])
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 500, "used_mb": 3070, "name": "t"}])
+    monkeypatch.setattr(rp, "_kill_tree", lambda pid: False)  # EPERM
+
+    strikes = {}
+    reap(q, cfg, vram_strikes=strikes)                    # first strike
+    (guilty,) = reap(q, cfg, vram_strikes=strikes)["convicted"]
+
+    assert guilty["killed"] is False
+
+
+def test_a_holder_that_had_already_exited_is_not_reported_as_unkillable(
+        monkeypatch):
+    """`killed` is what stamps the runner's co-tenant window, and an
+    over-using trainer usually OOMs itself within milliseconds of its
+    victim -- around the very sweep that convicts it. Reading "nothing left
+    to signal" as "could not kill" therefore denied the victim the one
+    retry `_hit_by_a_convicted_co_tenant` exists to grant, and logged
+    `COULD NOT KILL` over a process that was already gone.
+    """
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    sent = []
+    monkeypatch.setattr(rp, "_signal", lambda pid, sig: sent.append(sig))
+    proc = _sp.Popen(["sh", "-c", "exit 0"])
+    proc.wait(timeout=5)
+
+    assert rp._kill_tree(proc.pid) is True
+    assert sent == [], "signalled a process that had already exited"
+
+
+def test_a_blind_sweep_does_not_bank_a_vram_strike(q, tmp_path, monkeypatch):
+    """`WATCHDOG_STRIKES` counts *consecutive* sweeps over the declaration.
+    A sweep whose nvidia-smi call fails measured nothing at all, so a
+    strike left banked across it lets one spike now and one spike an hour
+    later add up to a conviction -- effectively killing on a single sample,
+    which is exactly what the strike count exists to prevent.
+    """
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path,
+                       kill_orphan_cuda=False, enforce_vram=True)
+    rec = _rec(tmp_path, "1.a.json", 500, 512, owner="alice")
+    monkeypatch.setattr(lg, "all_records", lambda d: [rec])
+    monkeypatch.setattr(rp, "_kill_tree", lambda pid: True)
+    over = [{"pid": 500, "used_mb": 3070, "name": "t"}]
+    seen = iter([over, None, over])
+    monkeypatch.setattr(rp, "compute_apps", lambda: next(seen))
+
+    strikes = {}
+    reap(q, cfg, vram_strikes=strikes)          # over the line: one strike
+    reap(q, cfg, vram_strikes=strikes)          # nvidia-smi says nothing
+    assert strikes == {}
+    assert reap(q, cfg, vram_strikes=strikes)["convicted"] == []
+
+
+def test_a_conviction_whose_kill_landed_says_so(q, tmp_path, monkeypatch):
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path,
+                       kill_orphan_cuda=False, enforce_vram=True)
+    rec = _rec(tmp_path, "1.a.json", 500, 512, owner="alice")
+    monkeypatch.setattr(lg, "all_records", lambda d: [rec])
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 500, "used_mb": 3070, "name": "t"}])
+    monkeypatch.setattr(rp, "_kill_tree", lambda pid: True)
+
+    strikes = {}
+    reap(q, cfg, vram_strikes=strikes)
+    (guilty,) = reap(q, cfg, vram_strikes=strikes)["convicted"]
+
+    assert guilty["killed"] is True
+
+
+def test_sweep_spares_the_whole_tree_of_a_running_job(q, tmp_path, monkeypatch):
+    """A runner restart splits the two halves of one reap() call.
+
+    `release_stale` deletes the job's ledger record, because that record
+    carries the *dead runner's* pid; `requeue_orphans` deliberately spares
+    the job, because `spec.pid` is still alive. Between them the sweep sees
+    the job's trainer -- a child of `spec.pid`, since spec.pid is a venv or
+    shell wrapper, a torchrun, a dataloader parent -- with no record to
+    charge it to. Protecting only the top-level pid SIGKILLs it.
+    """
+    import os
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path / "claims",
+                       kill_orphan_cuda=True, enforce_vram=False)
+    q.submit(mkspec())
+    spec = q.claim("j1")
+    spec.pid = os.getpid()          # the job survived; its runner did not
+    q._write(q.path_for("running", "j1"), spec)
+
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 4242, "used_mb": 100}])
+    monkeypatch.setattr(rp, "descendants",
+                        lambda pid: {4242} if pid == os.getpid() else set())
+    killed = []
+    monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
+
+    assert reap(q, cfg)["killed_pids"] == []
+    assert killed == []
+
+
+def test_sweep_still_kills_a_process_under_nobody(q, tmp_path, monkeypatch):
+    """The exemption above must not turn into a blanket amnesty."""
+    import os
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path / "claims",
+                       kill_orphan_cuda=True, enforce_vram=False)
+    q.submit(mkspec())
+    spec = q.claim("j1")
+    spec.pid = os.getpid()
+    q._write(q.path_for("running", "j1"), spec)
+
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 9999, "used_mb": 100}])
+    monkeypatch.setattr(rp, "descendants",
+                        lambda pid: {4242} if pid == os.getpid() else set())
+    monkeypatch.setattr(rp, "_kill", lambda pid: True)
+
+    assert reap(q, cfg)["killed_pids"] == [9999]

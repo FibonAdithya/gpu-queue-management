@@ -7,7 +7,8 @@ import os
 import subprocess
 import sys
 
-from .claim import gpu_claim, ClaimBusy, release_stale, list_claims
+from .claim import (gpu_claim, ClaimBusy, CannotEverFit, release_stale,
+                    list_claims, default_usable_mb)
 from .gpuid import gpu_key, cuda_visible_value, GpuIdError
 from .preflight import preflight, PreflightFailed
 
@@ -26,6 +27,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu-index", type=int, default=0)
     p.add_argument("--status", action="store_true", help="print live claims")
     p.add_argument("--reap", action="store_true", help="release dead claims")
+    p.add_argument("--vram-mb", dest="vram_mb", type=int, default=None,
+                   help="VRAM this command needs, in MiB as nvidia-smi "
+                        "reports it (so including the ~250 MiB CUDA "
+                        "context and the allocator's high-water mark, "
+                        "not torch's max_memory_allocated). Omit to "
+                        "take the whole card.")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     return p
 
@@ -89,6 +96,16 @@ def main(argv: list[str] | None = None) -> int:
     if not cmd:
         print("gpu-claim: a command is required after --", file=sys.stderr)
         return 2
+    if args.vram_mb is not None and args.vram_mb <= 0:
+        # 2, not 69/75: nothing about the card is wrong, the command line
+        # is. A typo'd minus sign here is not a claim that fails to be
+        # admitted -- `ledger.fits` sums declarations, so a negative one
+        # subtracts from the accounted total and lets the *next* claimant
+        # be admitted past the end of the card.
+        print(f"gpu-claim: --vram-mb must be a positive number of MiB, got "
+              f"{args.vram_mb}; omit it to take the whole card",
+              file=sys.stderr)
+        return 2
 
     try:
         key = gpu_key(args.gpu_index)
@@ -104,8 +121,18 @@ def main(argv: list[str] | None = None) -> int:
             return EX_UNAVAILABLE
 
     try:
-        with gpu_claim(key=key, owner=args.owner, cmd=cmd, wait=args.wait):
+        # Sized here rather than left to gpu_claim's default, which asks
+        # about card 0. We are the only one who knows which card --gpu-index
+        # named, and it is the card the key and the pin already point at.
+        with gpu_claim(key=key, owner=args.owner, cmd=cmd, wait=args.wait,
+                       vram_mb=args.vram_mb,
+                       usable_mb=default_usable_mb(args.gpu_index)):
             return subprocess.run(cmd, env=_child_env(args.gpu_index)).returncode
+    except CannotEverFit as e:
+        # Ahead of ClaimBusy, which it subclasses: 75 means "try again
+        # later" and there is no later in which this declaration fits.
+        print(f"gpu-claim: {e}", file=sys.stderr)
+        return EX_UNAVAILABLE
     except ClaimBusy as e:
         print(f"gpu-claim: {e}", file=sys.stderr)
         return EX_TEMPFAIL
