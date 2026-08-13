@@ -182,9 +182,20 @@ def exceeds_capacity(want_mb: int | None, usable_mb: int | None) -> bool:
 
     The runner needs this apart from `fits` so it can fail such a job
     instead of leaving it pending forever.
+
+    A declaration that is not a number at all is not this function's to
+    judge: `gpu_claim` owns that rule and raises ValueError on it, and
+    `runner._take_card` catches that to fail the one job. Comparing it
+    here instead would raise TypeError from under `_take_card`'s capacity
+    pre-check -- before that catch, and not a subclass of it -- so a
+    hand-edited `"vram_mb": "512"` would kill the daemon rather than the
+    job. `docs/design.md` makes such a repair supported, so this must be
+    total over whatever ends up on disk.
     """
-    if want_mb is None or usable_mb is None:
-        return False
+    if not isinstance(want_mb, int) or isinstance(want_mb, bool):
+        return False        # None, or a value the validator will refuse
+    if not isinstance(usable_mb, int) or isinstance(usable_mb, bool):
+        return False        # capacity unknown; nothing can be ruled out
     return want_mb > usable_mb
 
 

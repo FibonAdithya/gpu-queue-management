@@ -441,6 +441,105 @@ def test_kill_tree_does_not_wait_out_a_zombie(monkeypatch):
         proc.wait(timeout=5)
 
 
+def test_an_unreadable_proc_stat_is_not_read_as_exited(monkeypatch):
+    """The zombie check above must not turn into a blanket amnesty.
+
+    Under a `hidepid` /proc mount the stat file cannot be opened at all.
+    Reading that as "already exited" empties `_kill_tree`'s alive list on
+    the SIGKILL pass, so a convicted trainer that blocks SIGTERM survives
+    the watchdog outright. `pid_alive` is the authority on existence; an
+    unreadable stat only means the *state* is unknown.
+    """
+    def denied(path, *a, **k):
+        raise PermissionError(path)
+    monkeypatch.setattr(rp, "open", denied, raising=False)
+    assert rp._exited(_os.getpid()) is False
+
+
+def test_a_conviction_whose_kill_failed_is_not_reported_as_killed(
+        q, tmp_path, monkeypatch):
+    """Records live in a claim directory shared with hand-run `gpu-claim`
+    jobs, so a convicted holder can belong to another user. `_signal`
+    swallows the EPERM, so that holder keeps running and keeps over-using
+    the card -- while the runner logs `killed ...` and the sweep reports a
+    conviction indistinguishable from one that landed.
+    """
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path,
+                       kill_orphan_cuda=False, enforce_vram=True)
+    rec = _rec(tmp_path, "1.a.json", 500, 512, owner="alice")
+    monkeypatch.setattr(lg, "all_records", lambda d: [rec])
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 500, "used_mb": 3070, "name": "t"}])
+    monkeypatch.setattr(rp, "_kill_tree", lambda pid: False)  # EPERM
+
+    strikes = {}
+    reap(q, cfg, vram_strikes=strikes)                    # first strike
+    (guilty,) = reap(q, cfg, vram_strikes=strikes)["convicted"]
+
+    assert guilty["killed"] is False
+
+
+def test_a_holder_that_had_already_exited_is_not_reported_as_unkillable(
+        monkeypatch):
+    """`killed` is what stamps the runner's co-tenant window, and an
+    over-using trainer usually OOMs itself within milliseconds of its
+    victim -- around the very sweep that convicts it. Reading "nothing left
+    to signal" as "could not kill" therefore denied the victim the one
+    retry `_hit_by_a_convicted_co_tenant` exists to grant, and logged
+    `COULD NOT KILL` over a process that was already gone.
+    """
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    sent = []
+    monkeypatch.setattr(rp, "_signal", lambda pid, sig: sent.append(sig))
+    proc = _sp.Popen(["sh", "-c", "exit 0"])
+    proc.wait(timeout=5)
+
+    assert rp._kill_tree(proc.pid) is True
+    assert sent == [], "signalled a process that had already exited"
+
+
+def test_a_blind_sweep_does_not_bank_a_vram_strike(q, tmp_path, monkeypatch):
+    """`WATCHDOG_STRIKES` counts *consecutive* sweeps over the declaration.
+    A sweep whose nvidia-smi call fails measured nothing at all, so a
+    strike left banked across it lets one spike now and one spike an hour
+    later add up to a conviction -- effectively killing on a single sample,
+    which is exactly what the strike count exists to prevent.
+    """
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path,
+                       kill_orphan_cuda=False, enforce_vram=True)
+    rec = _rec(tmp_path, "1.a.json", 500, 512, owner="alice")
+    monkeypatch.setattr(lg, "all_records", lambda d: [rec])
+    monkeypatch.setattr(rp, "_kill_tree", lambda pid: True)
+    over = [{"pid": 500, "used_mb": 3070, "name": "t"}]
+    seen = iter([over, None, over])
+    monkeypatch.setattr(rp, "compute_apps", lambda: next(seen))
+
+    strikes = {}
+    reap(q, cfg, vram_strikes=strikes)          # over the line: one strike
+    reap(q, cfg, vram_strikes=strikes)          # nvidia-smi says nothing
+    assert strikes == {}
+    assert reap(q, cfg, vram_strikes=strikes)["convicted"] == []
+
+
+def test_a_conviction_whose_kill_landed_says_so(q, tmp_path, monkeypatch):
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path,
+                       kill_orphan_cuda=False, enforce_vram=True)
+    rec = _rec(tmp_path, "1.a.json", 500, 512, owner="alice")
+    monkeypatch.setattr(lg, "all_records", lambda d: [rec])
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 500, "used_mb": 3070, "name": "t"}])
+    monkeypatch.setattr(rp, "_kill_tree", lambda pid: True)
+
+    strikes = {}
+    reap(q, cfg, vram_strikes=strikes)
+    (guilty,) = reap(q, cfg, vram_strikes=strikes)["convicted"]
+
+    assert guilty["killed"] is True
+
+
 def test_sweep_spares_the_whole_tree_of_a_running_job(q, tmp_path, monkeypatch):
     """A runner restart splits the two halves of one reap() call.
 

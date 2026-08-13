@@ -151,8 +151,16 @@ def _exited(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat") as fh:
             stat = fh.read()
+    except FileNotFoundError:
+        return True     # it exited between `pid_alive` and this read
     except OSError:
-        return True
+        # Unreadable, not absent -- a `hidepid` mount hides other users'
+        # entries. `pid_alive` has already said this pid exists, and only
+        # its *state* is in question here, so the safe answer is "still
+        # alive": reading it as exited empties `_kill_tree`'s alive list
+        # on the SIGKILL pass, and a convicted trainer that blocks SIGTERM
+        # then survives the watchdog entirely.
+        return False
     # The comm field can contain spaces and parentheses; state is the
     # first field after the last ')'.
     fields = stat.rpartition(")")[2].split()
@@ -178,21 +186,33 @@ def _kill_tree(pid: int) -> bool:
     up front, and both loops exit early once everything in it has exited.
     A card still held by a dying trainer is not the moment to admit more
     work anyway -- the same trade `_kill_group` documents.
+
+    Returns whether the tree is off the card, which is not the same as
+    whether a signal landed. A holder that had already exited gets no
+    signal, and reporting that as failure told the runner the over-user
+    was still running: it logged `COULD NOT KILL` over a dead process and,
+    far worse, skipped stamping `_last_conviction`, so the co-tenant that
+    OOMed *because* of the overage failed `_hit_by_a_convicted_co_tenant`
+    and was never requeued. That is not a corner case -- an over-using
+    trainer typically OOMs itself within milliseconds of its victim, i.e.
+    right around the sweep that convicts it. False is reserved for the
+    case that actually needs it: a tree still alive after SIGKILL, which
+    on this shared claim directory means another user's process and an
+    EPERM `_signal` swallowed.
     """
     tree = {pid} | descendants(pid)
-    signalled = False
     for sig, grace in ((signal.SIGTERM, 10.0), (signal.SIGKILL, 5.0)):
         alive = [p for p in tree if not _exited(p)]
         if not alive:
-            break
+            return True
         for p in alive:
-            signalled = _signal(p, sig) or signalled
+            _signal(p, sig)
         deadline = time.monotonic() + grace
         while time.monotonic() < deadline:
             if all(_exited(p) for p in tree):
-                break
+                return True
             time.sleep(0.1)
-    return signalled
+    return all(_exited(p) for p in tree)
 
 
 def check_vram(records: list, apps: list[dict],
@@ -265,7 +285,18 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
     # neither on every timer tick.
     if include_orphan_cuda and (cfg.kill_orphan_cuda or cfg.enforce_vram):
         apps = compute_apps()
-        if apps is not None:
+        if apps is None:
+            # A sweep that cannot see the process list measured nothing, so
+            # it must not leave a strike banked. `WATCHDOG_STRIKES` counts
+            # *consecutive* sweeps over the declaration -- both branches
+            # that do run (`strikes.pop` under the limit, `strikes.clear()`
+            # on a broken measurement) forget, and a blind sweep is the
+            # blindest of the three. Left banked, a job that spikes once
+            # now and once an hour later, with nvidia-smi unavailable in
+            # between, is SIGKILLed on what is effectively one sample.
+            if vram_strikes is not None:
+                vram_strikes.clear()
+        else:
             # Inside the guard: with no visible process list neither
             # consumer runs, and walking the claim directory to build
             # records nothing will read is pure cost on every sweep of a
@@ -278,8 +309,15 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
             if cfg.enforce_vram and vram_strikes is not None:
                 convicted = check_vram(records, apps, vram_strikes)
                 for c in convicted:
-                    if c["usage_pid"]:
-                        _kill_tree(c["usage_pid"])
+                    # Whether the kill landed is not a detail the caller
+                    # can infer: this directory is shared with hand-run
+                    # `gpu-claim` jobs, so a holder can belong to another
+                    # user, `_signal` swallows the EPERM, and that holder
+                    # goes on over-using the card. Reporting the
+                    # conviction alone would have the runner log `killed`
+                    # over a process that is still running.
+                    c["killed"] = bool(c["usage_pid"]) and _kill_tree(
+                        c["usage_pid"])
     cleaned = clean_partials(queue)
     return {"stale_claims": stale, "requeued": requeued, "failed": failed,
             "killed_pids": killed, "cleaned_paths": cleaned,

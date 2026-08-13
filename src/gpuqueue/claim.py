@@ -125,6 +125,18 @@ def release_stale(directory: Path | None = None) -> list[dict]:
     return released
 
 
+def _refuse_if_too_big(key: str, vram_mb: int | None,
+                       usable_mb: int | None) -> None:
+    """A declaration larger than the whole card, refused rather than waited
+    on: every waiter in `gpu_claim` polls for room to appear, and room for
+    a claim this size never does. `_take_card` makes the same call for the
+    same reason."""
+    if ledger.exceeds_capacity(vram_mb, usable_mb):
+        raise ledger.CannotEverFit(
+            f"GPU {key}: declared {vram_mb} MiB but only {usable_mb} MiB is "
+            "usable on this card; it can never be admitted")
+
+
 @contextmanager
 def gpu_claim(key: str | None = None, owner: str | None = None,
               cmd: list[str] | None = None, wait: bool = False,
@@ -178,17 +190,12 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
             f"card), got {vram_mb!r}")
     d = Path(directory) if directory else claim_dir()
     key = key or gpu_key()
-    if usable_mb is _ASK_THE_CARD:
+    ours_to_ask = usable_mb is _ASK_THE_CARD
+    if ours_to_ask:
         usable_mb = default_usable_mb()
     if max_holders is _ASK_THE_CONFIG:
         max_holders = config.max_holders()
-    if ledger.exceeds_capacity(vram_mb, usable_mb):
-        # Before the wait loop, not inside it: every waiter below polls for
-        # room to appear, and room for a claim larger than the whole card
-        # never does. `_take_card` makes the same call for the same reason.
-        raise ledger.CannotEverFit(
-            f"GPU {key}: declared {vram_mb} MiB but only {usable_mb} MiB is "
-            "usable on this card; it can never be admitted")
+    _refuse_if_too_big(key, vram_mb, usable_mb)
     warned = False
     while True:
         try:
@@ -211,6 +218,22 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
             if not wait:
                 raise
             time.sleep(WAIT_POLL_S)
+        if ours_to_ask and usable_mb is None:
+            # A capacity query that failed is not latched for the whole
+            # wait. `default_usable_mb` returns None for a card that would
+            # not answer, and `ledger.fits` reads that as exclusive-only:
+            # the waiter then polls until the card is completely empty,
+            # which on a shared box is hours, over a subprocess hiccup that
+            # cleared on the next poll. `Runner._usable_mb` declines to
+            # cache a failed query for exactly this reason; a wait loop
+            # that asked once, before the loop, latched it just as hard.
+            #
+            # Only when we were the ones who asked: an explicit None from
+            # the caller means "I asked and the card would not say", and
+            # re-deriving a capacity that ignores their configured reserve
+            # is the double-booking the sentinel exists to prevent.
+            usable_mb = default_usable_mb()
+            _refuse_if_too_big(key, vram_mb, usable_mb)
     try:
         yield rec
     finally:

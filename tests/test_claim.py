@@ -101,6 +101,96 @@ def test_wait_blocks_until_there_is_room(tmp_path, monkeypatch):
         assert c.vram_mb == 1000
 
 
+def _bounded_poll(limit=5):
+    """A `time.sleep` for the wait loop that fails instead of hanging.
+
+    The bug these two tests cover is a wait that never ends, so a naive
+    stub would regress into a suite that hangs rather than one that fails.
+    """
+    polls = []
+    real_sleep = __import__("time").sleep
+
+    def poll(s):
+        polls.append(s)
+        if len(polls) > limit:
+            raise AssertionError(
+                f"still waiting after {limit} polls: the failed capacity "
+                "query was latched for the whole wait")
+        real_sleep(0)
+    return poll
+
+
+def test_a_wait_re_asks_the_card_after_a_failed_capacity_query(tmp_path,
+                                                               monkeypatch):
+    """A capacity query that failed must not be latched for the whole wait.
+
+    `default_usable_mb` answers None for a card that would not say, and
+    `ledger.fits` reads that as exclusive-only -- so a waiter that asked
+    once, before the loop, polls until the card is *completely empty*.
+    That is hours on a shared box, over an nvidia-smi hiccup that cleared
+    on the next poll. `Runner._usable_mb` declines to cache a failed query
+    for exactly this reason.
+    """
+    lg.acquire(KEY, vram_mb=3000, owner="a", cmd=[], directory=tmp_path,
+               usable_mb=7676)          # a co-tenant, with room beside it
+    answers = iter([None, 7676])
+    monkeypatch.setattr("gpuqueue.claim.default_usable_mb",
+                        lambda index=0: next(answers, 7676))
+    monkeypatch.setattr("gpuqueue.claim.time.sleep", _bounded_poll())
+
+    # usable_mb omitted, so this claim is the one asking the card.
+    with gpu_claim(key=KEY, owner="b", directory=tmp_path, vram_mb=1000,
+                   wait=True) as c:
+        assert c.vram_mb == 1000
+        assert len(list_claims(tmp_path)) == 2
+
+
+def test_a_re_asked_capacity_that_rules_the_claim_out_stops_the_wait(
+        tmp_path, monkeypatch):
+    """The recovered answer gets the same permanence check the first one
+    did. Without it a declaration larger than the whole card, submitted
+    while the query was failing, waits forever for room that can never
+    appear -- the case `CannotEverFit` exists to end.
+    """
+    lg.acquire(KEY, vram_mb=3000, owner="a", cmd=[], directory=tmp_path,
+               usable_mb=7676)
+    answers = iter([None, 7676])
+    monkeypatch.setattr("gpuqueue.claim.default_usable_mb",
+                        lambda index=0: next(answers, 7676))
+    monkeypatch.setattr("gpuqueue.claim.time.sleep", _bounded_poll())
+
+    with pytest.raises(lg.CannotEverFit):
+        with gpu_claim(key=KEY, owner="b", directory=tmp_path, vram_mb=99999,
+                       wait=True):
+            pass
+
+
+def test_an_explicit_none_capacity_is_never_re_derived(tmp_path, monkeypatch):
+    """`usable_mb=None` from the caller means "I asked and the card would
+    not say" -- the distinction the `_ASK_THE_CARD` sentinel exists to
+    keep. Re-deriving a capacity here would have the runner logging
+    exclusive-only while this function shared the card against a number
+    that ignores the runner's configured reserve: one `<key>.lock.d`,
+    two capacities, a double-booked card.
+    """
+    monkeypatch.setattr("gpuqueue.claim.WAIT_POLL_S", 0.01)
+    asked = []
+    monkeypatch.setattr("gpuqueue.claim.default_usable_mb",
+                        lambda index=0: asked.append(1) or 7676)
+    holder = lg.acquire(KEY, vram_mb=3000, owner="a", cmd=[],
+                        directory=tmp_path, usable_mb=7676)
+    real_sleep = __import__("time").sleep
+
+    def freeing_sleep(s):
+        lg.remove(holder)      # only an empty card admits an exclusive claim
+        real_sleep(0)
+
+    monkeypatch.setattr("gpuqueue.claim.time.sleep", freeing_sleep)
+    with gpu_claim(key=KEY, owner="b", directory=tmp_path, vram_mb=1000,
+                   usable_mb=None, wait=True):
+        assert asked == []
+
+
 def _spawn_lock_ex_holder(tmp_path, sleep_s=30):
     """A detached process holding the real `LOCK_EX` on the mutex path --
     what a pre-ledger gpu-claim looks like from the outside. A real

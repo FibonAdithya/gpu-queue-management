@@ -785,6 +785,32 @@ def test_a_hand_edited_bad_vram_mb_fails_the_job_not_the_runner(env):
     assert "j2" in started, "the cpu lane must survive one bad gpu spec"
 
 
+def test_a_hand_edited_quoted_vram_mb_fails_the_job_not_the_runner(env):
+    """The same repair with the likelier typo: JSON quotes around the
+    number.
+
+    `_take_card` compares the declaration against the card's capacity
+    *before* it reaches the guard that refuses a bad one, and `"512" >
+    8188` raises TypeError -- not the ValueError that guard catches. The
+    daemon must survive this the same way it survives `vram_mb: 0`.
+    """
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    submit(r, sha, "j1", ["sh", "-c", "true"], lane="gpu", vram_mb=512)
+    submit(r, sha, "j2", ["sh", "-c", "echo hi"], lane="cpu")
+    p = r.queue.root / "pending" / "j1.json"
+    d = json.loads(p.read_text())
+    d["vram_mb"] = "512"                # quoted, so not a number at all
+    p.write_text(json.dumps(d))
+
+    started = r.admit()                 # must not raise
+
+    state, spec = r.queue.find("j1")
+    assert state == "failed"
+    assert "vram_mb" in (spec.error or "")
+    assert "j2" in started, "the cpu lane must survive one bad gpu spec"
+
+
 def test_a_conviction_before_the_job_started_does_not_excuse_it(env, monkeypatch):
     r, sha = env
     r.cfg.gpu_vram_mb = 8188
@@ -877,6 +903,28 @@ def test_a_convicted_job_that_exits_cleanly_is_still_a_failure(env, monkeypatch)
     assert state == "failed"
     assert "exceeding its declaration" in (spec.error or "")
     assert "j1" not in r._convicted
+
+
+def test_a_conviction_whose_kill_landed_excuses_a_co_tenants_oom(env,
+                                                                monkeypatch):
+    r, sha = env
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {"convicted": [
+        {"owner": "alice", "declared": 512, "used": 3070, "killed": True}]})
+    r._reap()
+    assert r._last_conviction is not None
+
+
+def test_a_conviction_whose_kill_failed_excuses_nothing(env, monkeypatch):
+    """The claim directory is shared with hand-run `gpu-claim` jobs, so a
+    convicted holder can belong to another user and `_kill_tree` fails on
+    EPERM. That holder goes on over-using the card, so the OOM it causes is
+    guaranteed to recur -- requeueing on it burns a second full GPU run on
+    the blind retry `docs/design.md` forbids."""
+    r, sha = env
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {"convicted": [
+        {"owner": "alice", "declared": 512, "used": 3070, "killed": False}]})
+    r._reap()
+    assert r._last_conviction is None
 
 
 @pytest.fixture
@@ -1088,7 +1136,8 @@ def test_a_preflight_failure_defers_the_whole_pass_with_one_line(env, caplog,
 def test_a_box_with_no_card_fails_every_pending_gpu_job(env, monkeypatch):
     """`GpuIdError` is card-wide, but unlike a preflight failure it is
     permanent -- no card will appear on a box that has none. Deferring the
-    pass would queue them forever, so each still gets failed."""
+    pass would queue them forever, so each still gets failed -- but only
+    once the box has said so `GPUID_STRIKES` passes running."""
     from gpuqueue.gpuid import GpuIdError
     r, sha = env
     monkeypatch.setattr(rn, "gpu_key",
@@ -1096,10 +1145,92 @@ def test_a_box_with_no_card_fails_every_pending_gpu_job(env, monkeypatch):
                             GpuIdError("no CUDA device")))
     for i in range(3):
         submit(r, sha, f"j{i}", ["true"], lane="gpu")
-    r.admit()
+    for _ in range(rn.GPUID_STRIKES):
+        r.admit()
     for i in range(3):
         state, got = r.queue.find(f"j{i}")
         assert state == "failed" and "no usable GPU" in got.error
+
+
+def test_a_transient_nvidia_smi_failure_does_not_fail_the_backlog(env,
+                                                                 monkeypatch):
+    """`gpuid` cannot tell "this box has no card" from "nvidia-smi timed
+    out under load": both arrive as `GpuIdError`. Failing on the first one
+    moves the whole backlog to failed/ over a condition that clears two
+    seconds later."""
+    from gpuqueue.gpuid import GpuIdError
+    r, sha = env
+    calls = []
+
+    def flaky(index=0):
+        calls.append(1)
+        if len(calls) == 1:
+            raise GpuIdError("Unable to determine the device handle")
+        return "test-uuid"
+
+    monkeypatch.setattr(rn, "gpu_key", flaky)
+    for i in range(3):
+        submit(r, sha, f"j{i}", ["true"], lane="gpu")
+
+    assert r.admit() == []
+    assert all(r.queue.find(f"j{i}")[0] == "pending" for i in range(3))
+    # And the recovered pass admits them rather than holding a grudge.
+    assert r.admit() != []
+
+
+def test_a_pass_that_never_asked_the_card_ages_out_an_old_strike(env,
+                                                                 monkeypatch):
+    """`GPUID_STRIKES` counts *consecutive* passes that could not identify
+    the card, and a pass only asks when there is GPU work pending with room
+    for it. The counter was incremented and reset only inside that check,
+    so a strike froze rather than ageing out: a hiccup this morning, the
+    job that was waiting on it cancelled, and a fresh backlog tonight
+    starts one hiccup nearer being failed outright over a condition that
+    clears in seconds.
+    """
+    from gpuqueue.gpuid import GpuIdError
+    r, sha = env
+    monkeypatch.setattr(rn, "gpu_key",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            GpuIdError("Unable to determine the device handle")))
+    submit(r, sha, "j1", ["true"], lane="gpu")
+    assert r.admit() == []
+    assert r._gpuid_strikes == 1
+
+    r.queue.cancel("j1")
+    r.admit()               # nothing GPU-lane pending: the card is not asked
+    assert r._gpuid_strikes == 0
+
+    submit(r, sha, "j2", ["true"], lane="gpu")      # hours later
+    for _ in range(rn.GPUID_STRIKES - 1):
+        r.admit()
+    assert r.queue.find("j2")[0] == "pending"
+
+
+def test_preflight_is_not_re_asked_on_every_pass(gpu_env, monkeypatch):
+    """The steady-state cost `_card_key_cached` documents, for the other
+    half of `_ready_card`: a pending job that does not fit leaves
+    `_capacity` positive, so this ran every `poll_interval_s` for as long
+    as the card stayed full. Each call is an nvidia-smi with a 15s timeout
+    plus a recursive `ps` per process in every tree it walks, on the single
+    thread that also enforces `timeout_s`.
+    """
+    r, sha = gpu_env
+    calls = []
+    monkeypatch.setattr(rn, "preflight", lambda **kw: calls.append(1))
+    for job_id, vram in (("j1", 3000), ("j2", 7000)):
+        r.queue.work_dir(job_id).mkdir(parents=True, exist_ok=True)
+        submit(r, sha, job_id, ["sleep", "5"], lane="gpu", vram_mb=vram)
+    assert r.admit() == ["j1"]
+    r.admit()          # j2 does not fit, but capacity is still 1
+    r.admit()
+    assert len(calls) == 1
+
+    # A TTL, not a cache: unlike the card's uuid this is measuring
+    # contention now, so it does have to be asked again.
+    monkeypatch.setattr(rn, "PREFLIGHT_TTL_S", 0.0)
+    r.admit()
+    assert len(calls) == 2
 
 
 def test_a_hand_run_holder_counts_against_gpu_max_jobs(gpu_env):

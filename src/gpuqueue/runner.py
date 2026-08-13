@@ -35,6 +35,17 @@ from .spec import JobSpec
 
 log = logging.getLogger("gpuqueue.runner")
 
+# Consecutive passes that must fail to identify the card before the pending
+# GPU backlog is failed outright. See `admit`.
+GPUID_STRIKES = 3
+
+# How long a preflight verdict is reused before the card is asked again.
+# Not tied to `orphan_cuda_interval_s`, which is the cadence of the sweep
+# that clears the condition preflight detects: an operator who sets that to
+# an hour would be admitting jobs against hour-old contention data. See
+# `_preflight_cached`.
+PREFLIGHT_TTL_S = 10.0
+
 
 @dataclass
 class Active:
@@ -74,6 +85,13 @@ class Runner:
         # say "declared 512 MiB, using 3070" instead of "exit -9"
         self._convicted: dict[str, dict] = {}
         self._last_conviction: float | None = None
+        # Consecutive admit passes that could not identify the card. See
+        # the GpuIdError branch in `admit`.
+        self._gpuid_strikes = 0
+        # The last preflight verdict and when it was reached, so a pass
+        # inside PREFLIGHT_TTL_S reuses it. See _preflight_cached.
+        self._preflight_at: float | None = None
+        self._preflight_result: PreflightFailed | None = None
 
     # --- lifecycle ----------------------------------------------------
     def run_forever(self) -> None:
@@ -208,8 +226,24 @@ class Runner:
                       include_orphan_cuda=sweep,
                       vram_strikes=self._vram_strikes)
         for c in result.get("convicted", []):
-            self._last_conviction = time.monotonic()
-            log.warning("killed %s: declared %s MiB, using %s MiB",
+            # Only a conviction that got the holder off the card stamps the
+            # co-tenant window -- which `_kill_tree` reports for a holder
+            # that had already exited on its own, not just for one it
+            # signalled. This directory is shared with hand-run `gpu-claim`
+            # jobs, so a convicted holder can belong to another user and
+            # `_kill_tree` fails on EPERM -- that holder goes on over-using
+            # the card, so the OOM it causes is not a transient. Excusing it
+            # would requeue a job into the same full card and burn a second
+            # full GPU run on the blind retry `docs/design.md` forbids.
+            #
+            # `self._convicted` below is deliberately *not* gated: it means
+            # "this job was convicted", which is true whether or not the
+            # kill landed, and it is what `_describe_failure` uses to say
+            # what actually happened.
+            if c.get("killed"):
+                self._last_conviction = time.monotonic()
+            log.warning("%s %s: declared %s MiB, using %s MiB",
+                        "killed" if c.get("killed") else "COULD NOT KILL",
                         c["owner"], c["declared"], c["used"])
             if c["owner"].startswith("gpuq:"):
                 self._convicted[c["owner"][len("gpuq:"):]] = c
@@ -326,11 +360,31 @@ class Runner:
         card_key = card_error = None
         if any(s.lane == "gpu" for s in pending) and self._capacity("gpu") > 0:
             card_key, card_error = self._ready_card()
-            if isinstance(card_error, PreflightFailed):
-                # One line per pass, not one per pending job: the same
-                # reasoning `mutex_blocked` applies below to a card-wide
-                # condition nobody in this pass can get past.
-                log.warning("GPU admissions deferred this pass: %s", card_error)
+        if isinstance(card_error, PreflightFailed):
+            # One line per pass, not one per pending job: the same
+            # reasoning `mutex_blocked` applies below to a card-wide
+            # condition nobody in this pass can get past.
+            log.warning("GPU admissions deferred this pass: %s", card_error)
+        if isinstance(card_error, GpuIdError):
+            # Counted per pass, not per job: the strike is a property
+            # of this pass's one `gpu_key` call.
+            self._gpuid_strikes += 1
+            if self._gpuid_strikes < GPUID_STRIKES:
+                log.warning("GPU admissions deferred this pass "
+                            "(%s/%s): %s", self._gpuid_strikes,
+                            GPUID_STRIKES, card_error)
+        else:
+            # Reset on every pass that did not see a GpuIdError -- including
+            # the passes that never asked, which is the whole point of doing
+            # this outside the `if`. GPUID_STRIKES counts *consecutive*
+            # failures, and a pass skips the check whenever there is no GPU
+            # work pending with room for it, which can be hours or days.
+            # Resetting only on a successful `_ready_card` froze a strike
+            # instead of ageing it out: a hiccup this morning, the job that
+            # was waiting on it cancelled, and tonight's backlog starts one
+            # hiccup nearer being failed outright -- the exact outcome the
+            # strike count exists to prevent.
+            self._gpuid_strikes = 0
         for spec in pending:
             project = self.cfg.projects.get(spec.project)
             if project is None:
@@ -347,9 +401,21 @@ class Runner:
                 if mutex_blocked or isinstance(card_error, PreflightFailed):
                     continue
                 if card_error is not None:      # GpuIdError
-                    # Card-wide like the above, but permanent: no card will
-                    # appear on a box that has none, so deferring the pass
-                    # would queue these forever.
+                    # Card-wide like the above, and eventually permanent:
+                    # no card will appear on a box that has none, so
+                    # deferring forever would queue these forever. But
+                    # `gpuid` cannot tell that box apart from a working one
+                    # whose nvidia-smi just timed out under load or exited
+                    # non-zero on a driver hiccup -- both swallow into the
+                    # same `GpuIdError`. Failing on the first one moves the
+                    # entire pending backlog to failed/ over a condition
+                    # that clears two seconds later, which is what
+                    # `_card_key_cached` refuses to do to itself when it
+                    # declines to cache a failure. So the box has to say so
+                    # `GPUID_STRIKES` passes running, which a genuinely
+                    # cardless box does immediately and a hiccup does not.
+                    if self._gpuid_strikes < GPUID_STRIKES:
+                        continue
                     self._fail_pending(spec, f"no usable GPU: {card_error}")
                     continue
                 try:
@@ -391,8 +457,9 @@ class Runner:
         worse than a crash.
 
         Returns `(key, None)` when the card can be handed out, else
-        `(None, error)`: `PreflightFailed` to defer the pass,
-        `GpuIdError` to fail the jobs rather than queue them forever.
+        `(None, error)`: `PreflightFailed` to defer the pass, `GpuIdError`
+        to defer it and count a strike, failing the jobs rather than
+        queueing them forever once `GPUID_STRIKES` passes agree.
 
         What is deliberately *not* hoisted is the per-job half -- whether
         this declaration fits in the room that is left. Short-circuiting
@@ -401,21 +468,57 @@ class Runner:
         did not fit, which is the head-of-line blocking that per-job VRAM
         accounting exists to remove.
         """
+        failure = self._preflight_cached()
+        if failure is not None:
+            return None, failure
+        try:
+            return self._card_key_cached(), None
+        except GpuIdError as e:
+            return None, e
+
+    def _preflight_cached(self) -> PreflightFailed | None:
+        """`preflight()`, at a bounded cadence rather than once per pass.
+
+        Hoisting it out of the per-job loop bounded the cost per *job* but
+        left a steady-state one that did not exist before, the same one
+        `_card_key_cached` documents: a lane admitting `gpu_max_jobs` still
+        has capacity while the card is VRAM-full, so a pending job that
+        does not fit leaves `_capacity` positive and this runs every
+        `poll_interval_s`, indefinitely. Each call is an nvidia-smi with a
+        15s timeout plus a recursive `ps` per process in every tree it
+        walks -- roughly 20 process spawns every 2s for one trainer with 8
+        dataloader workers, on the thread that also enforces `timeout_s`.
+
+        A TTL rather than the outright cache the card's uuid gets, because
+        unlike the uuid this measures contention *now*: what it costs is
+        that a stray process appearing is noticed up to `PREFLIGHT_TTL_S`
+        late, and a stray that has gone away defers admissions for that
+        much longer. Both are bounded and small next to the 15s subprocess
+        the cache is there to stop repeating.
+
+        Returns the `PreflightFailed` to defer the pass on, or None when
+        the card is clear. Anything else is a gpuq bug and goes out
+        unfiltered and uncached -- a verdict was never reached.
+        """
+        now = time.monotonic()
+        if (self._preflight_at is not None
+                and now - self._preflight_at < PREFLIGHT_TTL_S):
+            return self._preflight_result
         try:
             # The runner's configured claim dir, not $GPU_CLAIM_DIR. These
             # were already two different answers to "where are the
             # claims?"; now that preflight decides contention by reading
             # them, disagreeing means a co-tenant reads as an intruder.
             preflight(directory=self.cfg.claim_dir)
+            result = None
         except PreflightFailed as e:
-            return None, e
+            result = e
         except Exception as e:
             self._report_bug(e, "preflight")
             raise
-        try:
-            return self._card_key_cached(), None
-        except GpuIdError as e:
-            return None, e
+        self._preflight_at = now
+        self._preflight_result = result
+        return result
 
     def _card_key_cached(self) -> str:
         """`gpu_key()`, asked once per daemon rather than once per pass.
@@ -427,13 +530,13 @@ class Runner:
         positive and this whole function runs every `poll_interval_s`,
         indefinitely, on the thread that also enforces `timeout_s`.
 
-        Only the key is cached. `preflight` above is the half that has to
-        stay fresh -- it is measuring contention right now -- where the
+        Cached outright, where `_preflight_cached` only gets a TTL: the
         card's uuid cannot change without a reboot, which restarts this
-        daemon anyway. Same trade `_usable_mb` makes for the card's total,
-        and a failure is not cached for the same reason it is not there: a
-        transient nvidia-smi hiccup must not latch this lane off for the
-        life of the process.
+        daemon anyway, while preflight is measuring contention right now.
+        Same trade `_usable_mb` makes for the card's total, and a failure
+        is not cached for the same reason it is not there: a transient
+        nvidia-smi hiccup must not latch this lane off for the life of the
+        process.
         """
         if self._card_key is None:
             self._card_key = gpu_key()
