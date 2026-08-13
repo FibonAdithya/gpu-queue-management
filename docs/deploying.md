@@ -179,15 +179,36 @@ The four GPU-capacity keys, all under `[queue]`:
 | `gpu_max_jobs` | `2` | A latency budget, not a safety one. VRAM alone would admit sixteen 500 MiB jobs onto an 8 GB card, all time-slicing and each slower than if it had waited. 2 is what has been measured (15% → 62% utilization); raise it on a box that has measured more. |
 | `enforce_vram` | `true` | Kill a job using more than it declared. Off does not make over-use safe — it makes it unattributable. Write it unquoted: `"false"` in quotes is a config error, not `false`. |
 
-The first two are read by `gpu-claim` as well as by the runner, because the
+The first three are read by `gpu-claim` as well as by the runner, because the
 two of them share one ledger and a capacity they disagree about is a card
-they will double-book. `gpu-claim` finds this file at `$GPUQ_CONFIG`, or
-`/workspace/gpuq.toml`; where it finds neither it sizes the card from
-`nvidia-smi` and holds back the default 512 MiB, which is what a box with no
-runner deployed wants. So if you override `gpu_vram_mb` on a box where people
-also run `gpu-claim` by hand, make sure `GPUQ_CONFIG` is exported in their
-environment too — otherwise they will admit against the nameplate total while
-the runner admits against yours.
+they will double-book. `gpu_max_jobs` is in that set because the cap is
+enforced in the ledger, against every holder of the card — a limit only the
+runner applied to its own jobs would leave four hand-run `gpu-claim`s
+time-slicing on an 8 GB card, which is the contention it exists to bound.
+
+`gpu-claim` finds this file at `$GPUQ_CONFIG`, or `/workspace/gpuq.toml`;
+where it finds neither it sizes the card from `nvidia-smi`, holds back the
+default 512 MiB and caps at the default 2 jobs, which is what a box with no
+runner deployed wants. So if you override any of the three on a box where
+people also run `gpu-claim` by hand, make sure `GPUQ_CONFIG` is exported in
+their environment too — otherwise they will admit against the nameplate total
+while the runner admits against yours.
+
+**`gpuq-runner --config` does not move `gpu-claim`.** A standalone claim has
+no way to know what flags the daemon was started with, so it reads
+`$GPUQ_CONFIG`/`/workspace/gpuq.toml` regardless. Starting the runner on some
+other path reopens exactly the divergence above: declare `gpu_vram_mb = 7000`
+in `/etc/gpuq-alt.toml`, pass it with `--config`, and the runner admits
+against 6488 MiB while `gpu-claim` sizes from `nvidia-smi`'s 8188 and admits
+against 7676 — 1188 MiB of over-admission into one ledger. The runner warns
+about this at startup; export `GPUQ_CONFIG` to the same path to clear it.
+
+**These three keys are read once, at startup.** The runner caches the card's
+total for the life of the daemon, where `gpu-claim` re-reads the file on every
+invocation. Raising `gpu_vram_reserve_mb` after an OOM without restarting the
+runner therefore splits the two views again — `gpu-claim` immediately admits
+against `total - 2048` while the runner keeps admitting against `total - 512`.
+Restart the runner after editing any of them.
 
 `gpu_vram_mb` describes the card the runner manages, which is always card 0.
 `gpu-claim --gpu-index 1` sizes card 1 from `nvidia-smi` regardless, and

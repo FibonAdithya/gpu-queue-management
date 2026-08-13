@@ -1,7 +1,8 @@
 import textwrap
 
 import pytest
-from gpuqueue.config import load_config, vram_policy, ConfigError
+from gpuqueue.config import (load_config, vram_policy, max_holders,
+                             ConfigError)
 from gpuqueue.ledger import DEFAULT_RESERVE_MB
 
 TOML = """
@@ -277,3 +278,25 @@ def test_vram_policy_falls_back_when_there_is_no_config(tmp_path):
     assert vram_policy(tmp_path / "absent.toml") == (None, DEFAULT_RESERVE_MB)
     (tmp_path / "junk.toml").write_text("this is not toml [[[")
     assert vram_policy(tmp_path / "junk.toml") == (None, DEFAULT_RESERVE_MB)
+
+
+# --- max_holders: the latency cap, for participants that are not the runner
+
+def test_max_holders_reads_the_key(tmp_path):
+    p = _write(tmp_path, '[queue]\nroot = "/q"\ngpu_max_jobs = 4\n')
+    assert max_holders(p) == 4
+
+
+def test_max_holders_defaults_when_the_key_is_absent(tmp_path):
+    assert max_holders(_write(tmp_path, '[queue]\nroot = "/q"\n')) == 2
+
+
+def test_max_holders_does_not_need_a_loadable_config(tmp_path):
+    """Same posture as vram_policy: a box with no runner deployed must
+    still be able to run gpu-claim."""
+    assert max_holders(tmp_path / "absent.toml") == 2
+
+
+def test_max_holders_falls_back_on_a_nonsense_value(tmp_path):
+    p = _write(tmp_path, '[queue]\nroot = "/q"\ngpu_max_jobs = 0\n')
+    assert max_holders(p) == 2

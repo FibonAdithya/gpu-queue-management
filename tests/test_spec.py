@@ -107,3 +107,16 @@ def test_vram_mb_rejects_anything_but_a_positive_int(bad):
 def test_vram_mb_round_trips_through_from_dict():
     spec = JobSpec.from_dict(mkspec(vram_mb=512).to_dict())
     assert spec.vram_mb == 512
+
+
+def test_vram_mb_is_rejected_on_the_cpu_lane():
+    """A cpu-lane job takes no card and writes no ledger record, so a
+    declaration on it is accepted, persisted and then ignored by `admit`
+    entirely -- the submitter gets a job that looks accounted-for and is
+    not. Almost always a mistyped lane."""
+    with pytest.raises(SpecError, match="vram_mb"):
+        mkspec(lane="cpu", vram_mb=8000).validate()
+
+
+def test_cpu_lane_without_a_declaration_is_still_fine():
+    mkspec(lane="cpu").validate()

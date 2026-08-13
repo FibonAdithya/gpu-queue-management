@@ -66,6 +66,14 @@ it is what stops a co-tenant turning into an OOM. `gpu_max_jobs` is a
 card, all time-slicing, each slower than it would have been queued — and
 with independent submitters that cost lands on a stranger.
 
+Both are enforced in the ledger, against every holder of the card. The
+runner's own `_capacity("gpu")` still refuses past `gpu_max_jobs`, but only
+as a cheap pre-filter that avoids taking the mutex — the authority is
+`ledger.acquire`, because a cap the runner applied to its own lane alone
+would leave four hand-run `gpu-claim`s on the card and the runner would then
+admit two more on top. "With independent submitters that cost lands on a
+stranger" is precisely the case where the submitters are not this runner.
+
 ## Queue
 
 A directory tree, with states as subdirectories and transitions by atomic

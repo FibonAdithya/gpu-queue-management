@@ -26,6 +26,10 @@ WAIT_POLL_S = 0.5
 # `usable_mb` omitted, as distinct from an explicit None. See gpu_claim.
 _ASK_THE_CARD = object()
 
+# The same distinction for `max_holders`: omitted means "read the policy",
+# an explicit None means "no cap" and must survive being passed in.
+_ASK_THE_CONFIG = object()
+
 # A MutexTimeout means an old-style gpu-claim is holding LOCK_EX for its
 # whole run, which can be hours -- a different condition from "the card is
 # full," which clears in the time a job takes to exit. Retrying at the
@@ -126,7 +130,8 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
               cmd: list[str] | None = None, wait: bool = False,
               directory: Path | None = None, vram_mb: int | None = None,
               usable_mb: int | None | object = _ASK_THE_CARD,
-              own_usage: bool = True):
+              own_usage: bool = True,
+              max_holders: int | None | object = _ASK_THE_CONFIG):
     """Hold a share of the card. `vram_mb=None` means the whole of it.
 
     `own_usage=False` is for the runner, which takes the card before the
@@ -141,6 +146,13 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
     "omitted" would have the runner logging exclusive-only while this
     function went on sharing the card against a rediscovered capacity that
     ignores the configured reserve.
+
+    `max_holders` is the card's latency budget, `[queue].gpu_max_jobs`.
+    Omitted, it is read from the config for the same reason `usable_mb` is
+    -- this participant shares one `<key>.lock.d` with the runner, and a
+    cap only one of them applies is not a cap on the card. The runner
+    passes its own loaded value straight through instead, so it does not
+    re-read the file once per admit.
 
     `wait` polls capacity rather than blocking on flock: the mutex is
     released the instant `acquire` returns, so there is no longer a kernel
@@ -168,6 +180,8 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
     key = key or gpu_key()
     if usable_mb is _ASK_THE_CARD:
         usable_mb = default_usable_mb()
+    if max_holders is _ASK_THE_CONFIG:
+        max_holders = config.max_holders()
     if ledger.exceeds_capacity(vram_mb, usable_mb):
         # Before the wait loop, not inside it: every waiter below polls for
         # room to appear, and room for a claim larger than the whole card
@@ -181,7 +195,8 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
             rec = ledger.acquire(
                 key, vram_mb=vram_mb, owner=owner or _default_owner(),
                 cmd=cmd, directory=d, usable_mb=usable_mb,
-                usage_pid=os.getpid() if own_usage else None)
+                usage_pid=os.getpid() if own_usage else None,
+                max_holders=max_holders)
             break
         except MutexTimeout:
             if not wait:

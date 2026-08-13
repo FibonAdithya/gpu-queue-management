@@ -15,6 +15,9 @@ gpu_vram_reserve_mb = 512
 # A latency budget, not a safety one. VRAM accounting alone would admit
 # many small jobs that then merely time-slice, each slower than it would
 # have been queued. 2 is what has been measured; raise it after measuring.
+# Counted over every holder of the card, hand-run gpu-claim included, so
+# gpu-claim reads this key too -- see the GPUQ_CONFIG note in
+# docs/deploying.md.
 gpu_max_jobs = 2
 # Kill a job using more VRAM than it declared. Turning this off does not
 # make over-use safe; it makes it unattributable.

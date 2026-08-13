@@ -60,6 +60,10 @@ class Runner:
         self._report_cooldowns: dict[str, float] = {}
         self._usable_mb_cache: int | None = None
         self._usable_asked = False
+        # The card's identity, cached for the same reason its total is: a
+        # second nvidia-smi subprocess for an answer that cannot change
+        # without a reboot. See _card_key_cached.
+        self._card_key: str | None = None
         # Logged once, not once per admit: see _usable_mb.
         self._usable_query_warned = False
         # str(record path) -> consecutive sweeps over its declaration. The
@@ -409,9 +413,31 @@ class Runner:
             self._report_bug(e, "preflight")
             raise
         try:
-            return gpu_key(), None
+            return self._card_key_cached(), None
         except GpuIdError as e:
             return None, e
+
+    def _card_key_cached(self) -> str:
+        """`gpu_key()`, asked once per daemon rather than once per pass.
+
+        Hoisting `_ready_card` out of the per-job loop bounded the cost per
+        *job*, but introduced a steady-state one that did not exist before:
+        a lane admitting `gpu_max_jobs` still has capacity while the card is
+        VRAM-full, so a pending job that does not fit leaves `_capacity`
+        positive and this whole function runs every `poll_interval_s`,
+        indefinitely, on the thread that also enforces `timeout_s`.
+
+        Only the key is cached. `preflight` above is the half that has to
+        stay fresh -- it is measuring contention right now -- where the
+        card's uuid cannot change without a reboot, which restarts this
+        daemon anyway. Same trade `_usable_mb` makes for the card's total,
+        and a failure is not cached for the same reason it is not there: a
+        transient nvidia-smi hiccup must not latch this lane off for the
+        life of the process.
+        """
+        if self._card_key is None:
+            self._card_key = gpu_key()
+        return self._card_key
 
     def _take_card(self, spec: JobSpec, key: str):
         """Enter a gpu_claim by hand so it can be held across ticks.
@@ -443,7 +469,13 @@ class Runner:
         cm = gpu_claim(key=key, owner=f"gpuq:{spec.id}", cmd=spec.cmd,
                        wait=False, directory=self.cfg.claim_dir,
                        vram_mb=spec.vram_mb, usable_mb=usable,
-                       own_usage=False)
+                       own_usage=False,
+                       # Passed rather than left to gpu_claim's default,
+                       # which re-reads the config file: this runner has
+                       # already loaded the key, and `_capacity` is only a
+                       # cheap pre-filter -- the ledger is what enforces
+                       # the cap against holders this process cannot see.
+                       max_holders=self.cfg.gpu_max_jobs)
         try:
             record = cm.__enter__()
         except ledger.MutexTimeout:

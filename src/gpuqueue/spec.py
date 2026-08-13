@@ -80,6 +80,15 @@ class JobSpec:
             raise SpecError(
                 f"vram_mb must be a positive int or None (meaning the whole "
                 f"card), got {self.vram_mb!r}")
+        if self.lane != "gpu" and self.vram_mb is not None:
+            # Almost always a mistyped lane. Left accepted, the declaration
+            # is persisted and then ignored entirely: `admit` takes no card
+            # and writes no ledger record for a cpu-lane job, so the
+            # submitter gets a job that looks accounted-for on the card and
+            # is not -- and no error anywhere says so.
+            raise SpecError(
+                f"vram_mb is only meaningful on the gpu lane; this job is on "
+                f"the {self.lane} lane, which takes no share of the card")
         if self.attempts < 0:
             raise SpecError("attempts must be >= 0")
         for a in self.artifacts:

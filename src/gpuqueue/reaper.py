@@ -82,6 +82,33 @@ def kill_orphan_cuda(protect: set[int], records: list, apps: list[dict]) -> list
     return killed
 
 
+def _running_trees(queue: QueueRoot) -> set[int]:
+    """Every pid under every running job, not just the job's own.
+
+    The whole tree, because the parts of one `reap()` call would otherwise
+    disagree about the same job. Supervisor restarts the runner
+    while a GPU job is running; the job survives, since it was started with
+    `start_new_session=True`. On the next tick `release_stale` deletes that
+    job's ledger record -- the record carries the *dead runner's* pid, not
+    the job's -- and `requeue_orphans` deliberately leaves the job alone,
+    because `spec.pid` is still alive. The sweep then arrives at a job with
+    no record to charge it to, and `spec.pid` is normally a venv or shell
+    wrapper, a `torchrun`, a dataloader parent: the process actually on the
+    card is its *child*. Protecting only `spec.pid` SIGKILLs a live job the
+    same call just decided to spare.
+
+    Costs one recursive `ps` per running job, bounded by `cpu_slots +
+    gpu_max_jobs`, and only inside the timer-gated sweep -- not on the
+    every-tick recovery path.
+    """
+    protect: set[int] = set()
+    for spec in queue.list_state("running"):
+        if spec.pid:
+            protect.add(spec.pid)
+            protect |= descendants(spec.pid)
+    return protect
+
+
 def clean_partials(queue: QueueRoot) -> list[str]:
     cleaned = []
     work = queue.root / "work"
@@ -246,7 +273,7 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
             d = cfg.claim_dir if cfg.claim_dir else claim_dir()
             records = ledger.live_records(ledger.all_records(d))
             if cfg.kill_orphan_cuda:
-                protect = {s.pid for s in queue.list_state("running") if s.pid}
+                protect = _running_trees(queue)
                 killed = kill_orphan_cuda(protect, records, apps)
             if cfg.enforce_vram and vram_strikes is not None:
                 convicted = check_vram(records, apps, vram_strikes)

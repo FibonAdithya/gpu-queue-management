@@ -357,3 +357,43 @@ def test_unknown_owner_is_not_reported_as_orphaned():
     owner is not evidence of an absent one."""
     from gpuqueue.claim import job_orphaned
     assert job_orphaned(os.getpid(), None) is False
+
+
+# --- the holder cap reaches the standalone gpu-claim path ---------------
+
+def test_gpu_claim_honours_the_configured_holder_cap(tmp_path, monkeypatch):
+    """The cap is a property of the card, so the participant with no config
+    of its own has to read the same key the runner does -- otherwise
+    `gpu_max_jobs = 2` is enforced against the runner's own jobs and nothing
+    else, which is the co-tenancy it exists to bound."""
+    import os
+    _config(tmp_path, monkeypatch,
+            '[queue]\nroot = "/q"\ngpu_max_jobs = 1\n')
+    d = tmp_path / "claims"
+    live = os.getpid()
+    lg.write_record(lg.Record(
+        path=lg.ledger_dir("k", d) / f"{live}.a.json", pid=live,
+        usage_pid=live, vram_mb=500, owner="alice", cmd=["train"],
+        started_at="2026-08-10T00:00:00Z", key="k"))
+    with pytest.raises(lg.ClaimBusy, match="1-job limit"):
+        with gpu_claim(key="k", owner="bob", cmd=["train"], directory=d,
+                       vram_mb=500, usable_mb=8000):
+            pass
+
+
+def test_gpu_claim_takes_an_explicit_cap_over_the_config(tmp_path,
+                                                         monkeypatch):
+    """The runner passes its own loaded `gpu_max_jobs` rather than letting
+    this re-read the file, for the same reason it passes `usable_mb`."""
+    import os
+    _config(tmp_path, monkeypatch,
+            '[queue]\nroot = "/q"\ngpu_max_jobs = 1\n')
+    d = tmp_path / "claims"
+    live = os.getpid()
+    lg.write_record(lg.Record(
+        path=lg.ledger_dir("k", d) / f"{live}.a.json", pid=live,
+        usage_pid=live, vram_mb=500, owner="alice", cmd=["train"],
+        started_at="2026-08-10T00:00:00Z", key="k"))
+    with gpu_claim(key="k", owner="bob", cmd=["train"], directory=d,
+                   vram_mb=500, usable_mb=8000, max_holders=4) as rec:
+        assert rec.owner == "bob"

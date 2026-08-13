@@ -331,3 +331,56 @@ def test_records_with_the_same_name_in_different_dirs_both_own(monkeypatch):
     assert [x["pid"] for x in owned[str(a.path)]] == [100]
     assert [x["pid"] for x in owned[str(b.path)]] == [200]
     assert unledgered == []
+
+
+# --- the holder cap: a latency budget the whole box shares ---------------
+
+def test_fits_refuses_past_the_holder_cap(tmp_path):
+    """VRAM accounting alone admits sixteen 500 MiB jobs onto an 8 GB card.
+    `gpu_max_jobs` is the latency budget that stops it -- and it has to live
+    here, not in the runner, or a hand-run gpu-claim walks straight past it."""
+    recs = [mkrec(tmp_path, "100.a.json", vram_mb=500),
+            mkrec(tmp_path, "101.b.json", vram_mb=500)]
+    assert lg.fits(recs, 500, 8000) is True            # uncapped, as before
+    assert lg.fits(recs, 500, 8000, max_holders=3) is True
+    assert lg.fits(recs, 500, 8000, max_holders=2) is False
+
+
+def test_the_cap_does_not_refuse_the_first_holder(tmp_path):
+    assert lg.fits([], None, 8000, max_holders=1) is True
+
+
+def test_busy_message_names_the_cap_rather_than_the_free_space(tmp_path):
+    """Refused for the count while 7 GB sits free, the VRAM wording sends
+    the reader looking for a memory problem that is not there."""
+    recs = [mkrec(tmp_path, "100.a.json", vram_mb=500),
+            mkrec(tmp_path, "101.b.json", vram_mb=500)]
+    msg = lg.busy_message(KEY, recs, 500, 8000, max_holders=2)
+    assert "2-job limit" in msg
+    assert "me" in msg          # still lists who is on the card
+
+
+def test_acquire_refuses_past_the_holder_cap(tmp_path):
+    live = os.getpid()
+    for n in ("a", "b"):
+        mkrec(tmp_path, f"{live}.{n}.json", pid=live, usage_pid=live,
+              vram_mb=500)
+    with pytest.raises(lg.ClaimBusy, match="2-job limit"):
+        lg.acquire(KEY, vram_mb=500, owner="third", cmd=["train"],
+                   directory=tmp_path, usable_mb=8000, max_holders=2)
+
+
+def test_acquire_admits_under_the_cap(tmp_path):
+    live = os.getpid()
+    mkrec(tmp_path, f"{live}.a.json", pid=live, usage_pid=live, vram_mb=500)
+    rec = lg.acquire(KEY, vram_mb=500, owner="second", cmd=["train"],
+                     directory=tmp_path, usable_mb=8000, max_holders=2)
+    assert rec.owner == "second"
+
+
+def test_a_dead_holder_does_not_spend_a_slot(tmp_path):
+    """`acquire` counts live records, the same set it sums VRAM over."""
+    mkrec(tmp_path, "4000000.dead.json", pid=4000000, vram_mb=500)
+    rec = lg.acquire(KEY, vram_mb=500, owner="live", cmd=["train"],
+                     directory=tmp_path, usable_mb=8000, max_holders=1)
+    assert rec.owner == "live"

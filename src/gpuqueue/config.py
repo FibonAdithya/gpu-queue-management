@@ -14,6 +14,11 @@ class ConfigError(ValueError):
     """The configuration file is missing or malformed."""
 
 
+# One source of truth with the standalone gpu-claim path, which reads the
+# same key through `max_holders` and has no config to default from.
+DEFAULT_MAX_HOLDERS = 2
+
+
 @dataclass
 class ProjectConfig:
     name: str
@@ -75,7 +80,12 @@ class RunnerConfig:
     # than it would have been queued -- and with independent submitters
     # that cost lands on a stranger. Two is what has been measured (15% to
     # 62% utilization); raise it on a box that has measured more.
-    gpu_max_jobs: int = 2
+    #
+    # Enforced in `ledger.acquire`, which counts every holder of the card,
+    # not just in `Runner._capacity`, which counts only this runner's own
+    # jobs. A budget the hand-run `gpu-claim` path walked past was not
+    # bounding the contention it was written to bound.
+    gpu_max_jobs: int = DEFAULT_MAX_HOLDERS
     enforce_vram: bool = True
     poll_interval_s: float = 2.0
     claim_dir: Path | None = None
@@ -156,6 +166,31 @@ def vram_policy(path: Path | None = None) -> tuple[int | None, int]:
     return total, reserve
 
 
+def max_holders(path: Path | None = None) -> int:
+    """`[queue].gpu_max_jobs`, for callers that are not the runner.
+
+    The cap is a property of the card, not of the runner: it bounds how
+    many processes time-slice on it, and a hand-run `gpu-claim` occupies a
+    slot exactly as a queued job does. Enforced in `ledger.acquire` rather
+    than in `Runner._capacity` alone for that reason, which means this
+    reader is what a standalone claim admits against.
+
+    Defensive in the same three ways `vram_policy` is, and for the same
+    reasons: not `load_config`, an unreadable file is the default rather
+    than an error, and a value `load_config` would reject falls back
+    instead of propagating. A zero or negative cap here would refuse every
+    claim on the box, including the runner's -- silently, with no daemon
+    around to fail loudly at startup.
+    """
+    p = Path(path) if path else default_config_path()
+    try:
+        queue = tomllib.loads(p.read_text()).get("queue") or {}
+        n = int(queue.get("gpu_max_jobs", DEFAULT_MAX_HOLDERS))
+    except Exception:
+        return DEFAULT_MAX_HOLDERS
+    return n if n >= 1 else DEFAULT_MAX_HOLDERS
+
+
 def default_config_path() -> Path:
     return Path(os.environ.get("GPUQ_CONFIG", "/workspace/gpuq.toml"))
 
@@ -178,7 +213,7 @@ def load_config(path: Path) -> RunnerConfig:
     gpu_vram_mb = int(gpu_vram_mb) if gpu_vram_mb is not None else None
     gpu_vram_reserve_mb = int(queue.get("gpu_vram_reserve_mb",
                                         DEFAULT_RESERVE_MB))
-    gpu_max_jobs = int(queue.get("gpu_max_jobs", 2))
+    gpu_max_jobs = int(queue.get("gpu_max_jobs", DEFAULT_MAX_HOLDERS))
     if gpu_max_jobs < 1:
         raise ConfigError("[queue].gpu_max_jobs must be >= 1")
     if gpu_vram_reserve_mb < 0:

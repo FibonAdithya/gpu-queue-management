@@ -189,10 +189,21 @@ def exceeds_capacity(want_mb: int | None, usable_mb: int | None) -> bool:
 
 
 def fits(records: list[Record], want_mb: int | None,
-         usable_mb: int | None) -> bool:
+         usable_mb: int | None, max_holders: int | None = None) -> bool:
     """`usable_mb is None` means the card could not be queried, so every
     claim is treated as exclusive -- degraded, and the same posture
-    preflight already takes when it cannot enumerate the card."""
+    preflight already takes when it cannot enumerate the card.
+
+    `max_holders` is the latency budget, and it is checked here rather than
+    only in `Runner._capacity` because it is a property of the card. VRAM
+    accounting alone admits sixteen 500 MiB claims onto an 8 GB card, all
+    time-slicing; a cap the runner applies to its own lane leaves that
+    reachable by hand, and with independent submitters the cost lands on a
+    stranger. None means uncapped, which is what a caller that has no
+    policy to read should pass rather than guessing a number.
+    """
+    if max_holders is not None and len(records) >= max_holders:
+        return False
     if any(r.vram_mb is None for r in records):
         return False
     if want_mb is None or usable_mb is None:
@@ -209,12 +220,22 @@ def free_mb(records: list[Record], usable_mb: int | None) -> int:
 
 
 def busy_message(key: str, records: list[Record], want_mb: int | None,
-                 usable_mb: int | None) -> str:
+                 usable_mb: int | None, max_holders: int | None = None) -> str:
     want = "the whole card" if want_mb is None else f"{want_mb} MiB"
-    head = (f"GPU {key}: need {want}, "
-            f"{free_mb(records, usable_mb)} MiB free"
-            + (f" of {usable_mb}" if usable_mb is not None else "")
-            + ". Holders:")
+    if max_holders is not None and len(records) >= max_holders:
+        # Named separately because the VRAM wording is actively misleading
+        # here: refused for the count with 7 GB of the card free, "need 500
+        # MiB, 6676 MiB free" sends the reader hunting for a memory problem
+        # that does not exist. This is a queueing decision, not a capacity
+        # one, and it clears when a holder exits rather than when memory
+        # frees up.
+        head = (f"GPU {key}: at the {max_holders}-job limit for this card "
+                f"(gpu_max_jobs), with {len(records)} on it. Holders:")
+    else:
+        head = (f"GPU {key}: need {want}, "
+                f"{free_mb(records, usable_mb)} MiB free"
+                + (f" of {usable_mb}" if usable_mb is not None else "")
+                + ". Holders:")
     lines = [
         f"  pid {r.pid:>7}  {r.owner:<24} "
         f"{'exclusive' if r.vram_mb is None else str(r.vram_mb) + ' MiB':>12}"
@@ -259,12 +280,17 @@ def _take_mutex(fd: int, timeout_s: float) -> None:
 
 def acquire(key: str, *, vram_mb: int | None, owner: str,
             cmd: list[str] | None, directory, usable_mb: int | None,
-            usage_pid: int | None = None) -> Record:
+            usage_pid: int | None = None,
+            max_holders: int | None = None) -> Record:
     """Take a share of the card, or raise ClaimBusy.
 
     Non-blocking on capacity by design: the caller decides whether to wait,
     and the runner must not, because a single-threaded loop that waits here
     stalls the CPU lane behind whoever holds the card.
+
+    `max_holders` is counted over the same `live_records` the VRAM is summed
+    over, so a wedged holder whose pid is gone does not spend a slot -- it
+    already does not spend its VRAM.
     """
     d = Path(directory)
     d.mkdir(parents=True, exist_ok=True)
@@ -275,8 +301,9 @@ def acquire(key: str, *, vram_mb: int | None, owner: str,
     try:
         _take_mutex(fd, MUTEX_WAIT_S)
         live = live_records(records_for(key, d))
-        if not fits(live, vram_mb, usable_mb):
-            raise ClaimBusy(busy_message(key, live, vram_mb, usable_mb))
+        if not fits(live, vram_mb, usable_mb, max_holders):
+            raise ClaimBusy(busy_message(key, live, vram_mb, usable_mb,
+                                         max_holders))
         # A token, not just the pid: the runner holds one record per GPU
         # job and every one of them carries the runner's pid.
         rec = Record(path=ldir / f"{os.getpid()}.{secrets.token_hex(3)}.json",

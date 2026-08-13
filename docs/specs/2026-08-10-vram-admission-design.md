@@ -166,6 +166,14 @@ small; `docs/deploying.md` should say so.
 `_take_card` forwards `spec.vram_mb` into `gpu_claim`, and `ClaimBusy`
 continues to mean "wait", not "fail".
 
+> **Amended after review.** `_capacity` counts `self.active` and so bounds
+> only this runner's own jobs; the paragraph below says the cap exists to
+> bound co-tenancy on the *card*, which independent `gpu-claim` users reach
+> without going through the runner at all. The cap is therefore enforced in
+> `ledger.fits`/`acquire` over live records, with `_capacity` kept as a
+> pre-filter. `gpu_max_jobs` joins `gpu_vram_mb` and `gpu_vram_reserve_mb`
+> as a key the standalone claim path reads, via `config.max_holders`.
+
 `gpu_max_jobs` defaults to 2 because that is the extent of what has been
 measured — 15% utilization to 62% — and extrapolating past a single data
 point is how a shared box acquires a scheduler nobody trusts. Without this

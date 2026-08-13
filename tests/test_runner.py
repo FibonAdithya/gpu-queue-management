@@ -1052,3 +1052,37 @@ def test_a_box_with_no_card_fails_every_pending_gpu_job(env, monkeypatch):
     for i in range(3):
         state, got = r.queue.find(f"j{i}")
         assert state == "failed" and "no usable GPU" in got.error
+
+
+def test_a_hand_run_holder_counts_against_gpu_max_jobs(gpu_env):
+    """`gpu_max_jobs` is a budget for the card, not for the runner's own
+    lane. Four users running `gpu-claim --vram-mb 500` by hand used to be
+    admitted in full and the runner would then add its own on top."""
+    from gpuqueue import ledger as lg
+    r, sha = gpu_env
+    r.cfg.gpu_max_jobs = 2
+    for i in (1, 2):
+        lg.acquire("test-uuid", vram_mb=500, owner=f"alice{i}",
+                   cmd=["train"], directory=r.cfg.claim_dir, usable_mb=7676)
+    submit(r, sha, "j1", ["sleep", "5"], lane="gpu", vram_mb=500)
+    r.queue.work_dir("j1").mkdir(parents=True, exist_ok=True)
+    # Nothing to do with VRAM: 6676 MiB of the card is free.
+    assert r.admit() == []
+    assert r.queue.list_state("pending")[0].id == "j1"
+
+
+def test_the_card_key_is_asked_for_once(gpu_env, monkeypatch):
+    """`gpu_key` is a second nvidia-smi subprocess and the card's identity
+    cannot change without a reboot. A pending job that does not fit leaves
+    `_capacity` positive, so `_ready_card` runs on every pass forever."""
+    r, sha = gpu_env
+    calls = []
+    monkeypatch.setattr(rn, "gpu_key",
+                        lambda index=0: (calls.append(1), "test-uuid")[1])
+    for job_id, vram in (("j1", 3000), ("j2", 7000)):
+        r.queue.work_dir(job_id).mkdir(parents=True, exist_ok=True)
+        submit(r, sha, job_id, ["sleep", "5"], lane="gpu", vram_mb=vram)
+    assert r.admit() == ["j1"]
+    r.admit()          # j2 does not fit, but capacity is still 1
+    r.admit()
+    assert len(calls) == 1

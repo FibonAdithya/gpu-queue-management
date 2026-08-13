@@ -439,3 +439,51 @@ def test_kill_tree_does_not_wait_out_a_zombie(monkeypatch):
         assert _time.monotonic() - started < 1.0
     finally:
         proc.wait(timeout=5)
+
+
+def test_sweep_spares_the_whole_tree_of_a_running_job(q, tmp_path, monkeypatch):
+    """A runner restart splits the two halves of one reap() call.
+
+    `release_stale` deletes the job's ledger record, because that record
+    carries the *dead runner's* pid; `requeue_orphans` deliberately spares
+    the job, because `spec.pid` is still alive. Between them the sweep sees
+    the job's trainer -- a child of `spec.pid`, since spec.pid is a venv or
+    shell wrapper, a torchrun, a dataloader parent -- with no record to
+    charge it to. Protecting only the top-level pid SIGKILLs it.
+    """
+    import os
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path / "claims",
+                       kill_orphan_cuda=True, enforce_vram=False)
+    q.submit(mkspec())
+    spec = q.claim("j1")
+    spec.pid = os.getpid()          # the job survived; its runner did not
+    q._write(q.path_for("running", "j1"), spec)
+
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 4242, "used_mb": 100}])
+    monkeypatch.setattr(rp, "descendants",
+                        lambda pid: {4242} if pid == os.getpid() else set())
+    killed = []
+    monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
+
+    assert reap(q, cfg)["killed_pids"] == []
+    assert killed == []
+
+
+def test_sweep_still_kills_a_process_under_nobody(q, tmp_path, monkeypatch):
+    """The exemption above must not turn into a blanket amnesty."""
+    import os
+    cfg = RunnerConfig(queue_root=q.root, claim_dir=tmp_path / "claims",
+                       kill_orphan_cuda=True, enforce_vram=False)
+    q.submit(mkspec())
+    spec = q.claim("j1")
+    spec.pid = os.getpid()
+    q._write(q.path_for("running", "j1"), spec)
+
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 9999, "used_mb": 100}])
+    monkeypatch.setattr(rp, "descendants",
+                        lambda pid: {4242} if pid == os.getpid() else set())
+    monkeypatch.setattr(rp, "_kill", lambda pid: True)
+
+    assert reap(q, cfg)["killed_pids"] == [9999]
