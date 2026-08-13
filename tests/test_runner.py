@@ -959,3 +959,96 @@ def test_the_mutex_timeout_is_logged_once_per_pass(gpu_env, monkeypatch,
 
     lines = [x for x in caplog.messages if "deferred this pass" in x]
     assert len(lines) == 1, lines
+
+
+def test_the_card_is_asked_about_once_per_admit_pass(env, monkeypatch):
+    """`preflight` and the uuid lookup answer the same question for every
+    pending GPU job -- two nvidia-smi subprocesses plus a recursive `ps`
+    walk per ledger record. Per job that used to cost nothing, because
+    `_capacity("gpu")` returned 0 as soon as one GPU job ran and the loop
+    skipped the rest without asking. A lane admitting `gpu_max_jobs` has
+    capacity to spare while the card is VRAM-full, so every pending job
+    reaches it: 20 queued jobs at `poll_interval_s = 2.0` is ~40 nvidia-smi
+    invocations every two seconds, and `collect` cannot run while `admit`
+    does, so a hung job outlives its `timeout_s`."""
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    r.cfg.gpu_vram_reserve_mb = 512
+    calls = {"preflight": 0, "gpu_key": 0}
+
+    def count(name, value):
+        def f(*a, **kw):
+            calls[name] += 1
+            return value
+        return f
+
+    monkeypatch.setattr(rn, "preflight", count("preflight", None))
+    monkeypatch.setattr(rn, "gpu_key", count("gpu_key", "test-uuid"))
+    for i in range(20):
+        submit(r, sha, f"j{i}", ["sleep", "5"], lane="gpu", vram_mb=7000)
+    assert len(r.admit()) == 1          # one fits; the card is then full
+    assert calls == {"preflight": 1, "gpu_key": 1}
+
+
+def test_a_pass_with_no_gpu_jobs_does_not_touch_the_card(env, monkeypatch):
+    r, sha = env
+    asked = []
+    monkeypatch.setattr(rn, "preflight",
+                        lambda **kw: asked.append("preflight"))
+    submit(r, sha, "j1", ["true"])
+    r.admit()
+    assert asked == []
+
+
+def test_a_job_that_fits_is_still_admitted_behind_one_that_did_not(env):
+    """Head-of-line blocking would defeat the point of per-job VRAM: a
+    500 MiB job has to slot in beside the 6 GB one already running even
+    though the 7 GB job queued ahead of it cannot. Short-circuiting the
+    pass on a full card is only correct for a condition every job shares
+    (an unusable card, a wedged ledger mutex), not for one job's
+    declaration being too big for the room that is left."""
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    r.cfg.gpu_vram_reserve_mb = 512
+    submit(r, sha, "big", ["sleep", "5"], lane="gpu", vram_mb=6000)
+    submit(r, sha, "wont-fit", ["sleep", "5"], lane="gpu", vram_mb=7000)
+    submit(r, sha, "fits", ["sleep", "5"], lane="gpu", vram_mb=500)
+    started = r.admit()
+    assert "big" in started and "fits" in started
+    assert r.queue.find("wont-fit")[0] == "pending"
+
+
+def test_a_preflight_failure_defers_the_whole_pass_with_one_line(env, caplog,
+                                                                 monkeypatch):
+    """An unusable card is a condition every pending GPU job shares, so it
+    is one log line per pass rather than one per job -- the same reasoning
+    `mutex_blocked` already applies to a wedged ledger mutex."""
+    import logging
+    from gpuqueue.preflight import PreflightFailed
+    r, sha = env
+    monkeypatch.setattr(rn, "preflight",
+                        lambda **kw: (_ for _ in ()).throw(
+                            PreflightFailed("pid 4321 train.py")))
+    for i in range(5):
+        submit(r, sha, f"j{i}", ["true"], lane="gpu")
+    with caplog.at_level(logging.WARNING):
+        assert r.admit() == []
+    assert sum("4321" in rec.getMessage() for rec in caplog.records) == 1
+    assert all(r.queue.find(f"j{i}")[0] == "pending" for i in range(5))
+
+
+def test_a_box_with_no_card_fails_every_pending_gpu_job(env, monkeypatch):
+    """`GpuIdError` is card-wide, but unlike a preflight failure it is
+    permanent -- no card will appear on a box that has none. Deferring the
+    pass would queue them forever, so each still gets failed."""
+    from gpuqueue.gpuid import GpuIdError
+    r, sha = env
+    monkeypatch.setattr(rn, "gpu_key",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            GpuIdError("no CUDA device")))
+    for i in range(3):
+        submit(r, sha, f"j{i}", ["true"], lane="gpu")
+    r.admit()
+    for i in range(3):
+        state, got = r.queue.find(f"j{i}")
+        assert state == "failed" and "no usable GPU" in got.error

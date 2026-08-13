@@ -99,11 +99,18 @@ def _as_bool(value, key: str, default: bool) -> bool:
     obviously one or the other is a ConfigError: a config this file cannot
     read is worth a loud failure at startup, where guessing is worth a
     dead job hours later.
+
+    `0` and `1` are accepted because `bool(value)` accepted them: a
+    stricter reader is worth an unreadable string, and not worth refusing
+    to start the daemon on a config that already worked before an upgrade.
+    Any other int is as unreadable as "sometimes".
     """
     if value is None:
         return default
-    if isinstance(value, bool):
+    if isinstance(value, bool):     # before int: bool *is* an int
         return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
     if isinstance(value, str):
         s = value.strip().lower()
         if s in _TRUE:
@@ -111,6 +118,42 @@ def _as_bool(value, key: str, default: bool) -> bool:
         if s in _FALSE:
             return False
     raise ConfigError(f"{key} must be true or false, got {value!r}")
+
+
+def vram_policy(path: Path | None = None) -> tuple[int | None, int]:
+    """`(gpu_vram_mb, gpu_vram_reserve_mb)`, for callers that are not the runner.
+
+    A standalone `gpu-claim` shares one `<key>.lock.d` with the runner but
+    has no config of its own, so it sized the card from nvidia-smi while
+    the runner sized it from `[queue].gpu_vram_mb`. An operator who follows
+    docs/deploying.md and declares a card smaller than nvidia-smi reports
+    -- the documented fix for a driver that will not hand out what the
+    query claims -- then has two participants admitting against different
+    totals into the same ledger, which is the double-booking the ledger
+    exists to prevent.
+
+    Deliberately not `load_config`: a caller that only wants the card's
+    size must not be refused because `[queue].root` is missing or a project
+    is half-declared. It would fall back to a capacity the runner does not
+    share, which is the divergence this closes. For the same reason an
+    unreadable or absent file is the defaults rather than an error -- that
+    is a box with no runner deployed, and exactly what this path did before
+    there was a config to read.
+    """
+    p = Path(path) if path else default_config_path()
+    try:
+        queue = tomllib.loads(p.read_text()).get("queue") or {}
+        total = queue.get("gpu_vram_mb")
+        total = int(total) if total is not None else None
+        reserve = int(queue.get("gpu_vram_reserve_mb", DEFAULT_RESERVE_MB))
+    except Exception:
+        return None, DEFAULT_RESERVE_MB
+    # load_config rejects these outright, but this reader runs in a process
+    # that has no runner to refuse to start; a nonsense reserve falls back
+    # rather than propagating a negative capacity into ledger.fits.
+    if reserve < 0 or (total is not None and reserve >= total):
+        return total, DEFAULT_RESERVE_MB
+    return total, reserve
 
 
 def default_config_path() -> Path:

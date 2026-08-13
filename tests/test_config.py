@@ -1,7 +1,8 @@
 import textwrap
 
 import pytest
-from gpuqueue.config import load_config, ConfigError
+from gpuqueue.config import load_config, vram_policy, ConfigError
+from gpuqueue.ledger import DEFAULT_RESERVE_MB
 
 TOML = """
 [queue]
@@ -207,3 +208,72 @@ def test_an_unreadable_bool_is_an_error_not_a_guess(tmp_path):
             root = "/q"
             enforce_vram = "sometimes"
         """)
+
+
+def test_an_integer_bool_is_still_read_as_one(tmp_path):
+    """`kill_orphan_cuda = 1` is valid TOML that the old `bool(...)` path
+    read as True. Rejecting it now would refuse to start the daemon after
+    an upgrade, with no change on the operator's side -- a stricter reader
+    is worth an unreadable *string*, not a config that already worked."""
+    cfg = write_and_load(tmp_path, """
+        [queue]
+        root = "/q"
+        enforce_vram = 0
+        kill_orphan_cuda = 1
+    """)
+    assert cfg.enforce_vram is False
+    assert cfg.kill_orphan_cuda is True
+
+
+def test_an_integer_that_is_not_a_bool_is_still_an_error(tmp_path):
+    """Widening to int is for the two values that spell a bool. `2` is as
+    unreadable as `"sometimes"`."""
+    with pytest.raises(ConfigError, match=r"\[queue\].enforce_vram"):
+        write_and_load(tmp_path, """
+            [queue]
+            root = "/q"
+            enforce_vram = 2
+        """)
+
+
+# --- vram_policy: the capacity keys, for participants that are not the runner
+
+
+def test_vram_policy_reads_the_capacity_keys(tmp_path):
+    p = _write(tmp_path, textwrap.dedent("""
+        [queue]
+        root = "/q"
+        gpu_vram_mb = 4096
+        gpu_vram_reserve_mb = 256
+    """))
+    assert vram_policy(p) == (4096, 256)
+
+
+def test_vram_policy_defaults_when_the_keys_are_absent(tmp_path):
+    assert vram_policy(_write(tmp_path, '[queue]\nroot = "/q"\n')) == (
+        None, DEFAULT_RESERVE_MB)
+
+
+def test_vram_policy_does_not_need_a_loadable_config(tmp_path):
+    """Deliberately not `load_config`. A caller that only wants the card's
+    size must not be refused because `[queue].root` is missing or a project
+    is half-declared -- it would fall back to a capacity the runner does not
+    share, which is the divergence this exists to close."""
+    p = _write(tmp_path, textwrap.dedent("""
+        [queue]
+        gpu_vram_mb = 4096
+
+        [project.p]
+        remote = "git@github.com:you/p.git"
+    """))
+    with pytest.raises(ConfigError):
+        load_config(p)
+    assert vram_policy(p) == (4096, DEFAULT_RESERVE_MB)
+
+
+def test_vram_policy_falls_back_when_there_is_no_config(tmp_path):
+    """The standalone `gpu-claim` path on a box with no runner deployed:
+    exactly what it did before there was a config to read."""
+    assert vram_policy(tmp_path / "absent.toml") == (None, DEFAULT_RESERVE_MB)
+    (tmp_path / "junk.toml").write_text("this is not toml [[[")
+    assert vram_policy(tmp_path / "junk.toml") == (None, DEFAULT_RESERVE_MB)

@@ -190,12 +190,12 @@ def test_read_claim_returns_none_on_garbage(tmp_path):
 
 
 def test_default_usable_mb_holds_back_a_reserve(monkeypatch):
-    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: 8188)
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 8188)
     assert default_usable_mb() == 8188 - lg.DEFAULT_RESERVE_MB
 
 
 def test_default_usable_mb_is_none_when_the_card_cannot_be_queried(monkeypatch):
-    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: None)
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: None)
     assert default_usable_mb() is None
 
 
@@ -205,8 +205,76 @@ def test_default_usable_mb_is_none_when_the_reserve_swallows_the_card(
     usable_mb to ledger.fits/exceeds_capacity, where `want_mb > usable_mb`
     is then true for every claim -- silently admitting nothing. Same
     guard as Runner._usable_mb, applied to this sibling path."""
-    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: 256)
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 256)
     assert default_usable_mb() is None
+
+
+def _config(tmp_path, monkeypatch, body):
+    p = tmp_path / "gpuq.toml"
+    p.write_text(body)
+    monkeypatch.setenv("GPUQ_CONFIG", str(p))
+    return p
+
+
+def test_default_usable_mb_follows_the_declared_card_size(tmp_path,
+                                                          monkeypatch):
+    """The runner and a standalone gpu-claim share one <key>.lock.d. An
+    operator who follows docs/deploying.md and declares a card smaller than
+    nvidia-smi reports must not leave the two of them admitting against
+    different totals into it -- that is the double-booking the ledger
+    exists to prevent."""
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 8188)
+    _config(tmp_path, monkeypatch,
+            '[queue]\nroot = "/q"\ngpu_vram_mb = 4096\n')
+    assert default_usable_mb() == 4096 - lg.DEFAULT_RESERVE_MB
+
+
+def test_default_usable_mb_follows_the_declared_reserve(tmp_path, monkeypatch):
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 8188)
+    _config(tmp_path, monkeypatch,
+            '[queue]\nroot = "/q"\ngpu_vram_reserve_mb = 1024\n')
+    assert default_usable_mb() == 8188 - 1024
+
+
+def test_default_usable_mb_sizes_the_card_it_was_asked_about(monkeypatch):
+    """`gpu-claim --gpu-index 1` keys the ledger on card 1 and pins the
+    child to it. Sizing it against card 0 admits a 16 GB claim onto the
+    8 GB card beside it."""
+    cards = {0: 24564, 1: 8188}
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb",
+                        lambda index=0: cards[index])
+    assert default_usable_mb(1) == 8188 - lg.DEFAULT_RESERVE_MB
+
+
+def test_a_declared_card_size_does_not_travel_to_another_index(tmp_path,
+                                                               monkeypatch):
+    """`gpu_vram_mb` describes the card the runner manages -- card 0, the
+    only one `gpu_key()` ever names. Applying it to card 1 would size a
+    card nobody declared. The reserve is a headroom policy rather than a
+    fact about one card, so it still applies."""
+    cards = {0: 24564, 1: 8188}
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb",
+                        lambda index=0: cards[index])
+    _config(tmp_path, monkeypatch,
+            '[queue]\nroot = "/q"\ngpu_vram_mb = 4096\n'
+            'gpu_vram_reserve_mb = 1024\n')
+    assert default_usable_mb(0) == 4096 - 1024
+    assert default_usable_mb(1) == 8188 - 1024
+
+
+def test_a_nonpositive_declaration_is_refused(tmp_path):
+    """A negative declaration *subtracts* from the accounted total in
+    `ledger.fits`, so a holder that declared -5000 lets the next claimant
+    be admitted 5 GB past the end of the card -- the OOM the ledger exists
+    to prevent. Zero is admitted without limit, which is the same failure
+    reached by an unbounded number of co-tenants. `JobSpec.validate`
+    already refuses both on the submit path."""
+    for bad in (0, -5000):
+        with pytest.raises(ValueError, match="positive"):
+            with gpu_claim(key=KEY, directory=tmp_path, vram_mb=bad,
+                           usable_mb=7676):
+                pass
+    assert list_claims(tmp_path) == []
 
 
 def test_an_explicit_usable_none_is_not_re_derived(tmp_path, monkeypatch):
@@ -220,7 +288,7 @@ def test_an_explicit_usable_none_is_not_re_derived(tmp_path, monkeypatch):
     on sharing the card against `total - DEFAULT_RESERVE_MB` -- ignoring the
     configured gpu_vram_reserve_mb, and disagreeing with the runner exactly
     when the card is the thing that cannot be trusted."""
-    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: 8188)
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 8188)
     with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512, usable_mb=None):
         with pytest.raises(ClaimBusy):
             with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512,
@@ -232,7 +300,7 @@ def test_an_omitted_usable_is_still_derived_from_the_card(tmp_path,
                                                           monkeypatch):
     """The other half of the same distinction: a caller that says nothing
     (a hand-run `gpu-claim --vram-mb 512`) still gets capacity discovery."""
-    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda: 8188)
+    monkeypatch.setattr("gpuqueue.claim.total_vram_mb", lambda index=0: 8188)
     with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512):
         with gpu_claim(key=KEY, directory=tmp_path, vram_mb=512) as second:
             assert second.vram_mb == 512

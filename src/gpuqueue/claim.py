@@ -14,7 +14,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import ledger
+from . import config, ledger
 from .gpuid import gpu_key, total_vram_mb
 # re-exported: callers use these
 from .ledger import ClaimBusy, MutexTimeout, CannotEverFit
@@ -69,22 +69,39 @@ def job_orphaned(job_pid: int | None, runner_pid: int | None) -> bool:
     return not pid_alive(runner_pid)
 
 
-def default_usable_mb() -> int | None:
+def default_usable_mb(index: int = 0) -> int | None:
     """What a standalone `gpu-claim` may admit against.
+
+    The runner's answer to the same question about the same card, which is
+    the point: the two of them share one `<key>.lock.d`, and a capacity
+    they disagree about is a card they will double-book. So this reads
+    `[queue].gpu_vram_mb`/`gpu_vram_reserve_mb` for the same reason
+    `Runner._usable_mb` does -- see `config.vram_policy`, which explains
+    why it does not go through `load_config`.
+
+    `index` follows `gpu-claim --gpu-index`, which keys the ledger on that
+    card and pins the child to it; sizing every claim against card 0 admits
+    a 16 GB claim onto the 8 GB card beside it. A declared `gpu_vram_mb`
+    describes the card the runner manages -- card 0, the only one
+    `gpu_key()` ever names -- so it is not applied to any other index. The
+    reserve is a headroom policy rather than a fact about one card, so it
+    applies to all of them.
 
     None when the card cannot be queried, which `ledger.fits` turns into
     exclusive-only admission -- degraded, and the same posture preflight
     already takes when it cannot enumerate the card. Also None when the
-    card's total is smaller than DEFAULT_RESERVE_MB: an uncapped
-    subtraction would go negative, and `want_mb > usable_mb` in
+    card's total is smaller than the reserve: an uncapped subtraction
+    would go negative, and `want_mb > usable_mb` in
     `ledger.fits`/`exceeds_capacity` is then true for every claim,
     silently admitting nothing instead of degrading the same way a
     query failure does.
     """
-    total = total_vram_mb()
+    declared, reserve = config.vram_policy()
+    total = declared if declared is not None and index == 0 else \
+        total_vram_mb(index)
     if total is None:
         return None
-    usable = total - ledger.DEFAULT_RESERVE_MB
+    usable = total - reserve
     return usable if usable > 0 else None
 
 
@@ -135,6 +152,18 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
     of silently retrying at the capacity rate for however long that run
     lasts.
     """
+    # The same rule `JobSpec.validate` applies on the submit path, applied
+    # here because this is the other way into the ledger. A declaration
+    # that is not a positive int does not merely fail to be admitted: it is
+    # *summed* by `ledger.fits`, so a holder that declared -5000 subtracts
+    # 5 GB from the accounted total and the next claimant is admitted past
+    # the end of the card. Zero is admitted without limit, which an
+    # unbounded number of co-tenants reaches the same way.
+    if vram_mb is not None and (not isinstance(vram_mb, int)
+                                or isinstance(vram_mb, bool) or vram_mb <= 0):
+        raise ValueError(
+            f"vram_mb must be a positive int or None (meaning the whole "
+            f"card), got {vram_mb!r}")
     d = Path(directory) if directory else claim_dir()
     key = key or gpu_key()
     if usable_mb is _ASK_THE_CARD:

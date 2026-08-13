@@ -316,6 +316,17 @@ class Runner:
         # tries again. Not fixed by lowering `ledger.MUTEX_WAIT_S`, which
         # the interactive `gpu-claim` path legitimately needs.
         mutex_blocked = False
+        # Asked once, before the loop, because the answer is the same for
+        # every pending GPU job and costs two nvidia-smi subprocesses plus
+        # a recursive `ps` walk per ledger record to get. See `_ready_card`.
+        card_key = card_error = None
+        if any(s.lane == "gpu" for s in pending) and self._capacity("gpu") > 0:
+            card_key, card_error = self._ready_card()
+            if isinstance(card_error, PreflightFailed):
+                # One line per pass, not one per pending job: the same
+                # reasoning `mutex_blocked` applies below to a card-wide
+                # condition nobody in this pass can get past.
+                log.warning("GPU admissions deferred this pass: %s", card_error)
         for spec in pending:
             project = self.cfg.projects.get(spec.project)
             if project is None:
@@ -329,10 +340,16 @@ class Runner:
             # running/ needs no unwinding if the card is busy.
             claim_cm = claim_record = None
             if spec.lane == "gpu":
-                if mutex_blocked:
+                if mutex_blocked or isinstance(card_error, PreflightFailed):
+                    continue
+                if card_error is not None:      # GpuIdError
+                    # Card-wide like the above, but permanent: no card will
+                    # appear on a box that has none, so deferring the pass
+                    # would queue these forever.
+                    self._fail_pending(spec, f"no usable GPU: {card_error}")
                     continue
                 try:
-                    taken = self._take_card(spec)
+                    taken = self._take_card(spec, card_key)
                 except ledger.MutexTimeout as e:
                     # Logged here rather than per job, so one wedged holder
                     # writes one line per pass instead of one per pending
@@ -353,8 +370,54 @@ class Runner:
                 started.append(claimed.id)
         return started
 
-    def _take_card(self, spec: JobSpec):
+    def _ready_card(self) -> tuple[str | None, Exception | None]:
+        """Is the card usable, and which card is it -- asked once per pass.
+
+        Both halves answer the same for every pending GPU job, and both are
+        expensive: `preflight` is an nvidia-smi subprocess with a 15s
+        timeout plus a recursive `ps` walk per ledger record, and `gpu_key`
+        is a second nvidia-smi. Per job that used to cost nothing, because
+        `_capacity("gpu")` returned 0 the moment one GPU job ran and the
+        loop skipped every other pending GPU job without asking. A lane
+        that admits `gpu_max_jobs` still has capacity while the card is
+        VRAM-full, so all of them now reach `_take_card`: 20 queued jobs at
+        `poll_interval_s = 2.0` is ~40 nvidia-smi invocations every two
+        seconds, and `collect` cannot run while `admit` does, so a hung job
+        outlives its `timeout_s`. That is the stall `_report_bug` calls
+        worse than a crash.
+
+        Returns `(key, None)` when the card can be handed out, else
+        `(None, error)`: `PreflightFailed` to defer the pass,
+        `GpuIdError` to fail the jobs rather than queue them forever.
+
+        What is deliberately *not* hoisted is the per-job half -- whether
+        this declaration fits in the room that is left. Short-circuiting
+        the pass on a full card would mean a 500 MiB job never slots in
+        beside the 6 GB one running, because a 7 GB job queued ahead of it
+        did not fit, which is the head-of-line blocking that per-job VRAM
+        accounting exists to remove.
+        """
+        try:
+            # The runner's configured claim dir, not $GPU_CLAIM_DIR. These
+            # were already two different answers to "where are the
+            # claims?"; now that preflight decides contention by reading
+            # them, disagreeing means a co-tenant reads as an intruder.
+            preflight(directory=self.cfg.claim_dir)
+        except PreflightFailed as e:
+            return None, e
+        except Exception as e:
+            self._report_bug(e, "preflight")
+            raise
+        try:
+            return gpu_key(), None
+        except GpuIdError as e:
+            return None, e
+
+    def _take_card(self, spec: JobSpec, key: str):
         """Enter a gpu_claim by hand so it can be held across ticks.
+
+        `key` comes from `_ready_card`, which has already established that
+        the card is usable; this is only the part that depends on `spec`.
 
         Never waits on *capacity*: `wait=True` in a single-threaded loop
         would stall the CPU lane behind whoever holds the card. A full card
@@ -369,24 +432,6 @@ class Runner:
         should stay pending or has just been failed outright. Raises
         `ledger.MutexTimeout`.
         """
-        try:
-            # The runner's configured claim dir, not $GPU_CLAIM_DIR. These
-            # were already two different answers to "where are the
-            # claims?"; now that preflight decides contention by reading
-            # them, disagreeing means a co-tenant reads as an intruder.
-            preflight(directory=self.cfg.claim_dir)
-        except PreflightFailed as e:
-            log.warning("%s waiting: %s", spec.id, e)
-            return None
-        except Exception as e:
-            self._report_bug(e, "preflight", spec)
-            raise
-        try:
-            key = gpu_key()
-        except GpuIdError as e:
-            # No card will appear on a box that has none; do not queue forever.
-            self._fail_pending(spec, f"no usable GPU: {e}")
-            return None
         usable = self._usable_mb()
         if ledger.exceeds_capacity(spec.vram_mb, usable):
             # Permanent, so failing beats queueing forever -- the same call
