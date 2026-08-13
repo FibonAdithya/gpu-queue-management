@@ -30,7 +30,7 @@ from .executor import (start_job, poll_job, kill_job, JobResult, RunningJob,
 from .gpuid import gpu_key, cuda_visible_value, total_vram_mb, GpuIdError
 from .preflight import preflight, PreflightFailed
 from .queue import QueueRoot, STATES
-from .reaper import reap, MAX_ATTEMPTS
+from .reaper import reap, MAX_ATTEMPTS, WATCHDOG_STRIKES
 from .spec import JobSpec
 
 log = logging.getLogger("gpuqueue.runner")
@@ -487,6 +487,23 @@ class Runner:
         except ClaimBusy as e:
             log.info("%s waiting: %s", spec.id, e)
             return None
+        except ValueError as e:
+            # A declaration `gpu_claim` refuses outright. `JobSpec.validate`
+            # rejects the same values, but only on the submit path --
+            # `QueueRoot._read` builds a spec with `from_dict`, which does
+            # not validate, and `docs/design.md` makes hand-editing a
+            # pending job an explicitly supported repair. So an operator
+            # who lowers a declaration after an OOM and types `"vram_mb":
+            # 0` puts a spec on disk that this call raises on.
+            #
+            # Uncaught, that leaves `admit` and `_phase` re-raises by
+            # design, so the process dies -- and supervisor restarts it
+            # onto the same pending spec, forever, taking the cpu lane down
+            # with it. One bad job must not be able to do that, so fail the
+            # job, exactly as the `exceeds_capacity` branch above does for
+            # the other permanently-unadmittable declaration.
+            self._fail_pending(spec, f"invalid vram_mb: {e}")
+            return None
         return cm, record
 
     def _card_pin(self, spec: JobSpec) -> dict:
@@ -663,6 +680,14 @@ class Runner:
         a transient, no matter what a co-tenant did at the same moment.
         Checking timed_out before oom, same as _describe_failure does,
         keeps that job out of the retry path.
+
+        The conviction has to be recent as well as after this job started.
+        "After it started" alone is nearly free for a long run: a six-hour
+        job that OOMs on its own misconfiguration at hour six is still
+        `> started_mono` behind a conviction from minute five, so it would
+        be requeued and burn another six hours -- exactly the blind retry
+        the first paragraph says stays forbidden. See `_conviction_window_s`
+        for the bound.
         """
         if spec.id in self._convicted:
             return False
@@ -672,8 +697,30 @@ class Runner:
             return False
         if self._last_conviction is None:
             return False
-        return (self._last_conviction > active.started_mono
-                and spec.attempts < MAX_ATTEMPTS)
+        if spec.attempts >= MAX_ATTEMPTS:
+            return False
+        if self._last_conviction <= active.started_mono:
+            return False
+        return (time.monotonic() - self._last_conviction
+                <= self._conviction_window_s())
+
+    def _conviction_window_s(self) -> float:
+        """How long after a conviction an OOM can still be blamed on it.
+
+        Derived from the watchdog's own cadence rather than picked: an
+        overage is convicted only on `WATCHDOG_STRIKES` consecutive sweeps
+        `orphan_cuda_interval_s` apart, so the overage that OOMed the
+        victim may have begun that far before the kill landed. The victim
+        then dies in milliseconds but is not `_settle`d until `collect`
+        next runs, which is why a couple of poll intervals of slack are
+        added on top.
+
+        Computed rather than stored so that an operator who retunes
+        `orphan_cuda_interval_s` does not silently leave this window
+        describing the old cadence.
+        """
+        return (WATCHDOG_STRIKES * self.cfg.orphan_cuda_interval_s
+                + 2 * self.cfg.poll_interval_s)
 
     def _collect_artifacts(self, spec: JobSpec, project: ProjectConfig,
                            workdir: Path) -> None:

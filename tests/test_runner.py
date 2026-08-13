@@ -737,6 +737,54 @@ def test_an_ordinary_oom_is_still_not_retried(env, monkeypatch):
     assert "out of memory" in (spec.error or "").lower()
 
 
+def test_a_stale_conviction_does_not_excuse_a_much_later_oom(env, monkeypatch):
+    """"After this job started" is nearly free for a long-running job.
+
+    A six-hour job that OOMs on its own misconfiguration at hour six is
+    still behind a conviction from minute five, so on the ordering test
+    alone it would be requeued and burn another six hours -- the blind
+    retry docs/design.md forbids. The conviction has to be recent as well
+    as later.
+    """
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    monkeypatch.setattr(r, "_prepare_workdir",
+                        lambda spec, project: r.queue.work_dir(spec.id))
+    r.queue.work_dir("j1").mkdir(parents=True, exist_ok=True)
+    submit(r, sha, "j1", OOMS, lane="gpu", vram_mb=512)
+    assert r.admit() == ["j1"]
+    now = time.monotonic()
+    r.active["j1"].started_mono = now - 21600  # six hours in
+    r._last_conviction = now - 21000           # convicted five hours ago,
+    _run_until_settled(r, "j1")                # i.e. after it started
+    state, spec = r.queue.find("j1")
+    assert state == "failed"
+    assert spec.attempts == 0
+
+
+def test_a_hand_edited_bad_vram_mb_fails_the_job_not_the_runner(env):
+    """docs/design.md makes hand-repairing a pending spec supported, and
+    `from_dict` does not validate -- only `submit` does. A declaration
+    `gpu_claim` refuses must fail that one job, not escape `admit` and
+    take the daemon down into a supervisor restart loop on the same spec,
+    with the cpu lane as collateral."""
+    r, sha = env
+    r.cfg.gpu_vram_mb = 8188
+    submit(r, sha, "j1", ["sh", "-c", "true"], lane="gpu", vram_mb=512)
+    submit(r, sha, "j2", ["sh", "-c", "echo hi"], lane="cpu")
+    p = r.queue.root / "pending" / "j1.json"
+    d = json.loads(p.read_text())
+    d["vram_mb"] = 0                    # the operator's typo, on disk
+    p.write_text(json.dumps(d))
+
+    started = r.admit()                 # must not raise
+
+    state, spec = r.queue.find("j1")
+    assert state == "failed"
+    assert "vram_mb" in (spec.error or "")
+    assert "j2" in started, "the cpu lane must survive one bad gpu spec"
+
+
 def test_a_conviction_before_the_job_started_does_not_excuse_it(env, monkeypatch):
     r, sha = env
     r.cfg.gpu_vram_mb = 8188
