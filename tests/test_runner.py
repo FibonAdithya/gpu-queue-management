@@ -1114,6 +1114,71 @@ def test_a_job_that_fits_is_still_admitted_behind_one_that_did_not(env):
     assert r.queue.find("wont-fit")[0] == "pending"
 
 
+def test_an_exclusive_holder_costs_one_acquire_per_pass_not_one_per_job(
+        gpu_env, monkeypatch):
+    """The default path, and the one that used to be free.
+
+    `vram_mb=None` means the whole card, so the *common* backlog is one
+    exclusive job running and a queue of undeclared ones behind it. None of
+    them can fit, but `_capacity("gpu")` is `gpu_max_jobs` rather than the
+    old hard 1, so each would reach `_take_card` and pay a mkdir, a flock
+    and a directory scan to be told what the first one was told. At
+    `poll_interval_s = 2.0` that repeats forever."""
+    from gpuqueue import ledger as lg
+    r, sha = gpu_env
+    for i in range(6):
+        r.queue.work_dir(f"j{i}").mkdir(parents=True, exist_ok=True)
+        submit(r, sha, f"j{i}", ["sleep", "5"], lane="gpu")   # undeclared
+    assert r.admit() == ["j0"]
+
+    calls = []
+    real = lg.acquire
+    monkeypatch.setattr(lg, "acquire",
+                        lambda *a, **kw: (calls.append(1), real(*a, **kw))[1])
+    assert r.admit() == []
+    assert len(calls) == 1, "one refusal per pass, not one per pending job"
+    assert all(r.queue.find(f"j{i}")[0] == "pending" for i in range(1, 6))
+
+
+def test_the_closed_card_is_logged_once_per_pass(gpu_env, caplog):
+    """One line, not one multi-line holder dump per pending job."""
+    import logging
+    r, sha = gpu_env
+    for i in range(5):
+        r.queue.work_dir(f"j{i}").mkdir(parents=True, exist_ok=True)
+        submit(r, sha, f"j{i}", ["sleep", "5"], lane="gpu")
+    assert r.admit() == ["j0"]
+    with caplog.at_level(logging.INFO, logger="gpuqueue.runner"):
+        assert r.admit() == []
+    lines = [x for x in caplog.messages if "deferred this pass" in x]
+    assert len(lines) == 1, lines
+
+
+def test_the_job_cap_closes_the_card_for_the_rest_of_the_pass(gpu_env,
+                                                              monkeypatch):
+    """`gpu_max_jobs` is card-wide too: at the cap, a smaller declaration
+    does not help either, so the queue behind it should not be walked.
+
+    Reached through hand-run holders rather than the runner's own jobs,
+    because `_capacity` already stops the loop before the ledger when the
+    runner owns every slot itself. The cap is a budget for the *card*, so
+    the case that gets here is the one `_capacity` cannot see."""
+    from gpuqueue import ledger as lg
+    r, sha = gpu_env
+    for i in (1, 2):
+        lg.acquire("test-uuid", vram_mb=500, owner=f"alice{i}", cmd=["train"],
+                   directory=r.cfg.claim_dir, usable_mb=7676)
+    for i in range(5):
+        r.queue.work_dir(f"j{i}").mkdir(parents=True, exist_ok=True)
+        submit(r, sha, f"j{i}", ["sleep", "5"], lane="gpu", vram_mb=100)
+    calls = []
+    real = lg.acquire
+    monkeypatch.setattr(lg, "acquire",
+                        lambda *a, **kw: (calls.append(1), real(*a, **kw))[1])
+    assert r.admit() == []                      # 6676 MiB free, but at the cap
+    assert len(calls) == 1, "one refusal ends the pass"
+
+
 def test_a_preflight_failure_defers_the_whole_pass_with_one_line(env, caplog,
                                                                  monkeypatch):
     """An unusable card is a condition every pending GPU job shares, so it

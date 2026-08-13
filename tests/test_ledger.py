@@ -333,6 +333,47 @@ def test_records_with_the_same_name_in_different_dirs_both_own(monkeypatch):
     assert unledgered == []
 
 
+# --- card_is_closed: is the refusal about this claim, or about the card? -
+
+def test_card_is_closed_only_when_no_declaration_could_get_past(tmp_path):
+    """The distinction a batch admitter needs: "your 7 GB does not fit" must
+    not stop the 500 MiB job behind you, but "at the job limit" must."""
+    half = [mkrec(tmp_path, "100.a.json", vram_mb=4000)]
+    assert lg.card_is_closed(half, 8000) is False          # room for a small one
+    assert lg.card_is_closed(half, 8000, max_holders=1) is True
+    assert lg.card_is_closed([], 8000, max_holders=2) is False
+    full = [mkrec(tmp_path, "101.b.json", vram_mb=8000)]
+    assert lg.card_is_closed(full, 8000) is True
+    excl = [mkrec(tmp_path, "102.c.json", vram_mb=None)]
+    assert lg.card_is_closed(excl, 8000) is True           # holds the whole card
+
+
+def test_card_is_closed_agrees_with_fits_on_an_unqueryable_card(tmp_path):
+    """`usable_mb is None` is exclusive-only admission, so an empty card
+    still takes one claim and is not closed."""
+    assert lg.card_is_closed([], None) is False
+    assert lg.fits([], 500, None) is True
+    recs = [mkrec(tmp_path, "100.a.json", vram_mb=500)]
+    assert lg.card_is_closed(recs, None) is True
+    assert lg.fits(recs, 500, None) is False
+
+
+def test_acquire_raises_card_closed_only_for_a_card_wide_refusal(tmp_path):
+    """A subclass, so every existing `except ClaimBusy` still catches it."""
+    live = os.getpid()
+    mkrec(tmp_path, f"{live}.a.json", pid=live, usage_pid=live, vram_mb=7000)
+    # Refused for this declaration alone: 1000 free, 2000 wanted.
+    with pytest.raises(lg.ClaimBusy) as e:
+        lg.acquire(KEY, vram_mb=2000, owner="big", cmd=["train"],
+                   directory=tmp_path, usable_mb=8000)
+    assert not isinstance(e.value, lg.CardClosed)
+    # Refused for the card: nothing at all fits behind a full one.
+    mkrec(tmp_path, f"{live}.b.json", pid=live, usage_pid=live, vram_mb=1000)
+    with pytest.raises(lg.CardClosed):
+        lg.acquire(KEY, vram_mb=1, owner="small", cmd=["train"],
+                   directory=tmp_path, usable_mb=8000)
+
+
 # --- the holder cap: a latency budget the whole box shares ---------------
 
 def test_fits_refuses_past_the_holder_cap(tmp_path):

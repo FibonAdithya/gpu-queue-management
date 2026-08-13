@@ -50,6 +50,10 @@ GPUQ_PREFIX="$tmp/ws" SUPERVISOR_CONF_DIR="$tmp/conf" \
 check "creates the queue tree" "[ -d '$tmp/ws/queue/pending' ]"
 check "creates the claim dir" "[ -d '$tmp/ws/lock/gpu' ]"
 check "writes a config when absent" "[ -f '$tmp/ws/gpuq.toml' ]"
+# The example hardcodes /workspace. Left in place on a box with another
+# prefix, the runner's ledger and a bare gpu-claim's are two directories.
+check "config claim_dir follows the prefix" \
+  "grep -q 'claim_dir = \"$tmp/ws/lock/gpu\"' '$tmp/ws/gpuq.toml'"
 
 before="$(cat "$tmp/ws/gpuq.toml")"
 echo "# edited by hand" >> "$tmp/ws/gpuq.toml"

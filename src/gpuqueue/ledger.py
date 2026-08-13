@@ -49,6 +49,20 @@ class MutexTimeout(ClaimBusy):
     """
 
 
+class CardClosed(ClaimBusy):
+    """Refused for a reason no *other* declaration gets past either.
+
+    A subclass for the same reason `MutexTimeout` and `CannotEverFit` are:
+    every existing `except ClaimBusy` must keep catching it. What it offers
+    a caller who asks is that retrying with a smaller declaration is
+    pointless -- the card is at its job limit, or an exclusive holder has
+    it, or there is no free VRAM at all. Unlike `CannotEverFit` this does
+    clear on its own, so waiters should keep waiting; it is the *batch*
+    admitter that wants the distinction, to stop walking a queue whose every
+    remaining entry would be refused for the same reason.
+    """
+
+
 class CannotEverFit(ClaimBusy):
     """The declaration exceeds the whole card -- permanent, not busy.
 
@@ -230,6 +244,34 @@ def free_mb(records: list[Record], usable_mb: int | None) -> int:
     return max(0, usable_mb - sum(r.vram_mb or 0 for r in records))
 
 
+def card_is_closed(records: list[Record], usable_mb: int | None,
+                   max_holders: int | None = None) -> bool:
+    """Would `fits` refuse *every* declaration, not just one of them?
+
+    The complement of the property `Runner._ready_card` is careful to keep
+    per-job: "this 7 GB job does not fit" must not stop a 500 MiB one
+    slotting in beside the 6 GB job that is running, or per-job VRAM
+    accounting has bought nothing over the old whole-card lock. But three of
+    `fits`'s refusals do not depend on `want_mb` at all, and walking the
+    rest of the queue against them is pure cost: a flock, a directory scan
+    and a multi-line log line per pending job, every `poll_interval_s`, for
+    as long as the backlog lasts.
+
+    Deliberately conservative where the card is unknowable: `usable_mb is
+    None` with nothing on the card still admits one exclusive claim, so it
+    is not closed.
+    """
+    if max_holders is not None and len(records) >= max_holders:
+        return True
+    if not records:
+        return False
+    if usable_mb is None or any(r.vram_mb is None for r in records):
+        # Card unqueryable, or an exclusive holder: `fits` treats either as
+        # the whole card being spoken for.
+        return True
+    return free_mb(records, usable_mb) <= 0
+
+
 def busy_message(key: str, records: list[Record], want_mb: int | None,
                  usable_mb: int | None, max_holders: int | None = None) -> str:
     want = "the whole card" if want_mb is None else f"{want_mb} MiB"
@@ -313,8 +355,10 @@ def acquire(key: str, *, vram_mb: int | None, owner: str,
         _take_mutex(fd, MUTEX_WAIT_S)
         live = live_records(records_for(key, d))
         if not fits(live, vram_mb, usable_mb, max_holders):
-            raise ClaimBusy(busy_message(key, live, vram_mb, usable_mb,
-                                         max_holders))
+            msg = busy_message(key, live, vram_mb, usable_mb, max_holders)
+            if card_is_closed(live, usable_mb, max_holders):
+                raise CardClosed(msg)
+            raise ClaimBusy(msg)
         # A token, not just the pid: the runner holds one record per GPU
         # job and every one of them carries the runner's pid.
         rec = Record(path=ldir / f"{os.getpid()}.{secrets.token_hex(3)}.json",

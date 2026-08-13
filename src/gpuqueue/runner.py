@@ -354,6 +354,21 @@ class Runner:
         # tries again. Not fixed by lowering `ledger.MUTEX_WAIT_S`, which
         # the interactive `gpu-claim` path legitimately needs.
         mutex_blocked = False
+        # Nor can a *closed* card resolve inside one pass -- the runner is
+        # what would have to release something, and it is in this loop. The
+        # per-job half of the fit check is deliberately not hoisted into
+        # `_ready_card` (see there) so a small job can still slot in beside
+        # a big one, but that only argues for walking the queue while some
+        # declaration could still get past. When none can -- at the job
+        # limit, an exclusive holder, no free VRAM -- every remaining GPU
+        # spec pays a mkdir, a flock and a directory scan to be told the
+        # same thing, and logs a multi-line holder dump saying so. With the
+        # default `vram_mb=None` that is the *common* case, not a corner:
+        # 30 queued jobs at `poll_interval_s = 2.0` is 15 flock round-trips
+        # and 30 multi-line records a second, forever. Before capacity-based
+        # admission `_capacity("gpu")` returned 0 here and the loop skipped
+        # them for nothing.
+        card_closed = False
         # Asked once, before the loop, because the answer is the same for
         # every pending GPU job and costs two nvidia-smi subprocesses plus
         # a recursive `ps` walk per ledger record to get. See `_ready_card`.
@@ -398,7 +413,8 @@ class Runner:
             # running/ needs no unwinding if the card is busy.
             claim_cm = claim_record = None
             if spec.lane == "gpu":
-                if mutex_blocked or isinstance(card_error, PreflightFailed):
+                if (mutex_blocked or card_closed
+                        or isinstance(card_error, PreflightFailed)):
                     continue
                 if card_error is not None:      # GpuIdError
                     # Card-wide like the above, and eventually permanent:
@@ -420,6 +436,12 @@ class Runner:
                     continue
                 try:
                     taken = self._take_card(spec, card_key)
+                except ledger.CardClosed as e:
+                    # One line per pass, like the two below, and for the
+                    # same reason: nothing this pass does can clear it.
+                    card_closed = True
+                    log.info("GPU admissions deferred this pass: %s", e)
+                    continue
                 except ledger.MutexTimeout as e:
                     # Logged here rather than per job, so one wedged holder
                     # writes one line per pass instead of one per pending
@@ -559,7 +581,8 @@ class Runner:
 
         Returns `(claim_cm, record)` on success, or `None` when the job
         should stay pending or has just been failed outright. Raises
-        `ledger.MutexTimeout`.
+        `ledger.MutexTimeout` and `ledger.CardClosed`, both of which end
+        this pass's GPU admissions rather than this job's.
         """
         usable = self._usable_mb()
         if ledger.exceeds_capacity(spec.vram_mb, usable):
@@ -586,6 +609,14 @@ class Runner:
             # the general ClaimBusy clause below because MutexTimeout is a
             # subclass of it, and "the ledger is unreadable" is not "the
             # card is full".
+            raise
+        except ledger.CardClosed:
+            # Likewise out to `admit`, and likewise before the general
+            # clause it subclasses: "no declaration fits" is a fact about
+            # the card that the rest of this pass's pending GPU jobs would
+            # each pay a flock and a directory scan to rediscover, where
+            # the plain ClaimBusy below is a fact about *this* spec and the
+            # next one may well fit.
             raise
         except ClaimBusy as e:
             log.info("%s waiting: %s", spec.id, e)

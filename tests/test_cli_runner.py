@@ -63,6 +63,51 @@ def test_no_warning_without_the_flag(tmp_path, monkeypatch, caplog):
     assert "GPUQ_CONFIG" not in caplog.text
 
 
+def _config_with_claim_dir(tmp_path, where):
+    p = tmp_path / "gpuq.toml"
+    p.write_text(f'[queue]\nroot = "{tmp_path / "q"}"\n'
+                 f'claim_dir = "{where}"\n')
+    return p
+
+
+def test_warns_when_gpu_claim_will_read_a_different_ledger(
+        tmp_path, monkeypatch, caplog):
+    """The divergence that does not need a flag: `bootstrap.sh` derives
+    GPU_CLAIM_DIR from `$GPUQ_PREFIX`, but `gpuq.example.toml` hardcodes
+    `claim_dir`. A non-default prefix plus the example config copied
+    verbatim gives one card two ledgers, and each admits against a total
+    the other's holders are missing from."""
+    p = _config_with_claim_dir(tmp_path, "/workspace/lock/gpu")
+    monkeypatch.setenv("GPUQ_CONFIG", str(p))
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(tmp_path / "data" / "lock" / "gpu"))
+    with caplog.at_level(logging.WARNING):
+        assert cli_runner.main(["--config", str(p), "--once"]) == 0
+    assert "GPU_CLAIM_DIR" in caplog.text
+    assert "/workspace/lock/gpu" in caplog.text
+
+
+def test_no_ledger_warning_when_the_two_agree(tmp_path, monkeypatch, caplog):
+    d = tmp_path / "lock" / "gpu"
+    p = _config_with_claim_dir(tmp_path, d)
+    monkeypatch.setenv("GPUQ_CONFIG", str(p))
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(d))
+    with caplog.at_level(logging.WARNING):
+        assert cli_runner.main(["--config", str(p), "--once"]) == 0
+    assert "GPU_CLAIM_DIR" not in caplog.text
+
+
+def test_no_ledger_warning_when_claim_dir_is_unset(tmp_path, monkeypatch,
+                                                   caplog):
+    """Unset means the runner reads `claim_dir()` too, so there is nothing
+    to diverge from -- whatever GPU_CLAIM_DIR happens to say."""
+    p = _config(tmp_path)
+    monkeypatch.setenv("GPUQ_CONFIG", str(p))
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(tmp_path / "anywhere"))
+    with caplog.at_level(logging.WARNING):
+        assert cli_runner.main(["--config", str(p), "--once"]) == 0
+    assert "GPU_CLAIM_DIR" not in caplog.text
+
+
 def test_a_bad_config_still_exits_two(tmp_path, monkeypatch):
     monkeypatch.delenv("GPUQ_CONFIG", raising=False)
     p = tmp_path / "bad.toml"
