@@ -28,13 +28,16 @@ def _warn_if_gpu_claim_disagrees(path: Path, cfg) -> None:
     `[queue].claim_dir` is worse, because it does not even need a flag. The
     runner passes `cfg.claim_dir` to `gpu_claim` and `preflight`, while a
     bare `gpu-claim` reads `$GPU_CLAIM_DIR`. `bootstrap.sh` derives
-    GPU_CLAIM_DIR from `$GPUQ_PREFIX` and templates it only into the
-    supervisor unit, but `gpuq.example.toml` hardcodes its `claim_dir`. So
-    a non-default prefix plus the example config copied verbatim gives one
-    card *two* ledgers: each admits against a total the other's holders are
-    missing from, and `gpu-claim`'s preflight reports the runner's live job
-    as an unclaimed stray. `reaper.py` documents the same divergence from
-    the other side.
+    GPU_CLAIM_DIR from `$GPUQ_PREFIX` and templates it into both the
+    supervisor unit and the gpuq.toml it generates, so a freshly
+    bootstrapped box agrees. But it writes that config once and never
+    overwrites it: a box bootstrapped before that change, or a config
+    hand-edited afterwards -- `gpuq.example.toml` hardcodes the default
+    prefix's `claim_dir` -- still gives one card *two* ledgers. Each admits
+    against a total the other's holders are missing from, and `gpu-claim`'s
+    preflight reports the runner's live job as an unclaimed stray.
+    `reaper.py` documents the same divergence from the other side, where it
+    is what keeps a direct `gpu-claim` run from being SIGKILLed.
 
     A warning rather than a refusal: a box may deliberately run the daemon
     off a path no interactive `gpu-claim` will ever be run on, and failing

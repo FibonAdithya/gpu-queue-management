@@ -262,6 +262,49 @@ def test_does_not_kill_a_direct_gpu_claim_run(q, direct_claim, monkeypatch):
     assert result["killed_pids"] == []
 
 
+def test_a_divergent_runner_claim_dir_still_spares_a_direct_run(
+        q, tmp_path, direct_claim, monkeypatch):
+    """The superset invariant `reaper.kill_orphan_cuda` rests on, made
+    observable.
+
+    The test above passes `claim_dir=None`, so `cfg.claim_dir` and
+    `$GPU_CLAIM_DIR` are the same directory and the two ownership
+    computations cannot disagree. Here they are deliberately different --
+    which a real box reaches by being bootstrapped before `claim_dir`
+    was templated into `gpuq.toml`, or by hand-editing the config.
+
+    So `ledger.attribute` sees no records at all and the holder's CUDA
+    child is unledgered, i.e. a kill candidate. The only thing standing
+    between it and SIGKILL is bare `own_pids()` reading `$GPU_CLAIM_DIR`.
+    Both "cleanups" `kill_orphan_cuda` warns against -- passing
+    `cfg.claim_dir` into `own_pids()`, or routing it through
+    `attribute()` -- point that read at the empty directory and turn this
+    red.
+    """
+    holder, child = direct_claim
+    runner_dir = tmp_path / "runner-claims"      # empty, and not the env one
+    runner_dir.mkdir()
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=runner_dir)
+    monkeypatch.setattr(rp, "own_pids", _pf.own_pids)   # undo the autouse stub
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": child, "used_mb": 900,
+                                  "name": "train.py"}])
+
+    from gpuqueue import ledger as lg
+    assert lg.all_records(runner_dir) == [], \
+        "the two directories must genuinely diverge or this proves nothing"
+
+    result = reap(q, cfg)
+
+    deadline = _time.monotonic() + 2
+    while _live(child) and _time.monotonic() < deadline:
+        _time.sleep(0.05)
+    assert _live(child), ("SIGKILLed a direct gpu-claim run because the "
+                          "runner's claim_dir disagreed with $GPU_CLAIM_DIR")
+    assert result["killed_pids"] == []
+
+
 def test_a_ledgered_co_tenants_process_is_not_an_orphan(q, tmp_path, monkeypatch):
     """The whole point of sharing: a declared holder's CUDA process is
     someone else's job, not debris."""

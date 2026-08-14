@@ -65,15 +65,22 @@ def kill_orphan_cuda(protect: set[int], records: list, apps: list[dict]) -> list
     # superset of what `attribute` owns, so disagreement can only add
     # exemptions, never remove one -- and this call is the only thing
     # standing between a direct `gpu-claim` user's trainer and SIGKILL when
-    # the two paths genuinely differ, which they can: with a non-default
-    # GPUQ_PREFIX, `bootstrap.sh` templates GPU_CLAIM_DIR into the
-    # supervisor environment but not into gpuq.toml.
+    # the two paths genuinely differ.
+    #
+    # They still can. `bootstrap.sh` now templates GPU_CLAIM_DIR into the
+    # generated gpuq.toml as well as the supervisor environment, so a
+    # freshly bootstrapped box agrees -- but it writes that config once and
+    # never overwrites it, so a box bootstrapped before that change, or any
+    # hand-edited config, diverges exactly as before. `cli_runner` warns at
+    # startup; it does not refuse.
     #
     # So do not "clean this up" by passing `cfg.claim_dir` into
     # `own_pids()`, and do not route it through `attribute()`. Either
-    # removes that accidental protection. The real fix is making the two
-    # configs agree, which is a bootstrap change, not a directory
-    # plumbed through here.
+    # removes that protection, and
+    # `test_a_divergent_runner_claim_dir_still_spares_a_direct_run` is
+    # there to catch it. Unifying the two becomes safe only once a
+    # divergent config is unreachable, which is a bootstrap change, not a
+    # directory plumbed through here.
     exempt = set(protect) | own_pids()
     killed = []
     for app in unledgered:
