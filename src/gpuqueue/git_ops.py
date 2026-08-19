@@ -53,9 +53,32 @@ def remove_worktree(checkout: Path, dest: Path) -> None:
     git(["worktree", "prune"], cwd=checkout, check=False)
 
 
+def publishes_to_results(project: ProjectConfig) -> bool:
+    """Do this project's artifacts go to a results repository?
+
+    Both halves or neither: `config` rejects one without the other, and a
+    remote with nowhere to clone it publishes nothing.
+    """
+    return bool(project.results_remote and project.results_checkout)
+
+
+def artifact_paths(project: ProjectConfig, job_id: str | None,
+                   rel_paths: list[str]) -> list[str]:
+    """Where the declared artifacts land, relative to whichever checkout
+    receives them -- namespaced in a results repo, bare in the project's own
+    checkout. One source of truth, so a log line cannot name a path
+    `commit_artifacts` never writes. See there for why results are
+    namespaced.
+    """
+    if not publishes_to_results(project):
+        return list(rel_paths)
+    prefix = Path(project.name) / (job_id or "unknown")
+    return [str(prefix / r) for r in rel_paths]
+
+
 def ensure_results_checkout(project: ProjectConfig) -> Path | None:
     """Clone the results repository, if this project publishes to one."""
-    if not (project.results_remote and project.results_checkout):
+    if not publishes_to_results(project):
         return None
     path = Path(project.results_checkout)
     if not (path / ".git").exists():
@@ -85,10 +108,9 @@ def commit_artifacts(project: ProjectConfig, branch: str,
     results = ensure_results_checkout(project)
     if results is not None:
         checkout, branch, push = results, project.results_branch, True
-        prefix = Path(project.name) / (job_id or "unknown")
-        rel_paths = [str(prefix / r) for r in rel_paths]
     else:
         checkout, push = ensure_checkout(project), project.push
+    rel_paths = artifact_paths(project, job_id, rel_paths)
 
     git(["checkout", "-q", branch], cwd=checkout, check=False)
     for src, rel in zip(files, rel_paths):
