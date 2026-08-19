@@ -1411,3 +1411,39 @@ def test_a_quiet_pass_lets_the_same_block_be_logged_again(gpu_env, caplog):
         assert r.admit() == []            # same text again -> logged again
     lines = [m for m in caplog.messages if "deferred this pass" in m]
     assert len(lines) == 2, lines
+
+
+def test_the_logged_artifact_path_is_where_the_file_actually_landed(env,
+                                                                    tmp_path,
+                                                                    caplog):
+    """In the split arrangement -- the one `docs/deploying.md` recommends --
+    `commit_artifacts` namespaces every path `<project>/<job>/<declared>`.
+    Logging the bare declared path sends an operator looking for a file the
+    results repo does not contain, which is the hand-check this line exists
+    to replace."""
+    import logging
+    r, sha = env
+    ro = tmp_path / "results-origin"
+    ro.mkdir()
+    git(["init", "-q", "-b", "main"], cwd=ro)
+    git(["config", "user.email", "r@r"], cwd=ro)
+    git(["config", "user.name", "r"], cwd=ro)
+    git(["config", "receive.denyCurrentBranch", "ignore"], cwd=ro)
+    (ro / "README.md").write_text("results\n")
+    git(["add", "--", "README.md"], cwd=ro)
+    git(["commit", "-qm", "init results"], cwd=ro)
+    p = r.cfg.projects["p"]
+    p.results_remote = str(ro)
+    p.results_checkout = tmp_path / "results-checkout"
+
+    submit(r, sha, "j1",
+           ["sh", "-c", "mkdir -p runs && echo one > runs/s.json"],
+           artifacts=["runs/s.json"])
+    with caplog.at_level(logging.INFO, logger="gpuqueue.runner"):
+        drain(r)
+    line = next((m for m in caplog.messages if "artifacts committed" in m),
+                None)
+    assert line is not None, caplog.messages
+    assert "results repo" in line, line
+    assert "p/j1/runs/s.json" in line, line
+    assert (Path(p.results_checkout) / "p" / "j1" / "runs" / "s.json").exists()

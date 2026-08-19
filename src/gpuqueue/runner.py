@@ -908,14 +908,19 @@ class Runner:
             sha = git_ops.commit_artifacts(project, spec.branch, srcs, rels,
                                            f"artifacts: {spec.id}",
                                            job_id=spec.id)
-            where = ("results repo" if project.results_remote
+            # The paths as committed, not as declared: a results repo
+            # namespaces them `<project>/<job>/<path>`, so naming the bare
+            # declared path would send the reader looking for a file that
+            # repo does not contain -- the hand-check this line replaces.
+            where = ("results repo" if git_ops.publishes_to_results(project)
                      else "checkout")
+            landed = ", ".join(git_ops.artifact_paths(project, spec.id, rels))
             if sha is None:
                 log.info("%s artifacts unchanged, nothing to commit: %s",
-                         spec.id, ", ".join(rels))
+                         spec.id, landed)
             else:
                 log.info("%s artifacts committed to %s as %s: %s",
-                         spec.id, where, sha, ", ".join(rels))
+                         spec.id, where, sha, landed)
 
     def _describe_failure(self, spec: JobSpec, result: JobResult) -> str:
         guilty = self._convicted.pop(spec.id, None)
