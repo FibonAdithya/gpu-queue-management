@@ -77,6 +77,10 @@ class Runner:
         self._card_key: str | None = None
         # Logged once, not once per admit: see _usable_mb.
         self._usable_query_warned = False
+        # The card-wide deferral reported on the previous pass, and the
+        # one reported on this pass. See _defer.
+        self._last_defer: str | None = None
+        self._defer_msg: str | None = None
         # str(record path) -> consecutive sweeps over its declaration. The
         # full path, never the bare filename: `reaper.check_vram` explains
         # why one is not unique across `<key>.lock.d` directories.
@@ -337,9 +341,30 @@ class Runner:
                       if a.running.spec.lane == lane)
         return limit - in_lane
 
+    def _defer(self, level: int, msg: str) -> None:
+        """Report a card-wide deferral, but only when it says something new.
+
+        The per-*job* half of this is already handled by `card_closed` and
+        `mutex_blocked`: one line per pass rather than one per pending spec.
+        That still leaves one line per *pass*, and a pass happens every
+        `poll_interval_s` -- 2.0 by default. A job queued overnight behind a
+        long training run therefore wrote thousands of byte-identical
+        records, each repeating every holder\'s full command line, and
+        buried the lines that did say something new.
+
+        Suppression is not permanent. `admit` clears the memory on any pass
+        that deferred for nothing, so a later block is reported even when
+        its text is identical to the earlier one -- which it usually is,
+        since the holder is what the text describes.
+        """
+        self._defer_msg = msg
+        if msg != self._last_defer:
+            log.log(level, "%s", msg)
+
     def admit(self) -> list[str]:
         if self._stopping:
             return []
+        self._defer_msg = None
         pending = sorted(self.queue.list_state("pending"),
                          key=lambda s: (s.submitted_at, s.id))
         started = []
@@ -379,15 +404,17 @@ class Runner:
             # One line per pass, not one per pending job: the same
             # reasoning `mutex_blocked` applies below to a card-wide
             # condition nobody in this pass can get past.
-            log.warning("GPU admissions deferred this pass: %s", card_error)
+            self._defer(logging.WARNING,
+                        f"GPU admissions deferred this pass: {card_error}")
         if isinstance(card_error, GpuIdError):
             # Counted per pass, not per job: the strike is a property
             # of this pass's one `gpu_key` call.
             self._gpuid_strikes += 1
             if self._gpuid_strikes < GPUID_STRIKES:
-                log.warning("GPU admissions deferred this pass "
-                            "(%s/%s): %s", self._gpuid_strikes,
-                            GPUID_STRIKES, card_error)
+                self._defer(logging.WARNING,
+                            f"GPU admissions deferred this pass "
+                            f"({self._gpuid_strikes}/{GPUID_STRIKES}): "
+                            f"{card_error}")
         else:
             # Reset on every pass that did not see a GpuIdError -- including
             # the passes that never asked, which is the whole point of doing
@@ -440,14 +467,16 @@ class Runner:
                     # One line per pass, like the two below, and for the
                     # same reason: nothing this pass does can clear it.
                     card_closed = True
-                    log.info("GPU admissions deferred this pass: %s", e)
+                    self._defer(logging.INFO,
+                                f"GPU admissions deferred this pass: {e}")
                     continue
                 except ledger.MutexTimeout as e:
                     # Logged here rather than per job, so one wedged holder
                     # writes one line per pass instead of one per pending
                     # job.
                     mutex_blocked = True
-                    log.warning("GPU admissions deferred this pass: %s", e)
+                    self._defer(logging.WARNING,
+                                f"GPU admissions deferred this pass: {e}")
                     continue
                 if taken is None:
                     continue
@@ -460,6 +489,7 @@ class Runner:
 
             if self._launch(claimed, project, claim_cm, claim_record):
                 started.append(claimed.id)
+        self._last_defer = self._defer_msg
         return started
 
     def _ready_card(self) -> tuple[str | None, Exception | None]:
@@ -871,8 +901,21 @@ class Runner:
             srcs.append(src)
             rels.append(rel)
         if project.commit_artifacts:
-            git_ops.commit_artifacts(project, spec.branch, srcs, rels,
-                                     f"artifacts: {spec.id}", job_id=spec.id)
+            # Logged either way. A commit that leaves no trace in the log
+            # reads exactly like one that never ran, which made confirming
+            # a freshly deployed box's artifact path a matter of reading
+            # `.git/logs/HEAD` in the checkout by hand.
+            sha = git_ops.commit_artifacts(project, spec.branch, srcs, rels,
+                                           f"artifacts: {spec.id}",
+                                           job_id=spec.id)
+            where = ("results repo" if project.results_remote
+                     else "checkout")
+            if sha is None:
+                log.info("%s artifacts unchanged, nothing to commit: %s",
+                         spec.id, ", ".join(rels))
+            else:
+                log.info("%s artifacts committed to %s as %s: %s",
+                         spec.id, where, sha, ", ".join(rels))
 
     def _describe_failure(self, spec: JobSpec, result: JobResult) -> str:
         guilty = self._convicted.pop(spec.id, None)

@@ -1141,15 +1141,20 @@ def test_an_exclusive_holder_costs_one_acquire_per_pass_not_one_per_job(
 
 
 def test_the_closed_card_is_logged_once_per_pass(gpu_env, caplog):
-    """One line, not one multi-line holder dump per pending job."""
+    """One line, not one multi-line holder dump per pending job.
+
+    Captures the pass that admits `j0` and closes the card under it, which
+    is where the four *other* specs would each have logged a dump. It used
+    to capture the pass after instead; `_defer` now suppresses that one as
+    a repeat, which says nothing about the per-job behaviour this test is
+    for."""
     import logging
     r, sha = gpu_env
     for i in range(5):
         r.queue.work_dir(f"j{i}").mkdir(parents=True, exist_ok=True)
         submit(r, sha, f"j{i}", ["sleep", "5"], lane="gpu")
-    assert r.admit() == ["j0"]
     with caplog.at_level(logging.INFO, logger="gpuqueue.runner"):
-        assert r.admit() == []
+        assert r.admit() == ["j0"]      # j1..j4 all blocked behind it
     lines = [x for x in caplog.messages if "deferred this pass" in x]
     assert len(lines) == 1, lines
 
@@ -1330,3 +1335,79 @@ def test_the_card_key_is_asked_for_once(gpu_env, monkeypatch):
     r.admit()          # j2 does not fit, but capacity is still 1
     r.admit()
     assert len(calls) == 1
+
+
+def test_a_committed_artifact_is_logged_with_its_sha(env, caplog):
+    """A silent commit reads exactly like a skipped one. The runner logged
+    `started` and `done` and nothing in between, so confirming that a newly
+    deployed box actually publishes artifacts meant reading `.git/logs/HEAD`
+    in the checkout by hand."""
+    import logging
+    r, sha = env
+    submit(r, sha, "j1",
+           ["sh", "-c", "mkdir -p runs && echo one > runs/s.json"],
+           artifacts=["runs/s.json"])
+    with caplog.at_level(logging.INFO, logger="gpuqueue.runner"):
+        drain(r)
+    committed = git(["rev-parse", "HEAD"],
+                    cwd=r.cfg.projects["p"].checkout).strip()
+    assert any("j1" in m and committed in m for m in caplog.messages), \
+        (committed, caplog.messages)
+
+
+def test_artifacts_identical_to_the_last_commit_say_so(env, caplog):
+    """`commit_artifacts` returns None when the tree did not change, and the
+    caller dropped it. Two runs writing the same bytes then look exactly
+    like one run whose commit vanished."""
+    import logging
+    r, sha = env
+    cmd = ["sh", "-c", "mkdir -p runs && echo same > runs/s.json"]
+    submit(r, sha, "j1", cmd, artifacts=["runs/s.json"])
+    drain(r)
+    submit(r, sha, "j2", cmd, artifacts=["runs/s.json"])
+    with caplog.at_level(logging.INFO, logger="gpuqueue.runner"):
+        drain(r)
+    assert any("j2" in m and "nothing to commit" in m
+               for m in caplog.messages), caplog.messages
+
+
+def test_an_unchanged_deferral_reason_is_logged_once_not_every_pass(gpu_env,
+                                                                    caplog):
+    """At `poll_interval_s = 2.0` a job waiting eight hours behind another
+    wrote ~14,000 identical records, each repeating every holder's full
+    command line."""
+    import logging
+    r, sha = gpu_env
+    for i in range(5):
+        r.queue.work_dir(f"j{i}").mkdir(parents=True, exist_ok=True)
+        submit(r, sha, f"j{i}", ["sleep", "5"], lane="gpu")
+    with caplog.at_level(logging.INFO, logger="gpuqueue.runner"):
+        assert r.admit() == ["j0"]
+        for _ in range(4):
+            assert r.admit() == []
+    lines = [m for m in caplog.messages if "deferred this pass" in m]
+    assert len(lines) == 1, lines
+
+
+def test_a_quiet_pass_lets_the_same_block_be_logged_again(gpu_env, caplog):
+    """Suppression must not be permanent. The holder here is identical
+    across both blocks -- same owner, same pid, same rendered text -- so
+    only resetting the memory on a pass that deferred for nothing can tell
+    the second block from a repeat of the first."""
+    import logging
+    from gpuqueue import ledger as lg
+    r, sha = gpu_env
+    lg.acquire("test-uuid", vram_mb=None, owner="alice", cmd=["train"],
+               directory=r.cfg.claim_dir, usable_mb=7676)
+    for j in ("j0", "j1"):
+        r.queue.work_dir(j).mkdir(parents=True, exist_ok=True)
+    submit(r, sha, "j0", ["sleep", "5"], lane="gpu", vram_mb=100)
+    with caplog.at_level(logging.INFO, logger="gpuqueue.runner"):
+        assert r.admit() == []            # blocked -> logged
+        assert r.admit() == []            # identical text -> suppressed
+        assert r.queue.cancel("j0")
+        assert r.admit() == []            # nothing pending: a quiet pass
+        submit(r, sha, "j1", ["sleep", "5"], lane="gpu", vram_mb=100)
+        assert r.admit() == []            # same text again -> logged again
+    lines = [m for m in caplog.messages if "deferred this pass" in m]
+    assert len(lines) == 2, lines
