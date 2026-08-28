@@ -131,3 +131,64 @@ def test_a_dead_holders_record_does_not_shelter_anyone(tmp_path, monkeypatch):
                         lambda pid: {4321} if pid == 4000000 else set())
     with pytest.raises(PreflightFailed):
         pf.preflight(directory=tmp_path)
+
+
+# --- The union stops at own_pids (issue #19) -----------------------------
+#
+# `own_pids` reads every directory a claim could be in, because it is the
+# last exemption before a SIGKILL and over-exempting is the safe way to be
+# wrong there. These two are the opposite trade: they decide whether a run
+# is allowed to *start*, where over-exempting fails open and puts a second
+# trainer onto a card someone else is already using. A record under
+# `DEFAULT_CLAIM_DIR` must not vouch for a process on a card this
+# directory knows nothing about.
+#
+# Asserted on which ledger is consulted, because that is precisely the
+# quantity issue #19 is about, and because the alternative -- a live,
+# non-descendant pid whose tree `ledger.attribute` would charge the
+# process to -- needs a detached helper for what is a one-line invariant.
+
+from pathlib import Path as _Path
+from gpuqueue import ledger as _lg
+
+
+def _ledgers_read(monkeypatch):
+    """Every directory handed to `ledger.all_records`, in order. Wraps the
+    real function rather than replacing it, so the call still does its
+    work and the assertion is about a real argument."""
+    seen = []
+    real = _lg.all_records
+
+    def spy(directory):
+        seen.append(_Path(directory))
+        return real(directory)
+
+    monkeypatch.setattr(pf.ledger, "all_records", spy)
+    return seen
+
+
+def test_preflight_consults_one_ledger(tmp_path, monkeypatch):
+    ours = tmp_path / "ours"
+    ours.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(ours))
+    monkeypatch.setattr(pf, "compute_apps", lambda: [])
+    seen = _ledgers_read(monkeypatch)
+
+    pf.preflight()
+
+    assert seen == [ours], (
+        "preflight decides whether a run may start; reading the other "
+        "claim directory as well would let a record there vouch for a "
+        "process on a card this one knows nothing about")
+
+
+def test_unledgered_processes_consults_one_ledger(tmp_path, monkeypatch):
+    ours = tmp_path / "ours"
+    ours.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(ours))
+    monkeypatch.setattr(pf, "compute_apps",
+                        lambda: [{"pid": 999_002, "used_mb": 9, "name": "t"}])
+    seen = _ledgers_read(monkeypatch)
+
+    assert [a["pid"] for a in pf.unledgered_processes()] == [999_002]
+    assert seen == [ours]

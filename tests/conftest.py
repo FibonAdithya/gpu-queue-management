@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import pytest
 
+from gpuqueue import claim
+
 
 @pytest.fixture(autouse=True)
 def _no_inherited_cuda_visible_devices(monkeypatch):
@@ -46,5 +48,21 @@ def _no_deployed_claims(tmp_path, monkeypatch):
 
     A test that wants records writes them under its own tmp_path and
     passes `directory=`, or sets this variable itself.
+
+    `DEFAULT_CLAIM_DIR` is stubbed for the same reason and cannot be done
+    the same way. `own_pids` exempts a claim written under *either* the
+    reaper's `$GPU_CLAIM_DIR` or the default, because those are the two
+    directories a claim on a box can land in and an interactive shell does
+    not inherit a supervisor unit's environment (issue #19). That second
+    read is a module constant, so no environment variable neutralises it,
+    and the live `/var/lock/gpu` would be back in the suite through a door
+    the variable above does not cover.
+
+    A *second* tmp directory, deliberately not the one above: pointing both
+    at one directory would make every test of that union pass whether or
+    not the union exists. A `str`, because `claim_dir()` hands it to
+    `os.environ.get` as a default and `claim.py` declares it as one.
     """
     monkeypatch.setenv("GPU_CLAIM_DIR", str(tmp_path / "claims-isolated"))
+    monkeypatch.setattr(claim, "DEFAULT_CLAIM_DIR",
+                        str(tmp_path / "claims-default"))

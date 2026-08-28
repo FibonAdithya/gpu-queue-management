@@ -1,8 +1,9 @@
 import textwrap
+from pathlib import Path
 
 import pytest
 from gpuqueue.config import (load_config, vram_policy, max_holders,
-                             ConfigError)
+                             claim_dir_setting, ConfigError)
 from gpuqueue.ledger import DEFAULT_RESERVE_MB
 
 TOML = """
@@ -300,3 +301,56 @@ def test_max_holders_does_not_need_a_loadable_config(tmp_path):
 def test_max_holders_falls_back_on_a_nonsense_value(tmp_path):
     p = _write(tmp_path, '[queue]\nroot = "/q"\ngpu_max_jobs = 0\n')
     assert max_holders(p) == 2
+
+
+# --- claim_dir_setting: what directory the deployed runner reads ---------
+#
+# `gpu-claim` runs in an interactive shell and the runner is a supervisor
+# unit; the shell cannot see the unit's environment. The config file is
+# the one thing both can read, so it is how a hand-run claim finds out it
+# is writing somewhere the daemon is not looking (issue #19).
+
+def test_claim_dir_setting_reads_the_queue_table(tmp_path):
+    p = _write(tmp_path, '[queue]\nroot = "/q"\nclaim_dir = "/workspace/lock/gpu"\n')
+    assert claim_dir_setting(p) == Path("/workspace/lock/gpu")
+
+
+def test_claim_dir_setting_is_none_when_the_key_is_absent(tmp_path):
+    """Not a divergence. The daemon then reads its own `$GPU_CLAIM_DIR`,
+    which this process cannot see, so there is nothing to compare against
+    and guessing would warn every user on a correctly configured box."""
+    assert claim_dir_setting(_write(tmp_path, '[queue]\nroot = "/q"\n')) is None
+
+
+def test_claim_dir_setting_is_none_when_there_is_no_config(tmp_path):
+    assert claim_dir_setting(tmp_path / "absent.toml") is None
+
+
+def test_claim_dir_setting_does_not_need_a_loadable_config(tmp_path):
+    """The same posture `vram_policy` and `max_holders` take: a caller that
+    only wants one key must not be refused because `[queue].root` is
+    missing or a project is half-declared."""
+    p = _write(tmp_path, '[queue]\nclaim_dir = "/workspace/lock/gpu"\n'
+                         '[project.p]\nremote = "x"\n')
+    with pytest.raises(ConfigError):
+        load_config(p)
+    assert claim_dir_setting(p) == Path("/workspace/lock/gpu")
+
+
+def test_claim_dir_setting_is_none_for_a_malformed_config(tmp_path):
+    assert claim_dir_setting(_write(tmp_path, "[queue\nroot =")) is None
+
+
+def test_claim_dir_setting_ignores_an_empty_value(tmp_path):
+    """`claim_dir = ""` is not a directory; `load_config` reads it as
+    unset (`Path(claim_dir) if claim_dir else None`), and a reader that
+    disagreed would warn about a divergence the runner does not have."""
+    p = _write(tmp_path, '[queue]\nroot = "/q"\nclaim_dir = ""\n')
+    assert claim_dir_setting(p) is None
+
+
+def test_claim_dir_setting_defaults_to_the_deployed_config(tmp_path,
+                                                           monkeypatch):
+    p = _write(tmp_path, '[queue]\nroot = "/q"\nclaim_dir = "/somewhere"\n')
+    monkeypatch.setenv("GPUQ_CONFIG", str(p))
+    assert claim_dir_setting() == Path("/somewhere")

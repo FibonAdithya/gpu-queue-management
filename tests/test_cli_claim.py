@@ -244,3 +244,102 @@ def test_the_capacity_is_sized_for_the_card_being_claimed(monkeypatch):
     monkeypatch.setattr(cli_claim, "gpu_claim", fake_claim)
     cli_claim.main(["--gpu-index", "1", "--vram-mb", "4000", "--", "true"])
     assert seen["usable_mb"] == 7676
+
+
+# --- Warning when the runner reads somewhere else (issue #19) ------------
+#
+# `gpu-claim` runs in an interactive shell; the runner is a supervisor
+# unit. A shell never inherits a unit's environment, so the two resolve
+# `$GPU_CLAIM_DIR` differently and neither one says so. The symptom is a
+# SIGKILL with an empty stderr, and `--status` reporting the claim as
+# healthy the whole time, because it reads the same directory the claim
+# was written to.
+
+from pathlib import Path
+from gpuqueue import claim as _claim
+
+
+def _runner_reads(tmp_path, monkeypatch, directory):
+    cfg = tmp_path / "gpuq.toml"
+    cfg.write_text(f'[queue]\nroot = "/q"\nclaim_dir = "{directory}"\n')
+    monkeypatch.setenv("GPUQ_CONFIG", str(cfg))
+    return cfg
+
+
+def test_warns_when_the_runner_reads_another_directory(tmp_path, monkeypatch,
+                                                       capsys):
+    _runner_reads(tmp_path, monkeypatch, "/workspace/lock/gpu")
+
+    cli_claim.main(["--", "true"])
+
+    err = capsys.readouterr().err
+    assert str(tmp_path) in err and "/workspace/lock/gpu" in err, err
+    assert "GPU_CLAIM_DIR=/workspace/lock/gpu" in err, err
+
+
+def test_the_warning_says_the_claim_is_not_counted(tmp_path, monkeypatch,
+                                                   capsys):
+    """The consequence that survives the exemption fix: the runner's
+    ledger does not know this claim exists, so `gpu_max_jobs` and the VRAM
+    accounting can admit a job straight on top of it."""
+    _runner_reads(tmp_path, monkeypatch, "/workspace/lock/gpu")
+    cli_claim.main(["--", "true"])
+    assert "on top of it" in capsys.readouterr().err
+
+
+def test_quiet_when_the_directories_agree(tmp_path, monkeypatch, capsys):
+    _runner_reads(tmp_path, monkeypatch, str(tmp_path))
+    cli_claim.main(["--", "true"])
+    assert "warning" not in capsys.readouterr().err
+
+
+def test_quiet_when_no_config_declares_a_directory(tmp_path, monkeypatch,
+                                                   capsys):
+    """The daemon then reads its own `$GPU_CLAIM_DIR`, which this process
+    cannot see. A warning on a guess would fire on every correctly
+    configured box, and one that is usually wrong is one people skip."""
+    cfg = tmp_path / "gpuq.toml"
+    cfg.write_text('[queue]\nroot = "/q"\n')
+    monkeypatch.setenv("GPUQ_CONFIG", str(cfg))
+    cli_claim.main(["--", "true"])
+    assert "warning" not in capsys.readouterr().err
+
+
+def test_the_warning_names_sigkill_only_for_a_third_directory(
+        tmp_path, monkeypatch, capsys):
+    """The reaper exempts its own `$GPU_CLAIM_DIR` *and* the default, so a
+    claim that landed on the default is covered even though it diverges.
+    Claiming otherwise would send an operator chasing a kill that cannot
+    happen."""
+    _runner_reads(tmp_path, monkeypatch, "/workspace/lock/gpu")
+
+    monkeypatch.delenv("GPU_CLAIM_DIR", raising=False)   # -> DEFAULT_CLAIM_DIR
+    cli_claim.main(["--", "true"])
+    on_default = capsys.readouterr().err
+    assert "warning" in on_default, on_default
+    assert "SIGKILL" not in on_default, on_default
+
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(tmp_path / "third"))
+    cli_claim.main(["--", "true"])
+    on_third = capsys.readouterr().err
+    assert "SIGKILL" in on_third, on_third
+
+
+def test_status_warns_before_reporting_a_claim_the_reaper_cannot_see(
+        tmp_path, monkeypatch, capsys):
+    """`gpu-claim --status` reads the same directory the claim went to, so
+    the operator's own health check confirms a claim the reaper cannot
+    see. That is named in issue #19 as part of what made this hard."""
+    _runner_reads(tmp_path, monkeypatch, "/workspace/lock/gpu")
+
+    assert cli_claim.main(["--status"]) == 0
+
+    out = capsys.readouterr()
+    assert "/workspace/lock/gpu" in out.err, out.err
+    assert out.out.strip().startswith("["), out.out
+
+
+def test_reap_warns_too(tmp_path, monkeypatch, capsys):
+    _runner_reads(tmp_path, monkeypatch, "/workspace/lock/gpu")
+    assert cli_claim.main(["--reap"]) == 0
+    assert "/workspace/lock/gpu" in capsys.readouterr().err

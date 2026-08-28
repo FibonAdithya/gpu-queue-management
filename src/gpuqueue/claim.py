@@ -43,6 +43,51 @@ def claim_dir() -> Path:
     return Path(os.environ.get("GPU_CLAIM_DIR", DEFAULT_CLAIM_DIR))
 
 
+def all_claim_dirs() -> list[Path]:
+    """Every directory a claim on this box could have been written to.
+
+    `claim_dir()` answers "where do *I* write", and that is a different
+    question from "where might a claim already be", because it resolves
+    `$GPU_CLAIM_DIR` in the calling process. The claim writer is an
+    interactive shell; the reaper is a supervisor unit; a shell does not
+    inherit a unit's environment. So the daemon reads `/workspace/lock/gpu`
+    while a hand-run `gpu-claim` writes to the default, and each is
+    invisible to the other.
+
+    That cost 48% of one session's runs to SIGKILL (issue #19), because
+    `reaper.kill_orphan_cuda` built its exemption set from `claim_dir()`
+    alone and a claim it cannot see is a claim it will not spare.
+
+    Ordered, with the caller's own directory first: this is what the runner
+    logs as the ledgers it consulted, and the reaper's own is the one an
+    operator debugging a kill needs to read first. Deduped on `.resolve()`
+    rather than on the spelling, so a `$GPU_CLAIM_DIR` pointing at a
+    symlink to the default is one ledger, not two.
+
+    `DEFAULT_CLAIM_DIR` is read here at call time rather than captured at
+    import: the suite stubs it to keep the live `/var/lock/gpu` out of
+    tests that take the bare path, and a name bound at import would make
+    that stub silently do nothing.
+    """
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for d in (claim_dir(), Path(DEFAULT_CLAIM_DIR)):
+        try:
+            key = d.resolve()
+        except OSError:
+            # `resolve()` is non-strict, so an absent path is not an error;
+            # this is ELOOP on a symlink cycle or EACCES on an unreadable
+            # parent. Fall back to the literal path -- a directory we
+            # cannot canonicalise is still one a claim may be sitting in,
+            # and dropping it here would drop an exemption.
+            key = d
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
 def read_claim(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text())

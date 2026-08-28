@@ -6,9 +6,16 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
+from . import claim as _claim, config
+# `DEFAULT_CLAIM_DIR` is deliberately reached through the module rather
+# than imported by name: `claim.claim_dir()` reads it at call time, so a
+# name bound here at import would drift from the value actually in use --
+# and drift between two readings of one claim directory is the whole of
+# issue #19.
 from .claim import (gpu_claim, ClaimBusy, CannotEverFit, release_stale,
-                    list_claims, default_usable_mb)
+                    list_claims, default_usable_mb, claim_dir)
 from .gpuid import gpu_key, cuda_visible_value, GpuIdError
 from .preflight import preflight, PreflightFailed
 
@@ -80,8 +87,65 @@ def _child_env(gpu_index: int) -> dict:
     return env
 
 
+def _warn_if_the_runner_reads_elsewhere() -> None:
+    """Say so when this claim is going somewhere the daemon is not looking.
+
+    `cli_runner` already warns from the daemon's side when
+    `[queue].claim_dir` and its own `$GPU_CLAIM_DIR` disagree. This is the
+    other side of the same card, and it is the side that goes wrong
+    silently: the daemon gets `GPU_CLAIM_DIR` from a supervisor unit and an
+    interactive shell never inherits one, so the divergence needs no flag
+    and no hand-edited config to appear. It cost 48% of one session's runs
+    (issue #19), and the operator's own `--status` confirmed the claim as
+    healthy throughout, because it reads the same directory the claim went
+    to.
+
+    Emitted before `--status` and `--reap` for exactly that reason.
+
+    Two consequences, and the second is conditional. `preflight.own_pids`
+    exempts a claim under the reaper's `$GPU_CLAIM_DIR` *or* the default,
+    so landing on the default is covered even while diverging -- claiming
+    a SIGKILL there would send someone chasing a kill that cannot happen.
+    What survives in every case is that the runner's ledger does not count
+    this claim at all, so `gpu_max_jobs` and the VRAM accounting will admit
+    a job on top of it.
+
+    A configured directory is the only thing worth comparing against. With
+    the key unset the daemon reads its own environment, which this process
+    cannot see; warning on that guess would fire on every correctly
+    configured box.
+    """
+    theirs = config.claim_dir_setting()
+    if theirs is None:
+        return
+    ours = claim_dir()
+    if _same_dir(ours, theirs):
+        return
+    msg = (f"gpu-claim: warning: this claim goes in {ours}, but the runner "
+           f"configured in {config.default_config_path()} reads {theirs}. "
+           f"Nothing there counts this claim against the card, so the "
+           f"runner can admit a job on top of it")
+    default = Path(_claim.DEFAULT_CLAIM_DIR)
+    if not _same_dir(ours, default):
+        # Neither the runner's directory nor the default, so no exemption
+        # the reaper can build covers this run.
+        msg += (f"; and the orphan sweep exempts only the claim directories "
+                f"the reaper's own process can see -- its $GPU_CLAIM_DIR "
+                f"and {default} -- so kill_orphan_cuda will SIGKILL it")
+    print(f"{msg}. Export GPU_CLAIM_DIR={theirs} before claiming.",
+          file=sys.stderr)
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a == b
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    _warn_if_the_runner_reads_elsewhere()
 
     if args.status:
         print(json.dumps([body for _, body in list_claims()], indent=2))

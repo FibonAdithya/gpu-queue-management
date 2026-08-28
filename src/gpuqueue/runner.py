@@ -229,6 +229,25 @@ class Runner:
         result = reap(self.queue, self.cfg, active_ids=set(self.active),
                       include_orphan_cuda=sweep,
                       vram_strikes=self._vram_strikes)
+        killed = result.get("killed_pids") or []
+        if killed:
+            # `killed_pids` went unlogged from the day it was returned. The
+            # process gets SIGKILL, so it writes nothing; the caller sees
+            # `exit -9` with an empty stderr and reads it as its own
+            # failure. Issue #19 was a session of ruling out OOM, host
+            # memory and the trainer itself before gpuq was even a suspect.
+            #
+            # The ledgers are named because *which* claim directory was
+            # consulted is exactly what was wrong there: a claim written
+            # under one `$GPU_CLAIM_DIR` and an exemption set built under
+            # another. An operator who sees a pid of theirs here can
+            # compare the list against where their own `gpu-claim` wrote.
+            log.warning(
+                "orphan sweep SIGKILLed unledgered CUDA %s %s; exemptions "
+                "came from %s -- a claim outside those is invisible here",
+                "pid" if len(killed) == 1 else "pids",
+                ", ".join(str(p) for p in killed),
+                ", ".join(result.get("exemption_dirs") or ["(none)"]))
         for c in result.get("convicted", []):
             # Only a conviction that got the holder off the card stamps the
             # co-tenant window -- which `_kill_tree` reports for a holder

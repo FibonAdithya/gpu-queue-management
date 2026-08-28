@@ -288,3 +288,40 @@ def load_config(path: Path) -> RunnerConfig:
         projects=projects,
         autofix=autofix,
     )
+
+
+def claim_dir_setting(path: Path | None = None) -> Path | None:
+    """`[queue].claim_dir`, for a process that is not the runner.
+
+    A hand-run `gpu-claim` and the daemon share one card, and each writes
+    into whatever `$GPU_CLAIM_DIR` resolves to in *its own* process. The
+    daemon's comes from a supervisor unit; an interactive shell never
+    inherits one. The config file is the only thing both of them can read,
+    so it is how the interactive side finds out it is claiming into a
+    directory the runner is not looking at -- which cost 48% of one
+    session's runs (issue #19).
+
+    None means "no configured directory to disagree with", not "they
+    agree". With the key unset the daemon reads its own environment, which
+    this process cannot see; warning on a guess would fire on every
+    correctly configured box, and a warning that is usually wrong is one
+    operators learn to skip past.
+
+    An empty string is None for the same reason `load_config` treats it as
+    unset (`Path(claim_dir) if claim_dir else None`): a reader that
+    disagreed with the runner about what the file says would report a
+    divergence the runner does not have.
+
+    Defensive in the three ways `vram_policy` and `max_holders` are, and
+    for the same reasons: not `load_config`, so a caller wanting one key
+    is not refused because `[queue].root` is missing; an unreadable or
+    absent file is None rather than an error, because this runs in a
+    process with no daemon to fail loudly at startup.
+    """
+    p = Path(path) if path else default_config_path()
+    try:
+        queue = tomllib.loads(p.read_text()).get("queue") or {}
+        value = queue.get("claim_dir")
+    except Exception:
+        return None
+    return Path(value) if value else None
