@@ -6,6 +6,7 @@ import os
 import shutil
 import signal
 import time
+from pathlib import Path
 
 from . import ledger
 from .claim import release_stale, claim_dir, all_claim_dirs
@@ -278,6 +279,45 @@ def check_vram(records: list, apps: list[dict],
     return convicted
 
 
+
+def _consulted_dirs(attributed_from) -> list[str]:
+    """Every claim directory a live claim in which would have spared a
+    process from this sweep.
+
+    Two mechanisms, one answer. `own_pids()` exempts a pid claimed under
+    any of `claim.all_claim_dirs()`; `ledger.attribute` never puts a pid
+    claimed under `attributed_from` into `unledgered` in the first place.
+    An operator reading the kill line is asking "where would a claim have
+    saved me", and both spare by the same amount, so both belong.
+
+    `attributed_from` is a third directory only when `[queue].claim_dir`
+    and the reaper's own `$GPU_CLAIM_DIR` diverge -- a split `cli_runner`
+    warns about and permits -- and on every ordinary box it dedups away.
+    Left out, the kill line asserted that a claim outside `all_claim_dirs()`
+    was invisible to the sweep, which on exactly that box was false and
+    sent the one reader already debugging a kill after the wrong
+    divergence. Chasing the wrong divergence is the whole of issue #19.
+
+    Appended rather than prepended so the ordinary two-entry answer keeps
+    the order `all_claim_dirs` chose. Deduped on `.resolve()` for the same
+    reason it is, and falling back to the literal path on OSError for the
+    same reason: a directory we cannot canonicalise was still consulted,
+    and dropping it here would understate what the sweep read.
+    """
+    out: list[str] = []
+    seen: set[Path] = set()
+    for cand in all_claim_dirs() + [Path(attributed_from)]:
+        try:
+            key = cand.resolve()
+        except OSError:
+            key = cand
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(str(cand))
+    return out
+
+
 def reap(queue: QueueRoot, cfg: RunnerConfig,
          active_ids: set[str] | None = None,
          include_orphan_cuda: bool = True,
@@ -295,8 +335,13 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
     stale = release_stale(cfg.claim_dir)
     requeued, failed = requeue_orphans(queue, active_ids)
     killed, convicted = [], []
-    # What `kill_orphan_cuda` exempted from, for the log line that follows a
-    # kill. Populated only where it is true: the sweep also runs for
+    # Where a claim would have spared a process from `kill_orphan_cuda`,
+    # for the log line that follows a kill. See `_consulted_dirs`: both
+    # the exemption ledgers and the one `attribute` read, because both
+    # spare by the same amount and the operator is asking about the
+    # outcome, not the mechanism.
+    #
+    # Populated only where it is true: the sweep also runs for
     # `enforce_vram`, which consults no exemption at all, and a sweep that
     # cannot see the process list examined nothing. Naming ledgers on
     # either would point the next operator at a read that never happened.
@@ -327,10 +372,9 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
             records = ledger.live_records(ledger.all_records(d))
             if cfg.kill_orphan_cuda:
                 protect = _running_trees(queue)
-                # The same `all_claim_dirs()` that `own_pids` reads inside
-                # `kill_orphan_cuda`, so the log names what was consulted
+                # What the log names, so it names what was consulted
                 # rather than what we assume it consulted.
-                exemption_dirs = [str(d) for d in all_claim_dirs()]
+                exemption_dirs = _consulted_dirs(d)
                 killed = kill_orphan_cuda(protect, records, apps)
             if cfg.enforce_vram and vram_strikes is not None:
                 convicted = check_vram(records, apps, vram_strikes)

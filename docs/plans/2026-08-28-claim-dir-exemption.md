@@ -75,6 +75,12 @@ safe way to be wrong." The residual hazard — a *live* pid in `/var/lock/gpu`
 that is coincidentally an orphan — is pid-reuse, which the primary directory has
 had all along.
 
+That last sentence understates it by the sweep interval, and #21 tracks the
+difference: `reap()` calls `release_stale(cfg.claim_dir)` and nothing sweeps
+`DEFAULT_CLAIM_DIR`, so a dead record there persists for the life of the box
+rather than for one tick. Fail-open, so not a blocker for this change, but not
+the same window either.
+
 `own_pids` has exactly one production caller (`reaper.py:84`); `preflight()` and
 `unledgered_processes()` are untouched, and that is a decision, not an
 oversight. Those are the *refuse to start* path, where over-exempting fails

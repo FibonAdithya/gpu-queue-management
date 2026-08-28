@@ -746,9 +746,12 @@ def test_sweep_still_kills_a_process_under_nobody(q, tmp_path, monkeypatch):
 # because nothing anywhere said a kill had happened, let alone which
 # exemption set was consulted before it.
 
-def test_reap_reports_the_ledgers_it_exempted_from(q, tmp_path, monkeypatch):
+def test_reap_reports_the_ledgers_it_exempted_from(q):
+    """An ordinary box: `[queue].claim_dir` is the same directory the
+    reaper's own `$GPU_CLAIM_DIR` names, so the ledger `attribute` read
+    dedups away and the answer is the two a claim can land in."""
     cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
-                       claim_dir=tmp_path)
+                       claim_dir=_cl.claim_dir())
     result = reap(q, cfg)
     assert result["exemption_dirs"] == [str(d) for d in _cl.all_claim_dirs()]
     assert len(result["exemption_dirs"]) == 2, \
@@ -778,3 +781,30 @@ def test_no_exemption_dirs_when_the_process_list_is_invisible(
     cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
                        claim_dir=tmp_path)
     assert reap(q, cfg)["exemption_dirs"] == []
+
+
+def test_the_reported_dirs_include_the_ledger_it_attributed_from(q, tmp_path):
+    """A claim in `[queue].claim_dir` spares its process too -- through
+    `ledger.attribute`, not through `own_pids` -- and that is a *third*
+    directory whenever the config and the reaper's own `$GPU_CLAIM_DIR`
+    diverge. `cli_runner` warns about that split and permits it, and
+    `test_a_divergent_runner_claim_dir_still_spares_a_direct_run` exists
+    to keep it working.
+
+    Left out, the runner's kill line told the one operator who is already
+    debugging a kill that gpuq never read their claim directory. That is
+    the wrong divergence to go chasing, and going chasing the wrong
+    divergence is the whole of issue #19.
+    """
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=configured)
+
+    dirs = reap(q, cfg)["exemption_dirs"]
+
+    assert str(configured) in dirs, (
+        "the sweep read this ledger to decide what was unledgered at all; "
+        "a live claim in it spares a process exactly as an exemption does")
+    assert dirs[:2] == [str(d) for d in _cl.all_claim_dirs()], \
+        "appended, so an ordinary box where the two agree still reports two"

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 from gpuqueue.config import (load_config, vram_policy, max_holders,
-                            claim_dir_setting, ConfigError)
+                             claim_dir_setting, ConfigError)
 from gpuqueue.ledger import DEFAULT_RESERVE_MB
 
 TOML = """
