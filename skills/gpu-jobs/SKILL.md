@@ -122,6 +122,10 @@ files without being asked.
 ## Do not
 
 - Run GPU work directly. `gpu-claim -- <cmd>` if you truly must run
-  something interactively; it takes the same lock the queue does.
+  something interactively -- and `export GPU_CLAIM_DIR=/workspace/lock/gpu`
+  first, or it does *not* take the same lock the queue does. Your shell does
+  not inherit the daemon's environment, so without that the claim lands in
+  `/var/lock/gpu`, the runner's ledger never counts it, and it will admit a
+  job on top of you. `gpu-claim` warns when it can tell.
 - Run git in a checkout the runner owns. It manages those, and a concurrent
   checkout corrupts the tree under a running job.

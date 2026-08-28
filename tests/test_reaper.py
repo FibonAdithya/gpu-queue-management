@@ -167,6 +167,7 @@ import sys as _sys
 import time as _time
 from pathlib import Path as _Path
 from gpuqueue import preflight as _pf
+from gpuqueue import claim as _cl
 
 # Detaches before spawning its child, so the pair is NOT in pytest's own
 # process tree. Without the double fork `descendants(os.getpid())` exempts
@@ -200,13 +201,31 @@ def _live(pid: int) -> bool:
     return False
 
 
-@pytest.fixture
-def direct_claim(tmp_path, monkeypatch):
-    """A detached `gpu-claim`-shaped process pair plus its claim file."""
-    claim_dir = tmp_path / "claims"
-    claim_dir.mkdir()
-    monkeypatch.setenv("GPU_CLAIM_DIR", str(claim_dir))
+def _write_claim(directory, holder: int) -> None:
+    """A hand-run `gpu-claim`'s record, in whichever directory that run's
+    own `$GPU_CLAIM_DIR` resolved to.
 
+    Separate from the fixture below because *which* directory it lands in
+    is the variable under test in the two-environment case: the claim
+    writer is an interactive shell and the reaper is a supervisor unit, and
+    they do not resolve that variable to the same place (issue #19).
+    """
+    directory = _Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "GPU-test.lock.json").write_text(json.dumps({
+        "pid": holder, "owner": "someone", "cmd": ["python", "train.py"],
+        "started_at": "2026-08-10T00:00:00Z", "key": "GPU-test"}))
+
+
+@pytest.fixture
+def holder_process(tmp_path):
+    """A detached `gpu-claim`-shaped process pair, with no claim written.
+
+    Detached on purpose, and the two assertions below are what make every
+    test built on this honest: `own_pids` exempts `os.getpid()` and its
+    whole tree unconditionally, so a helper inside pytest's tree would be
+    exempt no matter what the claim directory logic did.
+    """
     out = tmp_path / "pids.json"
     _sp.run([_sys.executable, "-c", _HOLDER, str(out)], check=True, timeout=30)
     deadline = _time.monotonic() + 10
@@ -216,10 +235,6 @@ def direct_claim(tmp_path, monkeypatch):
         _time.sleep(0.05)
     pids = json.loads(out.read_text())
     holder, child = pids["holder"], pids["child"]
-
-    (claim_dir / "GPU-test.lock.json").write_text(json.dumps({
-        "pid": holder, "owner": "someone", "cmd": ["python", "train.py"],
-        "started_at": "2026-08-10T00:00:00Z", "key": "GPU-test"}))
 
     # The whole reproduction rests on these two not being in pytest's tree.
     assert holder not in _pf.descendants(_os.getpid())
@@ -234,6 +249,18 @@ def direct_claim(tmp_path, monkeypatch):
                 pass
 
 
+@pytest.fixture
+def direct_claim(tmp_path, monkeypatch, holder_process):
+    """The single-environment case: the claim lands in the same
+    `$GPU_CLAIM_DIR` the reaper reads."""
+    claim_dir = tmp_path / "claims"
+    claim_dir.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(claim_dir))
+    holder, child = holder_process
+    _write_claim(claim_dir, holder)
+    return holder, child
+
+
 def test_own_pids_covers_a_claim_holders_children(direct_claim):
     """The root cause. The claim names the gpu-claim process; the process
     actually on the card is its child."""
@@ -241,6 +268,86 @@ def test_own_pids_covers_a_claim_holders_children(direct_claim):
     own = _pf.own_pids()
     assert holder in own, "the recorded pid itself is exempt"
     assert child in own, "a claim holder's CUDA child is not exempt"
+
+
+def test_own_pids_exempts_a_claim_written_under_the_default_dir(
+        holder_process, tmp_path, monkeypatch):
+    """Two environments, which is what issue #19 turns on.
+
+    The daemon got `$GPU_CLAIM_DIR` from its supervisor unit. The
+    interactive shell that ran `gpu-claim` did not inherit it, so the claim
+    landed on `DEFAULT_CLAIM_DIR`. `own_pids` resolves the variable in the
+    *reaper's* process, so before the union it read a directory the claim
+    was never written to -- not a superset of what `attribute` owns, but
+    disjoint from it.
+    """
+    holder, child = holder_process
+    daemon_dir = tmp_path / "daemon-claims"          # what supervisor gave it
+    daemon_dir.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(daemon_dir))
+    _write_claim(_cl.DEFAULT_CLAIM_DIR, holder)      # where the shell wrote
+
+    from gpuqueue import ledger as lg
+    assert lg.all_records(daemon_dir) == [], \
+        "the two environments must genuinely diverge or this proves nothing"
+
+    own = _pf.own_pids()
+
+    assert holder in own, "the hand-run claim's own pid is not exempt"
+    assert child in own, "the trainer under a hand-run claim is not exempt"
+
+
+def test_own_pids_given_a_directory_reads_only_that_one(
+        holder_process, tmp_path, monkeypatch):
+    """The widening is for the bare call. A caller that names a directory
+    is asking about that directory, and answering about a different one
+    would make `directory=` mean nothing."""
+    holder, _child = holder_process
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    _write_claim(_cl.DEFAULT_CLAIM_DIR, holder)
+
+    assert holder not in _pf.own_pids(directory=empty)
+    assert holder in _pf.own_pids(), "the bare call must still widen"
+
+
+def test_a_claim_the_daemons_environment_cannot_see_is_still_spared(
+        q, tmp_path, holder_process, monkeypatch):
+    """The reproduction, end to end: 14 of 29 runs on the deployment box,
+    `exit -9` with empty stderr, at exactly `orphan_cuda_interval_s`.
+
+    `test_a_divergent_runner_claim_dir_still_spares_a_direct_run` cannot
+    express this. It varies `cfg.claim_dir` while the claim is still
+    written into the same `$GPU_CLAIM_DIR` that `own_pids()` reads; here
+    `cfg.claim_dir` and the daemon's `$GPU_CLAIM_DIR` *agree*, and it is
+    the interactive user who diverges.
+    """
+    holder, child = holder_process
+    daemon_dir = tmp_path / "daemon-claims"
+    daemon_dir.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(daemon_dir))
+    _write_claim(_cl.DEFAULT_CLAIM_DIR, holder)
+
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=daemon_dir)
+    monkeypatch.setattr(rp, "own_pids", _pf.own_pids)   # undo the autouse stub
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": child, "used_mb": 900,
+                                  "name": "train.py"}])
+
+    from gpuqueue import ledger as lg
+    assert lg.all_records(daemon_dir) == [], \
+        "the config and the daemon's environment must agree with each other"
+
+    result = reap(q, cfg)
+
+    deadline = _time.monotonic() + 2
+    while _live(child) and _time.monotonic() < deadline:
+        _time.sleep(0.05)
+    assert _live(child), ("SIGKILLed a direct gpu-claim run whose claim went "
+                          "to the default directory because the reaper's "
+                          "$GPU_CLAIM_DIR came from its supervisor unit")
+    assert result["killed_pids"] == []
 
 
 def test_does_not_kill_a_direct_gpu_claim_run(q, direct_claim, monkeypatch):
@@ -629,3 +736,45 @@ def test_sweep_still_kills_a_process_under_nobody(q, tmp_path, monkeypatch):
     monkeypatch.setattr(rp, "_kill", lambda pid: True)
 
     assert reap(q, cfg)["killed_pids"] == [9999]
+
+
+# --- Which ledgers the sweep consulted (issue #19) -----------------------
+#
+# A SIGKILL from `kill_orphan_cuda` reaches the caller as `exit -9` with an
+# empty stderr. The reporter of #19 spent a session ruling out OOM, host
+# memory and the trainer itself before the reaper was even a suspect,
+# because nothing anywhere said a kill had happened, let alone which
+# exemption set was consulted before it.
+
+def test_reap_reports_the_ledgers_it_exempted_from(q, tmp_path, monkeypatch):
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    result = reap(q, cfg)
+    assert result["exemption_dirs"] == [str(d) for d in _cl.all_claim_dirs()]
+    assert len(result["exemption_dirs"]) == 2, \
+        "the environment directory and the default, which conftest keeps apart"
+
+
+def test_no_exemption_dirs_when_the_sweep_did_not_run(q, tmp_path):
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    assert reap(q, cfg, include_orphan_cuda=False)["exemption_dirs"] == []
+
+
+def test_no_exemption_dirs_when_only_the_vram_watchdog_ran(q, tmp_path):
+    """The sweep runs for `enforce_vram` too, and that path consults no
+    exemption at all. Reporting one here would have the runner name
+    ledgers nothing read."""
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=False,
+                       enforce_vram=True, claim_dir=tmp_path)
+    assert reap(q, cfg, vram_strikes={})["exemption_dirs"] == []
+
+
+def test_no_exemption_dirs_when_the_process_list_is_invisible(
+        q, tmp_path, monkeypatch):
+    """A sweep that could not see the process list exempted nothing
+    because it examined nothing."""
+    monkeypatch.setattr(rp, "compute_apps", lambda: None)
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    assert reap(q, cfg)["exemption_dirs"] == []

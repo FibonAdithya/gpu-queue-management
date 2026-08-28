@@ -12,8 +12,8 @@ import sys
 from pathlib import Path
 
 from . import ledger
-from .claim import claim_dir, list_claims          # noqa: F401 (list_claims
-                                                   # kept for callers)
+# list_claims is re-exported, not used here; kept for callers.
+from .claim import all_claim_dirs, claim_dir, list_claims   # noqa: F401
 from .procs import descendants
 
 
@@ -63,16 +63,29 @@ def own_pids(directory=None) -> set[int]:
     is `ledger.attribute`. This one is deliberately coarser: it is the
     last exemption before a SIGKILL, so over-exempting is the safe way to
     be wrong.
+
+    Bare, it reads *every* directory a claim on this box could be in, not
+    just the one this process would write to. `claim_dir()` resolves
+    `$GPU_CLAIM_DIR` in the calling process, and the reaper is a
+    supervisor unit while the claim writer is an interactive shell that
+    never inherits a unit's environment. Reading only our own left a
+    hand-run `gpu-claim` invisible here and killed 48% of one session's
+    runs (issue #19). See `claim.all_claim_dirs`.
+
+    An explicit `directory=` still means exactly that one: a caller who
+    names a directory is asking about that directory, and widening the
+    answer would make the argument mean nothing.
     """
     pids = {os.getpid(), os.getppid()} | descendants(os.getpid())
-    d = Path(directory) if directory else claim_dir()
-    for rec in ledger.live_records(ledger.all_records(d)):
-        pids.add(rec.pid)
-        if rec.usage_pid is not None:
-            pids.add(rec.usage_pid)
-            pids.update(descendants(rec.usage_pid))
-        else:
-            pids.update(descendants(rec.pid))
+    dirs = [Path(directory)] if directory else all_claim_dirs()
+    for d in dirs:
+        for rec in ledger.live_records(ledger.all_records(d)):
+            pids.add(rec.pid)
+            if rec.usage_pid is not None:
+                pids.add(rec.usage_pid)
+                pids.update(descendants(rec.usage_pid))
+            else:
+                pids.update(descendants(rec.pid))
     return pids
 
 

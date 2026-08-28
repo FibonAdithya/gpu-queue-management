@@ -27,7 +27,10 @@ kill_orphan_cuda = true
 # nvidia-smi, so it is throttled; the cheap recovery reaps run every poll.
 orphan_cuda_interval_s = 60.0
 # Every participant on the box must agree on this path, or two tools hold
-# two different locks for the same card.
+# two different locks for the same card. `gpu-claim` reads this key to warn
+# an interactive user whose $GPU_CLAIM_DIR does not match it -- a shell does
+# not inherit the daemon's environment, so that disagreement is the common
+# one and it has no other symptom.
 claim_dir = "/workspace/lock/gpu"
 
 # One block per project the runner serves. Delete this example and add yours.

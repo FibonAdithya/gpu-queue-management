@@ -8,7 +8,7 @@ import signal
 import time
 
 from . import ledger
-from .claim import release_stale, claim_dir
+from .claim import release_stale, claim_dir, all_claim_dirs
 from .config import RunnerConfig
 from .preflight import compute_apps, own_pids
 from .procs import descendants, pid_alive
@@ -60,27 +60,36 @@ def kill_orphan_cuda(protect: set[int], records: list, apps: list[dict]) -> list
     """
     _, unledgered = ledger.attribute(apps, records)
     # Two directories on purpose, and the divergence is load-bearing.
-    # `records` came from `cfg.claim_dir`; bare `own_pids()` reads
-    # `$GPU_CLAIM_DIR`. That is safe only because `own_pids` is a strict
-    # superset of what `attribute` owns, so disagreement can only add
-    # exemptions, never remove one -- and this call is the only thing
-    # standing between a direct `gpu-claim` user's trainer and SIGKILL when
-    # the two paths genuinely differ.
+    # `records` came from `cfg.claim_dir`; bare `own_pids()` reads every
+    # directory a claim on this box could be in. This call is the only
+    # thing standing between a direct `gpu-claim` user's trainer and
+    # SIGKILL when the two paths differ.
     #
-    # They still can. `bootstrap.sh` now templates GPU_CLAIM_DIR into the
-    # generated gpuq.toml as well as the supervisor environment, so a
-    # freshly bootstrapped box agrees -- but it writes that config once and
-    # never overwrites it, so a box bootstrapped before that change, or any
-    # hand-edited config, diverges exactly as before. `cli_runner` warns at
-    # startup; it does not refuse.
+    # This used to be justified by `own_pids` being a strict *superset* of
+    # what `attribute` owns, so that disagreement could only add
+    # exemptions. That was false, and it was the bug in issue #19. It held
+    # only while the claim writer and the reaper resolved `$GPU_CLAIM_DIR`
+    # to the same value, and they systematically do not: the daemon gets
+    # the variable from a supervisor unit, and an interactive shell never
+    # inherits a unit's environment. The two sets were then *disjoint*
+    # rather than nested, the hand-run claim was invisible, and 48% of one
+    # session's runs died on `exit -9` with an empty stderr.
     #
-    # So do not "clean this up" by passing `cfg.claim_dir` into
+    # The superset property is now built rather than assumed:
+    # `claim.all_claim_dirs()` names every directory a claim could have
+    # landed in, whichever environment wrote it, and `own_pids` reads them
+    # all. Over-exempting is the safe way to be wrong here -- it is the
+    # last check before a SIGKILL.
+    #
+    # So still do not "clean this up" by passing `cfg.claim_dir` into
     # `own_pids()`, and do not route it through `attribute()`. Either
-    # removes that protection, and
-    # `test_a_divergent_runner_claim_dir_still_spares_a_direct_run` is
-    # there to catch it. Unifying the two becomes safe only once a
-    # divergent config is unreachable, which is a bootstrap change, not a
-    # directory plumbed through here.
+    # narrows the exemption back to one directory chosen by one process,
+    # which is what killed those runs.
+    # `test_a_divergent_runner_claim_dir_still_spares_a_direct_run` catches
+    # the config-vs-environment split;
+    # `test_a_claim_the_daemons_environment_cannot_see_is_still_spared`
+    # catches the two-environment one that a single-process test cannot
+    # express.
     exempt = set(protect) | own_pids()
     killed = []
     for app in unledgered:
@@ -286,6 +295,12 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
     stale = release_stale(cfg.claim_dir)
     requeued, failed = requeue_orphans(queue, active_ids)
     killed, convicted = [], []
+    # What `kill_orphan_cuda` exempted from, for the log line that follows a
+    # kill. Populated only where it is true: the sweep also runs for
+    # `enforce_vram`, which consults no exemption at all, and a sweep that
+    # cannot see the process list examined nothing. Naming ledgers on
+    # either would point the next operator at a read that never happened.
+    exemption_dirs: list[str] = []
     # Both consumers below need one nvidia-smi call and one ledger scan.
     # Gate that shared cost on whether either consumer is switched on --
     # a box with kill_orphan_cuda and enforce_vram both off should pay for
@@ -312,6 +327,10 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
             records = ledger.live_records(ledger.all_records(d))
             if cfg.kill_orphan_cuda:
                 protect = _running_trees(queue)
+                # The same `all_claim_dirs()` that `own_pids` reads inside
+                # `kill_orphan_cuda`, so the log names what was consulted
+                # rather than what we assume it consulted.
+                exemption_dirs = [str(d) for d in all_claim_dirs()]
                 killed = kill_orphan_cuda(protect, records, apps)
             if cfg.enforce_vram and vram_strikes is not None:
                 convicted = check_vram(records, apps, vram_strikes)
@@ -328,4 +347,4 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
     cleaned = clean_partials(queue)
     return {"stale_claims": stale, "requeued": requeued, "failed": failed,
             "killed_pids": killed, "cleaned_paths": cleaned,
-            "convicted": convicted}
+            "convicted": convicted, "exemption_dirs": exemption_dirs}

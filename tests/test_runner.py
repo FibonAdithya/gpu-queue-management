@@ -1,3 +1,4 @@
+import logging
 import json
 import threading
 import time
@@ -1447,3 +1448,40 @@ def test_the_logged_artifact_path_is_where_the_file_actually_landed(env,
     assert "results repo" in line, line
     assert "p/j1/runs/s.json" in line, line
     assert (Path(p.results_checkout) / "p" / "j1" / "runs" / "s.json").exists()
+
+
+# --- Saying that a kill happened (issue #19) -----------------------------
+#
+# `reap()` has always returned `killed_pids` and nothing ever read it. A
+# SIGKILL from the orphan sweep reaches the caller as `exit -9` with an
+# empty stderr, which downstream reads as the job's own failure -- in the
+# reported case a well-formed `quality 0`, indistinguishable from a broken
+# algorithm. The ledgers are named because *which* claim directory was
+# consulted is the thing that was wrong.
+
+def test_a_kill_is_logged_with_the_ledgers_it_consulted(env, monkeypatch,
+                                                        caplog):
+    r, sha = env
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {
+        "killed_pids": [4321, 4322],
+        "exemption_dirs": ["/workspace/lock/gpu", "/var/lock/gpu"]})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+
+    msg = "\n".join(caplog.messages)
+    assert "4321" in msg and "4322" in msg, msg
+    assert "/workspace/lock/gpu" in msg and "/var/lock/gpu" in msg, msg
+
+
+def test_a_sweep_that_killed_nothing_says_nothing(env, monkeypatch, caplog):
+    r, sha = env
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {
+        "killed_pids": [],
+        "exemption_dirs": ["/workspace/lock/gpu", "/var/lock/gpu"]})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+
+    assert not [m for m in caplog.messages if "/var/lock/gpu" in m], \
+        "an idle sweep must not name a ledger once a minute forever"

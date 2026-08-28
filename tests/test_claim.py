@@ -487,3 +487,61 @@ def test_gpu_claim_takes_an_explicit_cap_over_the_config(tmp_path,
     with gpu_claim(key="k", owner="bob", cmd=["train"], directory=d,
                    vram_mb=500, usable_mb=8000, max_holders=4) as rec:
         assert rec.owner == "bob"
+
+
+# --- Where a claim on this box can live (issue #19) ----------------------
+#
+# `claim_dir()` resolves `$GPU_CLAIM_DIR` in the *calling* process. The
+# claim writer is an interactive shell and the reaper is a supervisor
+# unit, and a shell never inherits a unit's environment, so the two
+# systematically disagree. `all_claim_dirs` is the set the reaper has to
+# consult to exempt a claim it did not write.
+
+from pathlib import Path as _P
+from gpuqueue import claim as _claim
+
+
+def test_all_claim_dirs_lists_the_environment_dir_and_the_default(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(tmp_path / "env"))
+    monkeypatch.setattr(_claim, "DEFAULT_CLAIM_DIR", str(tmp_path / "default"))
+    assert _claim.all_claim_dirs() == [tmp_path / "env", tmp_path / "default"]
+
+
+def test_the_environment_dir_comes_first(tmp_path, monkeypatch):
+    """Order is not cosmetic: it is what the runner logs as the ledgers it
+    consulted, and the reaper's own directory is the one an operator
+    debugging a kill needs to see first."""
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(tmp_path / "env"))
+    monkeypatch.setattr(_claim, "DEFAULT_CLAIM_DIR", str(tmp_path / "default"))
+    assert _claim.all_claim_dirs()[0] == tmp_path / "env"
+
+
+def test_all_claim_dirs_is_one_entry_when_the_default_is_in_use(
+        tmp_path, monkeypatch):
+    monkeypatch.delenv("GPU_CLAIM_DIR", raising=False)
+    monkeypatch.setattr(_claim, "DEFAULT_CLAIM_DIR", str(tmp_path / "d"))
+    assert _claim.all_claim_dirs() == [tmp_path / "d"]
+
+
+def test_one_directory_reached_two_ways_is_not_listed_twice(
+        tmp_path, monkeypatch):
+    """Deduped on `.resolve()`, not on the spelling. A box that points
+    `$GPU_CLAIM_DIR` at a symlink to the default would otherwise walk the
+    same ledger twice and name it twice in the runner's log."""
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(link))
+    monkeypatch.setattr(_claim, "DEFAULT_CLAIM_DIR", str(real))
+    assert _claim.all_claim_dirs() == [link]
+
+
+def test_the_default_is_read_at_call_time(tmp_path, monkeypatch):
+    """Not import-bound. The suite stubs this constant to keep the live
+    `/var/lock/gpu` out of every test that takes the bare path, and a name
+    captured at import would make that stub silently do nothing."""
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(tmp_path / "env"))
+    monkeypatch.setattr(_claim, "DEFAULT_CLAIM_DIR", str(tmp_path / "moved"))
+    assert _P(tmp_path / "moved") in _claim.all_claim_dirs()

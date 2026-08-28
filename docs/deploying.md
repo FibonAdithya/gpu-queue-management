@@ -128,7 +128,7 @@ ssh $BOX 'cd /workspace/gpu-queue-management &&
 | `PYTHON` | `python3` | Interpreter the runner is installed into. Must be 3.11+ |
 | `GPUQ_PREFIX` | `/workspace` | Everything else derives from this |
 | `QUEUE_ROOT` | `$GPUQ_PREFIX/queue` | |
-| `GPU_CLAIM_DIR` | `$GPUQ_PREFIX/lock/gpu` | Must be identical for **every** participant on the box, or you have two locks for one card |
+| `GPU_CLAIM_DIR` | `$GPUQ_PREFIX/lock/gpu` | Must be identical for **every** participant on the box, or you have two locks for one card. An interactive shell does not inherit the daemon's -- see below |
 | `GPUQ_CONFIG` | `$GPUQ_PREFIX/gpuq.toml` | Written once, never overwritten |
 | `GPUQ_SKILLS_DIR` | `~/.claude/skills` | Where the agent skill is installed |
 | `SUPERVISOR_CONF_DIR` | `/etc/supervisor/conf.d` | |
@@ -232,6 +232,35 @@ they are unverified here — `flock` is emulated via POSIX locks on Linux
 clients and its behaviour across a server restart is not something gpuq has
 been tested against. Keep the claim directory on local disk; there is no
 reason for it to be shared, since it describes one box's card.
+
+### An interactive shell does not inherit the daemon's `GPU_CLAIM_DIR`
+
+This is the one divergence that needs no misconfiguration to appear, and it
+used to be silent.
+
+`GPU_CLAIM_DIR` is resolved by whichever process reads it. The runner gets it
+from its supervisor unit; an `ssh` shell gets nothing, so a hand-run
+`gpu-claim` writes into the built-in default `/var/lock/gpu` while the daemon
+reads `/workspace/lock/gpu`. `[queue].claim_dir` and the daemon agree
+perfectly the whole time -- it is the person at the keyboard who diverges.
+
+The orphan sweep now exempts a claim under **either** the reaper's
+`$GPU_CLAIM_DIR` or `/var/lock/gpu`, so this no longer gets your trainer
+SIGKILLed. What it still costs you is accounting: the runner's ledger does not
+count a claim it cannot see, so `gpu_max_jobs` and the VRAM budget will admit
+a job straight on top of yours. `gpu-claim` says so when it can tell -- it
+compares where it is about to write against `[queue].claim_dir` in
+`$GPUQ_CONFIG`.
+
+So export it in any shell that will run `gpu-claim`:
+
+```sh
+export GPU_CLAIM_DIR=/workspace/lock/gpu
+```
+
+If a job dies with `exit -9`, an empty stderr and no message of its own, check
+the runner log: an orphan-sweep kill now names the pids it killed and the
+claim directories it exempted from.
 
 Set `venv` even if the runner already lives there. It is what puts `python` on
 a job's PATH — and on many images there is **no bare `python`**, only `python3`,
