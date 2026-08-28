@@ -43,7 +43,7 @@ def claim_dir() -> Path:
     return Path(os.environ.get("GPU_CLAIM_DIR", DEFAULT_CLAIM_DIR))
 
 
-def all_claim_dirs() -> list[Path]:
+def all_claim_dirs(extra=None) -> list[Path]:
     """Every directory a claim on this box could have been written to.
 
     `claim_dir()` answers "where do *I* write", and that is a different
@@ -68,10 +68,26 @@ def all_claim_dirs() -> list[Path]:
     import: the suite stubs it to keep the live `/var/lock/gpu` out of
     tests that take the bare path, and a name bound at import would make
     that stub silently do nothing.
+
+    `extra` is a directory the caller learned about some other way,
+    because this process's environment cannot name it: `[queue].claim_dir`
+    out of the config file, which is the daemon's answer and the one thing
+    an interactive shell can read it from. Both callers that have it pass
+    it -- `reaper._swept_dirs` and `gpu-claim --reap` -- and they go
+    through this one function rather than each appending it themselves,
+    because two spellings of "every directory a claim could be in" are two
+    lists that drift, which is the whole of issue #21.
+
+    Appended rather than prepended, so the ordinary two-entry answer keeps
+    the order above, and deduped on `.resolve()` like the rest: on every
+    box where the config and the environment agree it collapses away.
     """
     out: list[Path] = []
     seen: set[Path] = set()
-    for d in (claim_dir(), Path(DEFAULT_CLAIM_DIR)):
+    cands = [claim_dir(), Path(DEFAULT_CLAIM_DIR)]
+    if extra is not None:
+        cands.append(Path(extra))
+    for d in cands:
         try:
             key = d.resolve()
         except OSError:
@@ -182,10 +198,15 @@ def _sweep_one(directory: Path, released: list[dict], stuck: list[dict]) -> None
             continue
         try:
             ledger.remove(r)
-        except OSError:
+        except OSError as e:
             # The path, unlike a released record, because this one is still
-            # there and the operator reading the log is who has to remove it.
-            stuck.append(dict(r.to_dict(), path=str(r.path)))
+            # there and the operator reading the log is who has to remove
+            # it -- and the kernel's own reason beside it, because EACCES
+            # on another user's file is only the expected way to land here
+            # and a reader told the expected cause for an unexpected errno
+            # goes looking in the wrong place.
+            stuck.append(dict(r.to_dict(), path=str(r.path),
+                              error=e.strerror or str(e)))
             continue
         released.append(r.to_dict())
 

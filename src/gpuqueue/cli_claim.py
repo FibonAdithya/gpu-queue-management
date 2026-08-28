@@ -159,7 +159,17 @@ def main(argv: list[str] | None = None) -> int:
         # interactive shell and a supervisor unit systematically disagree
         # about that variable (issue #19), and the daemon's sweep now
         # covers both for the same reason (issue #21).
-        released, stuck = sweep_stale(all_claim_dirs())
+        #
+        # `[queue].claim_dir` is the third, and on the deployed box the
+        # one most records are under: the daemon reads it, and this
+        # process's environment cannot name it. It is already in hand --
+        # the warning above compares against it on every invocation --
+        # and it is the same argument `reaper._swept_dirs` passes, so the
+        # operator's sweep and the daemon's cover one set. Left out,
+        # `--reap` opened neither the directory holding the card nor said
+        # so, and printing nothing reads as "nothing was stale".
+        released, stuck = sweep_stale(
+            all_claim_dirs(config.claim_dir_setting()))
         for body in released:
             print(f"released stale claim: pid {body.get('pid')} "
                   f"{body.get('owner')}", file=sys.stderr)
@@ -167,9 +177,15 @@ def main(argv: list[str] | None = None) -> int:
             # Named rather than swallowed: the card is still held by this
             # record, and reporting only what was freed would say it is
             # not.
+            # The kernel's reason, not a guess at it. EACCES on another
+            # user's record in a world-writable directory is the expected
+            # one, but a read-only remount and a stale NFS handle reach
+            # this same branch, and naming a cause the kernel did not give
+            # sends an operator mid-incident to find an owner who is not
+            # the problem.
             print(f"could not remove stale claim {body.get('path')}: "
-                  f"pid {body.get('pid')} {body.get('owner')} -- it belongs "
-                  f"to another user", file=sys.stderr)
+                  f"pid {body.get('pid')} {body.get('owner')} -- "
+                  f"{body.get('error')}", file=sys.stderr)
         return 0
 
     cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else args.cmd

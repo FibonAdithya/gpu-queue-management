@@ -395,3 +395,58 @@ def test_reap_names_a_record_it_may_not_remove(tmp_path, monkeypatch, capsys):
 
 def _refuse_remove(rec):
     raise PermissionError(13, "Operation not permitted")
+
+
+def test_reap_sweeps_the_directory_the_runner_is_configured_to_read(
+        tmp_path, monkeypatch, capsys):
+    """The third directory, and on the deployed box the important one.
+
+    `docs/deploying.md` describes exactly this shape: the daemon reads
+    `[queue].claim_dir` out of `$GPUQ_CONFIG`, while an interactive shell
+    -- which never inherits the unit's `$GPU_CLAIM_DIR` -- lands on the
+    default. Nearly every record on such a box is therefore under the
+    runner's directory, and `all_claim_dirs()` cannot name it: it resolves
+    the environment of *this* process. A `--reap` built from that list
+    alone opens neither the directory holding the card nor says so; it
+    prints nothing, which reads as "nothing was stale".
+
+    The config file is the one thing both sides can read, and
+    `_warn_if_the_runner_reads_elsewhere` already reads it on every
+    invocation -- so the directory is in hand, and leaving it out of the
+    sweep is the same drift between two lists that issue #21 was.
+    """
+    runners = tmp_path / "runnerdir"
+    _runner_reads(tmp_path, monkeypatch, str(runners))
+    ghost = _dead_claim(runners, "ghost-runner")
+
+    assert cli_claim.main(["--reap"]) == 0
+
+    assert not ghost.exists(), "the record holding the card was never read"
+    assert "ghost-runner" in capsys.readouterr().err
+
+
+def test_reap_says_why_it_could_not_remove_a_record(tmp_path, monkeypatch,
+                                                    capsys):
+    """`OSError` out of the unlink is not only "another user's file".
+
+    A read-only remount of `/var/lock`, a stale NFS handle and an
+    exhausted inode table all reach the same branch, and the errno is the
+    only thing that tells them apart. Naming a cause the kernel did not
+    give sends the one operator already mid-incident to go find an owner
+    who is not the problem.
+    """
+    import errno
+    from gpuqueue import ledger as lg
+    stuck = _dead_claim(tmp_path, "mine")
+
+    def _readonly(rec):
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    monkeypatch.setattr(lg, "remove", _readonly)
+
+    assert cli_claim.main(["--reap"]) == 0
+
+    err = capsys.readouterr().err
+    assert str(stuck) in err, err
+    assert "Read-only file system" in err, err
+    assert "another user" not in err, err

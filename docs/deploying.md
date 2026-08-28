@@ -250,11 +250,16 @@ SIGKILLed, and it releases stale records from both, so a dead claim of
 yours in either one stops holding the card within a poll. A record the
 daemon is refused permission to remove -- another user's, in a
 world-writable directory -- is named in the runner log once, with its
-path, because clearing it needs the person who owns it. What it still costs you is accounting: the runner's ledger does not
-count a claim it cannot see, so `gpu_max_jobs` and the VRAM budget will admit
-a job straight on top of yours. `gpu-claim` says so when it can tell -- it
-compares where it is about to write against `[queue].claim_dir` in
-`$GPUQ_CONFIG`.
+path and the kernel's own reason, because clearing it needs the person
+who owns it. `gpu-claim --reap` sweeps that same set by hand, the
+`[queue].claim_dir` the daemon reads included, so it reaches a record
+your own shell's `$GPU_CLAIM_DIR` cannot name.
+
+What it still costs you is accounting: the runner's ledger does not
+count a claim it cannot see, so `gpu_max_jobs` and the VRAM budget will
+admit a job straight on top of yours. `gpu-claim` says so when it can
+tell -- it compares where it is about to write against
+`[queue].claim_dir` in `$GPUQ_CONFIG`.
 
 So export it in any shell that will run `gpu-claim`:
 

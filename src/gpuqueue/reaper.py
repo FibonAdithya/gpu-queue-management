@@ -297,25 +297,15 @@ def _swept_dirs(attributed_from) -> list[Path]:
     and the reaper's own `$GPU_CLAIM_DIR` diverge -- a split `cli_runner`
     warns about and permits -- and on every ordinary box it dedups away.
 
-    Appended rather than prepended so the ordinary two-entry answer keeps
-    the order `all_claim_dirs` chose. Deduped on `.resolve()` for the same
-    reason it is, and falling back to the literal path on OSError for the
-    same reason: a directory we cannot canonicalise is still one a claim
-    may be sitting in, and dropping it here would drop both an exemption
-    and the sweep that bounds it.
+    Appended, deduped on `.resolve()`, and falling back to the literal
+    path on OSError -- all of that is `all_claim_dirs`'s to do, and it
+    does it here through the `extra` argument rather than in a second copy
+    of the loop. `gpu-claim --reap` builds its set the same way from the
+    same function: two spellings of "every directory a claim could be in"
+    are two lists that drift, and this whole module exists because two of
+    them did.
     """
-    out: list[Path] = []
-    seen: set[Path] = set()
-    for cand in all_claim_dirs() + [Path(attributed_from)]:
-        try:
-            key = cand.resolve()
-        except OSError:
-            key = cand
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(cand)
-    return out
+    return all_claim_dirs(attributed_from)
 
 
 def _consulted_dirs(attributed_from) -> list[str]:
