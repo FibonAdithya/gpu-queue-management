@@ -14,8 +14,9 @@ from . import claim as _claim, config
 # name bound here at import would drift from the value actually in use --
 # and drift between two readings of one claim directory is the whole of
 # issue #19.
-from .claim import (gpu_claim, ClaimBusy, CannotEverFit, release_stale,
-                    list_claims, default_usable_mb, claim_dir)
+from .claim import (gpu_claim, ClaimBusy, CannotEverFit, sweep_stale,
+                    list_claims, default_usable_mb, claim_dir,
+                    all_claim_dirs)
 from .gpuid import gpu_key, cuda_visible_value, GpuIdError
 from .preflight import preflight, PreflightFailed
 
@@ -151,9 +152,40 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps([body for _, body in list_claims()], indent=2))
         return 0
     if args.reap:
-        for body in release_stale():
+        # Every directory a claim could be in, not just this shell's. The
+        # operator running `--reap` is chasing a card that looks held by
+        # nothing, and the record doing the holding is as likely to be
+        # under the default as under their own `$GPU_CLAIM_DIR` -- an
+        # interactive shell and a supervisor unit systematically disagree
+        # about that variable (issue #19), and the daemon's sweep now
+        # covers both for the same reason (issue #21).
+        #
+        # `[queue].claim_dir` is the third, and on the deployed box the
+        # one most records are under: the daemon reads it, and this
+        # process's environment cannot name it. It is already in hand --
+        # the warning above compares against it on every invocation --
+        # and it is the same argument `reaper._swept_dirs` passes, so the
+        # operator's sweep and the daemon's cover one set. Left out,
+        # `--reap` opened neither the directory holding the card nor said
+        # so, and printing nothing reads as "nothing was stale".
+        released, stuck = sweep_stale(
+            all_claim_dirs(config.claim_dir_setting()))
+        for body in released:
             print(f"released stale claim: pid {body.get('pid')} "
                   f"{body.get('owner')}", file=sys.stderr)
+        for body in stuck:
+            # Named rather than swallowed: the card is still held by this
+            # record, and reporting only what was freed would say it is
+            # not.
+            # The kernel's reason, not a guess at it. EACCES on another
+            # user's record in a world-writable directory is the expected
+            # one, but a read-only remount and a stale NFS handle reach
+            # this same branch, and naming a cause the kernel did not give
+            # sends an operator mid-incident to find an owner who is not
+            # the problem.
+            print(f"could not remove stale claim {body.get('path')}: "
+                  f"pid {body.get('pid')} {body.get('owner')} -- "
+                  f"{body.get('error')}", file=sys.stderr)
         return 0
 
     cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else args.cmd

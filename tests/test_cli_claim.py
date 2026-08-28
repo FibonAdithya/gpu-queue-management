@@ -4,6 +4,8 @@ from gpuqueue import cli_claim
 from gpuqueue.claim import ClaimBusy
 from gpuqueue.preflight import PreflightFailed
 from gpuqueue.gpuid import GpuIdError
+from pathlib import Path
+from gpuqueue import claim
 
 KEY = "4b8f2c1a-0000-0000-0000-000000000001"
 
@@ -343,3 +345,108 @@ def test_reap_warns_too(tmp_path, monkeypatch, capsys):
     _runner_reads(tmp_path, monkeypatch, "/workspace/lock/gpu")
     assert cli_claim.main(["--reap"]) == 0
     assert "/workspace/lock/gpu" in capsys.readouterr().err
+
+
+def _dead_claim(directory, owner="ghost", pid=4000000):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    p = directory / f"{owner}.lock.json"
+    p.write_text(json.dumps({"pid": pid, "owner": owner, "cmd": ["t"],
+                             "started_at": "2026-08-05T00:00:00Z"}))
+    return p
+
+
+def test_reap_sweeps_every_directory_a_claim_could_be_in(
+        tmp_path, monkeypatch, capsys):
+    """`--reap` is what an operator runs when a card looks held by nothing,
+    and the record they are chasing is as likely to be under the default
+    directory as under their own `$GPU_CLAIM_DIR` -- an interactive shell
+    and a supervisor unit disagree about that variable, which is the whole
+    of issue #19. Sweeping only one of them leaves the other's dead records
+    exempting reused pids with nothing to clear them (issue #21).
+    """
+    default = tmp_path / "default"
+    monkeypatch.setattr(claim, "DEFAULT_CLAIM_DIR", str(default))
+    mine = _dead_claim(tmp_path, "ghost-mine")
+    theirs = _dead_claim(default, "ghost-default")
+
+    assert cli_claim.main(["--reap"]) == 0
+
+    assert not mine.exists() and not theirs.exists()
+    err = capsys.readouterr().err
+    assert "ghost-mine" in err and "ghost-default" in err
+
+
+def test_reap_names_a_record_it_may_not_remove(tmp_path, monkeypatch, capsys):
+    """The sweep now reaches `/var/lock/gpu`, where another user's record
+    is not this process's to unlink. Silence would report a card as freed
+    while the record still holds it."""
+    from gpuqueue import ledger as lg
+    stuck = _dead_claim(tmp_path, "someone-else")
+    monkeypatch.setattr(lg, "remove", _refuse_remove)
+
+    assert cli_claim.main(["--reap"]) == 0
+
+    err = capsys.readouterr().err
+    assert str(stuck) in err, err
+    assert "could not" in err.lower(), err
+    assert "released stale claim" not in err, err
+
+
+def _refuse_remove(rec):
+    raise PermissionError(13, "Operation not permitted")
+
+
+def test_reap_sweeps_the_directory_the_runner_is_configured_to_read(
+        tmp_path, monkeypatch, capsys):
+    """The third directory, and on the deployed box the important one.
+
+    `docs/deploying.md` describes exactly this shape: the daemon reads
+    `[queue].claim_dir` out of `$GPUQ_CONFIG`, while an interactive shell
+    -- which never inherits the unit's `$GPU_CLAIM_DIR` -- lands on the
+    default. Nearly every record on such a box is therefore under the
+    runner's directory, and `all_claim_dirs()` cannot name it: it resolves
+    the environment of *this* process. A `--reap` built from that list
+    alone opens neither the directory holding the card nor says so; it
+    prints nothing, which reads as "nothing was stale".
+
+    The config file is the one thing both sides can read, and
+    `_warn_if_the_runner_reads_elsewhere` already reads it on every
+    invocation -- so the directory is in hand, and leaving it out of the
+    sweep is the same drift between two lists that issue #21 was.
+    """
+    runners = tmp_path / "runnerdir"
+    _runner_reads(tmp_path, monkeypatch, str(runners))
+    ghost = _dead_claim(runners, "ghost-runner")
+
+    assert cli_claim.main(["--reap"]) == 0
+
+    assert not ghost.exists(), "the record holding the card was never read"
+    assert "ghost-runner" in capsys.readouterr().err
+
+
+def test_reap_says_why_it_could_not_remove_a_record(tmp_path, monkeypatch,
+                                                    capsys):
+    """`OSError` out of the unlink is not only "another user's file".
+
+    A read-only remount of `/var/lock`, a stale NFS handle and an
+    exhausted inode table all reach the same branch, and the errno is the
+    only thing that tells them apart. Naming a cause the kernel did not
+    give sends the one operator already mid-incident to go find an owner
+    who is not the problem.
+    """
+    import errno
+    from gpuqueue import ledger as lg
+    stuck = _dead_claim(tmp_path, "mine")
+
+    def _readonly(rec):
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    monkeypatch.setattr(lg, "remove", _readonly)
+
+    assert cli_claim.main(["--reap"]) == 0
+
+    err = capsys.readouterr().err
+    assert str(stuck) in err, err
+    assert "Read-only file system" in err, err
+    assert "another user" not in err, err

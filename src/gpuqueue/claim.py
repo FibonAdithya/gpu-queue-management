@@ -43,7 +43,7 @@ def claim_dir() -> Path:
     return Path(os.environ.get("GPU_CLAIM_DIR", DEFAULT_CLAIM_DIR))
 
 
-def all_claim_dirs() -> list[Path]:
+def all_claim_dirs(extra=None) -> list[Path]:
     """Every directory a claim on this box could have been written to.
 
     `claim_dir()` answers "where do *I* write", and that is a different
@@ -68,10 +68,26 @@ def all_claim_dirs() -> list[Path]:
     import: the suite stubs it to keep the live `/var/lock/gpu` out of
     tests that take the bare path, and a name bound at import would make
     that stub silently do nothing.
+
+    `extra` is a directory the caller learned about some other way,
+    because this process's environment cannot name it: `[queue].claim_dir`
+    out of the config file, which is the daemon's answer and the one thing
+    an interactive shell can read it from. Both callers that have it pass
+    it -- `reaper._swept_dirs` and `gpu-claim --reap` -- and they go
+    through this one function rather than each appending it themselves,
+    because two spellings of "every directory a claim could be in" are two
+    lists that drift, which is the whole of issue #21.
+
+    Appended rather than prepended, so the ordinary two-entry answer keeps
+    the order above, and deduped on `.resolve()` like the rest: on every
+    box where the config and the environment agree it collapses away.
     """
     out: list[Path] = []
     seen: set[Path] = set()
-    for d in (claim_dir(), Path(DEFAULT_CLAIM_DIR)):
+    cands = [claim_dir(), Path(DEFAULT_CLAIM_DIR)]
+    if extra is not None:
+        cands.append(Path(extra))
+    for d in cands:
         try:
             key = d.resolve()
         except OSError:
@@ -159,15 +175,71 @@ def list_claims(directory: Path | None = None) -> list[tuple[Path, dict]]:
     return [(r.path, r.to_dict()) for r in ledger.all_records(d)]
 
 
-def release_stale(directory: Path | None = None) -> list[dict]:
-    """Remove records whose owning pid is gone. Returns what it freed."""
-    d = Path(directory) if directory else claim_dir()
-    released = []
-    for r in ledger.all_records(d):
-        if not pid_alive(r.pid):
-            released.append(r.to_dict())
+def _sweep_one(directory: Path, released: list[dict], stuck: list[dict]) -> None:
+    """Remove one directory's dead records, and let the kernel decide which
+    of them are ours to remove.
+
+    Ownership is not re-derived here. A record whose owning pid is gone is
+    garbage for every reader of that ledger, wherever it sits; the only
+    open question is whether this process may unlink it, and the
+    filesystem already answers exactly that question. `/var/lock` is
+    sticky and world-writable, so another user's record there raises
+    EPERM and stays -- reported rather than deleted, and rather than
+    propagating out of `reap()` into the runner's tick, which is the crash
+    path that did not exist while the sweep only ever read a directory
+    bootstrap creates for the runner (issue #21).
+
+    Appended *after* the unlink lands, not before: a record named in
+    `released` while it is still on disk tells the operator the card was
+    freed by a claim that is still holding it.
+    """
+    for r in ledger.all_records(directory):
+        if pid_alive(r.pid):
+            continue
+        try:
             ledger.remove(r)
-    return released
+        except OSError as e:
+            # The path, unlike a released record, because this one is still
+            # there and the operator reading the log is who has to remove
+            # it -- and the kernel's own reason beside it, because EACCES
+            # on another user's file is only the expected way to land here
+            # and a reader told the expected cause for an unexpected errno
+            # goes looking in the wrong place.
+            stuck.append(dict(r.to_dict(), path=str(r.path),
+                              error=e.strerror or str(e)))
+            continue
+        released.append(r.to_dict())
+
+
+def sweep_stale(directories) -> tuple[list[dict], list[dict]]:
+    """Sweep every claim directory given. Returns (released, stuck).
+
+    Plural on purpose, and the plural is the point. `own_pids` exempts a
+    pid claimed under *any* of `all_claim_dirs()` -- that is the fix for
+    issue #19 and it is the right one -- while the sweep read `claim_dir()`
+    alone. Dead records under the other directory were therefore removed by
+    nothing: they accumulated for the life of the box, and every one of
+    them was an exemption waiting for the kernel to reuse its pid, at which
+    point that live and entirely unrelated process, and its whole
+    descendant tree, was spared from the orphan sweep.
+
+    So the invariant this exists to hold is that *every directory that can
+    grant an exemption is swept by the same tick* -- see
+    `reaper._swept_dirs`, which builds one list and hands it both to this
+    and to the kill line that names what was consulted.
+    """
+    released: list[dict] = []
+    stuck: list[dict] = []
+    for d in directories:
+        _sweep_one(Path(d), released, stuck)
+    return released, stuck
+
+
+def release_stale(directory: Path | None = None) -> list[dict]:
+    """Remove one directory's records whose owning pid is gone. Returns
+    what it freed -- and only what it actually freed."""
+    d = Path(directory) if directory else claim_dir()
+    return sweep_stale([d])[0]
 
 
 def _refuse_if_too_big(key: str, vram_mb: int | None,

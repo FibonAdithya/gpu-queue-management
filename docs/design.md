@@ -226,8 +226,15 @@ holder as far as the ledger is concerned, so a process that keeps running
 after it is done with the card, but never removes its record, keeps its
 declared VRAM off the ledger for everyone else until it exits. Records
 left behind by a pid that is already dead are a different case, covered
-by cleanup rather than protocol: `release_stale` clears those every poll,
-which is recovery from a crash, not a substitute for a holder releasing
+by cleanup rather than protocol: the sweep clears those every poll, in
+every directory a claim on this box could be in. That is the same set the
+orphan sweep's exemption is built from, deliberately -- a ledger that can
+spare a process from a SIGKILL has to be a ledger something cleans, or its
+dead records pile up until the kernel reuses one of their pids and the
+exemption lands on a stranger. A record another user left in a
+world-writable directory is reported rather than removed: what is ours to
+unlink is the filesystem's decision, not one this daemon re-derives. All
+of it is recovery from a crash, not a substitute for a holder releasing
 itself.
 
 Enforcement stays advisory, with two additions. Preflight refuses to start
