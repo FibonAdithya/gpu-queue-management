@@ -89,6 +89,9 @@ class Runner:
         # say "declared 512 MiB, using 3070" instead of "exit -9"
         self._convicted: dict[str, dict] = {}
         self._last_conviction: float | None = None
+        # The record paths the sweep found stale but was refused permission
+        # to remove, as of the last tick that reported them. See _reap.
+        self._stuck_claims: set[str] = set()
         # Consecutive admit passes that could not identify the card. See
         # the GpuIdError branch in `admit`.
         self._gpuid_strikes = 0
@@ -229,6 +232,29 @@ class Runner:
         result = reap(self.queue, self.cfg, active_ids=set(self.active),
                       include_orphan_cuda=sweep,
                       vram_strikes=self._vram_strikes)
+        # A stale record the sweep may not unlink. `claim.sweep_stale` now
+        # covers every directory that can grant an exemption, and one of
+        # them is `/var/lock/gpu` -- sticky and world-writable, so a record
+        # another user left there raises EPERM and stays. While it stays it
+        # goes on offering an exemption to whatever process the kernel
+        # gives that pid next, which is the unbounded window issue #21 is
+        # about, so the person who *can* remove it is told where it is.
+        #
+        # Reported when the set changes rather than on every tick: this
+        # path runs at the poll interval and the condition is permanent by
+        # nature, so an ungated line repeats until the operator stops
+        # reading the log. A record that appears, is removed by its owner
+        # and comes back is new again, because the set is replaced rather
+        # than accumulated.
+        stuck = {r.get("path", ""): r for r in result.get("stuck_claims") or []}
+        for path in sorted(stuck.keys() - self._stuck_claims):
+            rec = stuck[path]
+            log.warning(
+                "stale claim %s (pid %s, %s) is not this runner's to remove; "
+                "it will go on exempting whatever process the kernel gives "
+                "that pid next until its owner clears it",
+                path, rec.get("pid"), rec.get("owner"))
+        self._stuck_claims = set(stuck)
         killed = result.get("killed_pids") or []
         if killed:
             # `killed_pids` went unlogged from the day it was returned. The

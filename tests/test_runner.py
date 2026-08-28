@@ -1485,3 +1485,68 @@ def test_a_sweep_that_killed_nothing_says_nothing(env, monkeypatch, caplog):
 
     assert not [m for m in caplog.messages if "/var/lock/gpu" in m], \
         "an idle sweep must not name a ledger once a minute forever"
+
+
+def _stuck(path, owner="someone-else", pid=4000000):
+    return {"pid": pid, "usage_pid": pid, "vram_mb": 512, "owner": owner,
+            "cmd": ["python", "train.py"], "started_at": "2026-08-10T00:00:00Z",
+            "key": "GPU-a", "path": path}
+
+
+def test_a_stale_claim_the_sweep_may_not_remove_is_logged(env, monkeypatch,
+                                                          caplog):
+    """The widened sweep reaches `/var/lock/gpu`, which is sticky and
+    world-writable, so a record another user left there is not the daemon's
+    to unlink. It stays, and while it stays it goes on offering an
+    exemption to whatever process the kernel gives that pid next -- so the
+    one person who can remove it has to be told it is there, and where.
+    """
+    r, _sha = env
+    rec = _stuck("/var/lock/gpu/GPU-a.lock.d/4000000.json")
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {"stuck_claims": [rec]})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+
+    assert any(rec["path"] in m and "someone-else" in m
+               for m in caplog.messages), caplog.messages
+
+
+def test_a_stale_claim_it_may_not_remove_is_not_re_logged_every_tick(
+        env, monkeypatch, caplog):
+    """`_reap` runs on every tick, and this condition is permanent by
+    nature: the record is not ours to remove, so it is still there on the
+    next tick and the one after that. Ungated, one foreign record fills the
+    log at the poll interval forever -- and a log that says the same thing
+    every two seconds is one nobody reads the day something else goes
+    wrong.
+    """
+    r, _sha = env
+    rec = _stuck("/var/lock/gpu/GPU-a.lock.d/4000000.json")
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {"stuck_claims": [rec]})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+        r._reap()
+
+    assert sum(rec["path"] in m for m in caplog.messages) == 1
+
+
+def test_a_second_stale_claim_is_logged_after_the_first(env, monkeypatch,
+                                                        caplog):
+    """Gated on which records are stuck, not on whether it has ever
+    warned. A ledger accumulating a *second* unremovable record is new
+    information, and it is the growth issue #21 is about."""
+    r, _sha = env
+    first = _stuck("/var/lock/gpu/GPU-a.lock.d/4000000.json")
+    second = _stuck("/var/lock/gpu/GPU-b.lock.d/4000001.json", pid=4000001)
+    stuck = [first]
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {"stuck_claims": stuck})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+        stuck.append(second)
+        r._reap()
+
+    assert sum(second["path"] in m for m in caplog.messages) == 1
+    assert sum(first["path"] in m for m in caplog.messages) == 1

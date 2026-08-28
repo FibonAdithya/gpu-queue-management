@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from . import ledger
-from .claim import release_stale, claim_dir, all_claim_dirs
+from .claim import sweep_stale, claim_dir, all_claim_dirs
 from .config import RunnerConfig
 from .preflight import compute_apps, own_pids
 from .procs import descendants, pid_alive
@@ -105,7 +105,7 @@ def _running_trees(queue: QueueRoot) -> set[int]:
     The whole tree, because the parts of one `reap()` call would otherwise
     disagree about the same job. Supervisor restarts the runner
     while a GPU job is running; the job survives, since it was started with
-    `start_new_session=True`. On the next tick `release_stale` deletes that
+    `start_new_session=True`. On the next tick the claim sweep deletes that
     job's ledger record -- the record carries the *dead runner's* pid, not
     the job's -- and `requeue_orphans` deliberately leaves the job alone,
     because `spec.pid` is still alive. The sweep then arrives at a job with
@@ -280,6 +280,44 @@ def check_vram(records: list, apps: list[dict],
 
 
 
+def _swept_dirs(attributed_from) -> list[Path]:
+    """Every claim directory this sweep is responsible for.
+
+    One list, two uses, and that is the point. It is what `reap` releases
+    stale records from and what `_consulted_dirs` names as the ledgers a
+    claim would have spared a process from -- so a directory that can grant
+    an exemption is a directory something sweeps. Issue #21 was those two
+    answers drifting apart: `own_pids` read both of `all_claim_dirs()`
+    while the sweep read `cfg.claim_dir` alone, so dead records under the
+    other one were removed by nothing, accumulated for the life of the box,
+    and each sat there as an exemption waiting for the kernel to reuse its
+    pid.
+
+    `attributed_from` is a third directory only when `[queue].claim_dir`
+    and the reaper's own `$GPU_CLAIM_DIR` diverge -- a split `cli_runner`
+    warns about and permits -- and on every ordinary box it dedups away.
+
+    Appended rather than prepended so the ordinary two-entry answer keeps
+    the order `all_claim_dirs` chose. Deduped on `.resolve()` for the same
+    reason it is, and falling back to the literal path on OSError for the
+    same reason: a directory we cannot canonicalise is still one a claim
+    may be sitting in, and dropping it here would drop both an exemption
+    and the sweep that bounds it.
+    """
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for cand in all_claim_dirs() + [Path(attributed_from)]:
+        try:
+            key = cand.resolve()
+        except OSError:
+            key = cand
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cand)
+    return out
+
+
 def _consulted_dirs(attributed_from) -> list[str]:
     """Every claim directory a live claim in which would have spared a
     process from this sweep.
@@ -298,24 +336,11 @@ def _consulted_dirs(attributed_from) -> list[str]:
     sent the one reader already debugging a kill after the wrong
     divergence. Chasing the wrong divergence is the whole of issue #19.
 
-    Appended rather than prepended so the ordinary two-entry answer keeps
-    the order `all_claim_dirs` chose. Deduped on `.resolve()` for the same
-    reason it is, and falling back to the literal path on OSError for the
-    same reason: a directory we cannot canonicalise was still consulted,
-    and dropping it here would understate what the sweep read.
+    The same list `_swept_dirs` builds, spelled for the log line: what
+    spares a process and what gets swept must not be two lists that can
+    drift apart.
     """
-    out: list[str] = []
-    seen: set[Path] = set()
-    for cand in all_claim_dirs() + [Path(attributed_from)]:
-        try:
-            key = cand.resolve()
-        except OSError:
-            key = cand
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(str(cand))
-    return out
+    return [str(d) for d in _swept_dirs(attributed_from)]
 
 
 def reap(queue: QueueRoot, cfg: RunnerConfig,
@@ -332,7 +357,10 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
     so the runner puts them on a timer and passes include_orphan_cuda=False
     the rest of the time.
     """
-    stale = release_stale(cfg.claim_dir)
+    # One directory list for the sweep and for the kill line below, so a
+    # ledger that can grant an exemption is a ledger something sweeps.
+    claims = cfg.claim_dir if cfg.claim_dir else claim_dir()
+    stale, stuck = sweep_stale(_swept_dirs(claims))
     requeued, failed = requeue_orphans(queue, active_ids)
     killed, convicted = [], []
     # Where a claim would have spared a process from `kill_orphan_cuda`,
@@ -368,13 +396,12 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
             # consumer runs, and walking the claim directory to build
             # records nothing will read is pure cost on every sweep of a
             # box where nvidia-smi is broken.
-            d = cfg.claim_dir if cfg.claim_dir else claim_dir()
-            records = ledger.live_records(ledger.all_records(d))
+            records = ledger.live_records(ledger.all_records(claims))
             if cfg.kill_orphan_cuda:
                 protect = _running_trees(queue)
                 # What the log names, so it names what was consulted
                 # rather than what we assume it consulted.
-                exemption_dirs = _consulted_dirs(d)
+                exemption_dirs = _consulted_dirs(claims)
                 killed = kill_orphan_cuda(protect, records, apps)
             if cfg.enforce_vram and vram_strikes is not None:
                 convicted = check_vram(records, apps, vram_strikes)
@@ -389,6 +416,7 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
                     c["killed"] = bool(c["usage_pid"]) and _kill_tree(
                         c["usage_pid"])
     cleaned = clean_partials(queue)
-    return {"stale_claims": stale, "requeued": requeued, "failed": failed,
+    return {"stale_claims": stale, "stuck_claims": stuck,
+            "requeued": requeued, "failed": failed,
             "killed_pids": killed, "cleaned_paths": cleaned,
             "convicted": convicted, "exemption_dirs": exemption_dirs}

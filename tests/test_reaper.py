@@ -24,7 +24,7 @@ def cfg(q):
 
 @pytest.fixture(autouse=True)
 def no_gpu_calls(monkeypatch):
-    monkeypatch.setattr(rp, "release_stale", lambda directory=None: [])
+    monkeypatch.setattr(rp, "sweep_stale", lambda directories: ([], []))
     monkeypatch.setattr(rp, "compute_apps", lambda: [])
     monkeypatch.setattr(rp, "own_pids", lambda: set())
     # Attribution now walks each record's process tree; without this every
@@ -75,8 +75,9 @@ def test_requeues_running_job_with_no_pid_when_not_active(q, cfg):
     assert reap(q, cfg, active_ids=set())["requeued"] == ["j1"]
 
 def test_releases_stale_claims(q, cfg, monkeypatch):
-    monkeypatch.setattr(rp, "release_stale",
-                        lambda directory=None: [{"pid": 999, "owner": "ghost"}])
+    monkeypatch.setattr(
+        rp, "sweep_stale",
+        lambda directories: ([{"pid": 999, "owner": "ghost"}], []))
     assert reap(q, cfg)["stale_claims"] == [{"pid": 999, "owner": "ghost"}]
 
 def test_removes_part_files(q, cfg):
@@ -808,3 +809,107 @@ def test_the_reported_dirs_include_the_ledger_it_attributed_from(q, tmp_path):
         "a live claim in it spares a process exactly as an exemption does")
     assert dirs[:2] == [str(d) for d in _cl.all_claim_dirs()], \
         "appended, so an ordinary box where the two agree still reports two"
+
+
+@pytest.fixture
+def real_sweep(monkeypatch):
+    """Undo the autouse stub for the tests that are about what the sweep
+    does *to* the filesystem. Every directory it can reach is a tmp_path:
+    `conftest` points both `$GPU_CLAIM_DIR` and `DEFAULT_CLAIM_DIR` at one.
+    """
+    monkeypatch.setattr(rp, "sweep_stale", _cl.sweep_stale)
+
+
+@pytest.fixture
+def diverged(tmp_path, monkeypatch):
+    """The three directories a claim on this box can be in, all different.
+
+    An ordinary box collapses these to one and every assertion about
+    *which* of them was swept passes whether or not the code reads more
+    than one. The split is real: the daemon takes `$GPU_CLAIM_DIR` from a
+    supervisor unit, an interactive shell does not inherit it, and
+    `[queue].claim_dir` is a third answer `cli_runner` warns about and
+    permits.
+    """
+    daemon, default = tmp_path / "daemon", tmp_path / "default"
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(daemon))
+    monkeypatch.setattr(_cl, "DEFAULT_CLAIM_DIR", str(default))
+    return daemon, default, tmp_path / "configured"
+
+
+def test_reap_releases_a_stale_record_under_the_default_claim_dir(
+        q, diverged, real_sweep):
+    """Nothing swept `/var/lock/gpu` (issue #21).
+
+    `kill_orphan_cuda` exempts a pid claimed under either the reaper's own
+    `$GPU_CLAIM_DIR` or the default -- the #19 fix -- but `reap` released
+    stale claims from `cfg.claim_dir` alone. Records under the default
+    accumulated for the life of the box, and the moment the kernel reused
+    one of those pids that live, unrelated process and its whole descendant
+    tree became exempt from the orphan sweep.
+    """
+    _daemon, default, configured = diverged
+    _write_claim(default, 4000000)              # a pid that is long gone
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=False,
+                       claim_dir=configured)
+
+    result = reap(q, cfg)
+
+    from gpuqueue import ledger as lg
+    assert [r["owner"] for r in result["stale_claims"]] == ["someone"]
+    assert lg.all_records(default) == [], \
+        "a dead record left here goes on granting exemptions to a reused pid"
+
+
+def test_reap_survives_a_stale_record_it_may_not_remove(
+        q, diverged, real_sweep, monkeypatch):
+    """`/var/lock` is sticky and world-writable, so the widened sweep now
+    reaches records that are not the daemon's to unlink. `ledger.remove`
+    has no EPERM branch, and this crash path -- out of `release_stale`,
+    through `reap`, into `Runner._reap` -- did not exist while the sweep
+    only read a directory bootstrap creates for the runner.
+    """
+    _daemon, default, configured = diverged
+    _write_claim(default, 4000000)
+    from gpuqueue import ledger as lg
+    monkeypatch.setattr(lg, "remove", _cl_refuse)
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=False,
+                       claim_dir=configured)
+
+    result = reap(q, cfg)
+
+    assert result["stale_claims"] == [], "it did not free what it left behind"
+    assert [r["owner"] for r in result["stuck_claims"]] == ["someone"]
+    assert result["stuck_claims"][0]["path"].startswith(str(default)), \
+        "the operator who has to remove it by hand needs the path"
+
+
+def test_the_sweep_covers_every_ledger_that_can_grant_an_exemption(
+        q, diverged, monkeypatch):
+    """The invariant issue #21 is the violation of.
+
+    Two mechanisms spare a process from `kill_orphan_cuda`: `own_pids`
+    exempts a pid claimed under any of `all_claim_dirs()`, and
+    `ledger.attribute` never calls a pid claimed under `cfg.claim_dir`
+    unledgered in the first place. `exemption_dirs` is already the list of
+    both, because that is what the kill line has to name. A directory on
+    that list that the sweep does not visit is a ledger whose dead records
+    nothing removes -- which is the bug, stated once, where a future change
+    to either list has to trip over it.
+    """
+    _daemon, _default, configured = diverged
+    swept: list = []
+    monkeypatch.setattr(rp, "sweep_stale",
+                        lambda dirs: (swept.extend(dirs), ([], []))[1])
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=configured)
+
+    result = reap(q, cfg)
+
+    assert len(result["exemption_dirs"]) == 3, \
+        "the three directories must genuinely diverge or this proves nothing"
+    assert [str(d) for d in swept] == result["exemption_dirs"]
+
+
+def _cl_refuse(rec):
+    raise PermissionError(13, "Operation not permitted")

@@ -4,6 +4,8 @@ from gpuqueue import cli_claim
 from gpuqueue.claim import ClaimBusy
 from gpuqueue.preflight import PreflightFailed
 from gpuqueue.gpuid import GpuIdError
+from pathlib import Path
+from gpuqueue import claim
 
 KEY = "4b8f2c1a-0000-0000-0000-000000000001"
 
@@ -343,3 +345,53 @@ def test_reap_warns_too(tmp_path, monkeypatch, capsys):
     _runner_reads(tmp_path, monkeypatch, "/workspace/lock/gpu")
     assert cli_claim.main(["--reap"]) == 0
     assert "/workspace/lock/gpu" in capsys.readouterr().err
+
+
+def _dead_claim(directory, owner="ghost", pid=4000000):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    p = directory / f"{owner}.lock.json"
+    p.write_text(json.dumps({"pid": pid, "owner": owner, "cmd": ["t"],
+                             "started_at": "2026-08-05T00:00:00Z"}))
+    return p
+
+
+def test_reap_sweeps_every_directory_a_claim_could_be_in(
+        tmp_path, monkeypatch, capsys):
+    """`--reap` is what an operator runs when a card looks held by nothing,
+    and the record they are chasing is as likely to be under the default
+    directory as under their own `$GPU_CLAIM_DIR` -- an interactive shell
+    and a supervisor unit disagree about that variable, which is the whole
+    of issue #19. Sweeping only one of them leaves the other's dead records
+    exempting reused pids with nothing to clear them (issue #21).
+    """
+    default = tmp_path / "default"
+    monkeypatch.setattr(claim, "DEFAULT_CLAIM_DIR", str(default))
+    mine = _dead_claim(tmp_path, "ghost-mine")
+    theirs = _dead_claim(default, "ghost-default")
+
+    assert cli_claim.main(["--reap"]) == 0
+
+    assert not mine.exists() and not theirs.exists()
+    err = capsys.readouterr().err
+    assert "ghost-mine" in err and "ghost-default" in err
+
+
+def test_reap_names_a_record_it_may_not_remove(tmp_path, monkeypatch, capsys):
+    """The sweep now reaches `/var/lock/gpu`, where another user's record
+    is not this process's to unlink. Silence would report a card as freed
+    while the record still holds it."""
+    from gpuqueue import ledger as lg
+    stuck = _dead_claim(tmp_path, "someone-else")
+    monkeypatch.setattr(lg, "remove", _refuse_remove)
+
+    assert cli_claim.main(["--reap"]) == 0
+
+    err = capsys.readouterr().err
+    assert str(stuck) in err, err
+    assert "could not" in err.lower(), err
+    assert "released stale claim" not in err, err
+
+
+def _refuse_remove(rec):
+    raise PermissionError(13, "Operation not permitted")

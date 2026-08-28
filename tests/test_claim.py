@@ -6,7 +6,7 @@ import threading
 import pytest
 from gpuqueue import ledger as lg
 from gpuqueue.claim import (gpu_claim, ClaimBusy, MutexTimeout, read_claim,
-                            pid_alive, list_claims, release_stale,
+                            pid_alive, list_claims, release_stale, sweep_stale,
                             default_usable_mb)
 
 KEY = "4b8f2c1a-0000-0000-0000-000000000001"
@@ -545,3 +545,93 @@ def test_the_default_is_read_at_call_time(tmp_path, monkeypatch):
     monkeypatch.setenv("GPU_CLAIM_DIR", str(tmp_path / "env"))
     monkeypatch.setattr(_claim, "DEFAULT_CLAIM_DIR", str(tmp_path / "moved"))
     assert _P(tmp_path / "moved") in _claim.all_claim_dirs()
+
+
+def _dead_record(directory, owner="ghost", pid=4000000):
+    """A record whose owning pid is gone, in a directory of your choosing.
+
+    Which directory is the variable under test below: `own_pids` exempts a
+    pid claimed under any of `all_claim_dirs()`, so a record left in any of
+    them goes on granting exemptions whatever the sweep happens to read.
+    """
+    rec = lg.Record(path=lg.ledger_dir(KEY, directory) / f"{pid}.dead.json",
+                    pid=pid, usage_pid=pid, vram_mb=512, owner=owner,
+                    cmd=["x"], started_at="2026-08-10T00:00:00Z", key=KEY)
+    lg.write_record(rec)
+    return rec
+
+
+def _refuse(rec):
+    raise PermissionError(13, "Operation not permitted")
+
+
+def test_sweep_stale_sweeps_every_directory_it_is_given(tmp_path):
+    """One sweep, every ledger that can grant an exemption.
+
+    `reap` swept `cfg.claim_dir` alone while `own_pids` read both it and
+    `DEFAULT_CLAIM_DIR`, so dead records under the default accumulated for
+    the life of the box and each one was an exemption waiting for the
+    kernel to reuse its pid (issue #21).
+    """
+    a, b = tmp_path / "a", tmp_path / "b"
+    _dead_record(a, "ghost-a")
+    _dead_record(b, "ghost-b")
+
+    released, stuck = sweep_stale([a, b])
+
+    assert sorted(r["owner"] for r in released) == ["ghost-a", "ghost-b"]
+    assert stuck == []
+    assert list_claims(a) == [] and list_claims(b) == []
+
+
+def test_sweep_stale_keeps_a_live_record(tmp_path):
+    with gpu_claim(key=KEY, directory=tmp_path, usable_mb=7676):
+        assert sweep_stale([tmp_path]) == ([], [])
+        assert len(list_claims(tmp_path)) == 1
+
+
+def test_sweep_stale_reports_a_record_it_may_not_remove_as_stuck(
+        tmp_path, monkeypatch):
+    """`/var/lock` is sticky and world-writable, so a record another user
+    left there is not this process's to unlink, and `ledger.remove` has no
+    EPERM branch. Unguarded, the widened sweep propagates that errno out of
+    `release_stale` -> `reap` -> `Runner._reap` and kills the tick.
+
+    Carries the path, unlike a released record: this one is still on disk
+    and the operator reading the log is the one who has to go remove it.
+    """
+    rec = _dead_record(tmp_path, "someone-else")
+    monkeypatch.setattr(lg, "remove", _refuse)
+
+    released, stuck = sweep_stale([tmp_path])
+
+    assert released == []
+    assert [(r["owner"], r["path"]) for r in stuck] == \
+        [("someone-else", str(rec.path))]
+    assert len(list_claims(tmp_path)) == 1
+
+
+def test_release_stale_reports_only_what_it_actually_removed(
+        tmp_path, monkeypatch):
+    """A record reported as released while it is still on disk tells the
+    operator the card was freed by a claim that is still holding it."""
+    _dead_record(tmp_path, "someone-else")
+    monkeypatch.setattr(lg, "remove", _refuse)
+
+    assert release_stale(tmp_path) == []
+    assert len(list_claims(tmp_path)) == 1
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root unlinks regardless")
+def test_sweep_stale_survives_a_real_unwritable_directory(tmp_path):
+    """The monkeypatched EPERM above proves the branch; this proves the
+    branch is the one the kernel actually takes."""
+    rec = _dead_record(tmp_path, "someone-else")
+    os.chmod(rec.path.parent, 0o555)
+    try:
+        released, stuck = sweep_stale([tmp_path])
+    finally:
+        os.chmod(rec.path.parent, 0o755)
+
+    assert released == []
+    assert [r["path"] for r in stuck] == [str(rec.path)]

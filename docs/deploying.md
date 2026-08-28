@@ -246,7 +246,11 @@ perfectly the whole time -- it is the person at the keyboard who diverges.
 
 The orphan sweep now exempts a claim under **either** the reaper's
 `$GPU_CLAIM_DIR` or `/var/lock/gpu`, so this no longer gets your trainer
-SIGKILLed. What it still costs you is accounting: the runner's ledger does not
+SIGKILLed, and it releases stale records from both, so a dead claim of
+yours in either one stops holding the card within a poll. A record the
+daemon is refused permission to remove -- another user's, in a
+world-writable directory -- is named in the runner log once, with its
+path, because clearing it needs the person who owns it. What it still costs you is accounting: the runner's ledger does not
 count a claim it cannot see, so `gpu_max_jobs` and the VRAM budget will admit
 a job straight on top of yours. `gpu-claim` says so when it can tell -- it
 compares where it is about to write against `[queue].claim_dir` in
