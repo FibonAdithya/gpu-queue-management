@@ -90,6 +90,50 @@ def own_pids(directory=None) -> set[int]:
     return pids
 
 
+def own_scopes(directory=None) -> set[str]:
+    """Every cgroup scope the claim protocol accounts for.
+
+    The scope half of `own_pids`, deliberately built as a sibling rather
+    than folded into it: `own_pids` stays exactly as issue #19 left it.
+    What the two share is breadth, and that is the whole reason this
+    exists. `kill_orphan_cuda` took its scope exemption from
+    `ledger.attribute` alone, over records read from one directory
+    (`cfg.claim_dir`), while its pid exemption came from a bare
+    `own_pids()` reading every directory a claim could be in. So a
+    `--scope-pid` claim written to a directory in `all_claim_dirs()` that
+    is not `cfg.claim_dir` had its wrapper's pid tree spared and its
+    *container* SIGKILLed -- while a plain `gpu-claim -- python train.py`
+    in the same setup survived, because its trainer is a descendant.
+
+    That divergence is not hypothetical. `cli_claim` already documents
+    that the daemon reads `[queue].claim_dir` while "this process's
+    environment cannot name it": an interactive shell and a supervisor
+    unit systematically disagree about `$GPU_CLAIM_DIR`, which is issue
+    #19. Without this, a correctly formed `gpu-claim --scope-pid $(docker
+    inspect ...)` issued from a shell exempts nothing.
+
+    `scope_is_live` is consulted, so a record whose anchor died or whose
+    container restarted onto a fresh scope id exempts nothing. A void
+    scope left standing is an amnesty for whatever the kernel puts at
+    that path next -- the same unbounded window issue #21 was about, one
+    mechanism over.
+
+    An explicit `directory=` still means exactly that one, for the reason
+    `own_pids` gives: a caller who names a directory is asking about that
+    directory.
+
+    Over-exempting is the safe way to be wrong here, same as `own_pids`:
+    this is the last check before a SIGKILL.
+    """
+    scopes: set[str] = set()
+    dirs = [Path(directory)] if directory else all_claim_dirs()
+    for d in dirs:
+        for rec in ledger.live_records(ledger.all_records(d)):
+            if rec.scope_cgroup and ledger.scope_is_live(rec):
+                scopes.add(rec.scope_cgroup)
+    return scopes
+
+
 def unledgered_processes(allow: set[int] | None = None,
                          directory=None) -> list[dict]:
     """CUDA processes no live ledger record accounts for.

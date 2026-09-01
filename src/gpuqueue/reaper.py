@@ -13,7 +13,7 @@ from . import killlog
 from . import ledger
 from .claim import sweep_stale, claim_dir, all_claim_dirs
 from .config import RunnerConfig
-from .preflight import compute_apps, own_pids
+from .preflight import compute_apps, own_pids, own_scopes
 from .procs import descendants, pid_alive
 from .queue import QueueRoot
 
@@ -101,8 +101,23 @@ def kill_orphan_cuda(protect: set[int], records: list,
     # `test_a_claim_the_daemons_environment_cannot_see_is_still_spared`
     # catches the two-environment one that a single-process test cannot
     # express.
+    #
+    # `own_scopes()` is the same argument one mechanism over, and it is
+    # here for the same reason it is bare. The scope exemption used to
+    # live *only* inside `ledger.attribute` above, over `records` from a
+    # single directory, while the pid exemption beside it read every
+    # directory a claim could be in. A `--scope-pid` claim written to a
+    # directory in `all_claim_dirs()` that is not `cfg.claim_dir` then had
+    # its wrapper's pid tree spared and its container SIGKILLed, while a
+    # plain `gpu-claim -- python train.py` in the same setup survived
+    # because its trainer is a descendant. Two exemptions of different
+    # breadth is what issue #19 was; making them the same breadth is what
+    # fixed it, and a scope is not exempt from that.
     exempt = set(protect) | own_pids()
-    victims = [a for a in unledgered if a["pid"] not in exempt]
+    scopes = own_scopes()
+    victims = [a for a in unledgered
+               if a["pid"] not in exempt
+               and not any(cgroups.in_scope(a["pid"], s) for s in scopes)]
     if not victims:
         return []
     # Read before signalling: /proc/<pid>/cgroup is gone the moment the

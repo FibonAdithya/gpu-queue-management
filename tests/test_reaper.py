@@ -332,6 +332,130 @@ def test_own_pids_given_a_directory_reads_only_that_one(
     assert holder in _pf.own_pids(), "the bare call must still widen"
 
 
+# --- the scope exemption, at the same breadth as the pid one -------------
+#
+# `kill_orphan_cuda` builds its exemption from two sources, and until this
+# section they were not the same width. The *pid* half is `own_pids()`,
+# which reads every directory a claim could be in; the *scope* half lived
+# only in `ledger.attribute`, over records from `cfg.claim_dir` alone. So a
+# `--scope-pid` claim written to a directory that is in `all_claim_dirs()`
+# but is not `cfg.claim_dir` had its wrapper's pid tree spared and its
+# container SIGKILLed -- while a plain `gpu-claim -- python train.py` in
+# the same setup survived, because its trainer is a descendant.
+#
+# That split is issue #19's, not a hypothetical: `cli_claim` already
+# documents that the daemon reads `[queue].claim_dir` while an interactive
+# shell "cannot name it".
+
+_DOCKER_SCOPE = "/system.slice/docker-43faa0ee4d16.scope"
+
+
+def _write_scoped_claim(directory, anchor: int, scope: str):
+    """A `gpu-claim --scope-pid` record, in whichever directory that run's
+    own `$GPU_CLAIM_DIR` resolved to.
+
+    `usage_pid=None` on purpose: the container's CUDA process is not in the
+    claiming process's tree at all -- a `docker exec`'d process is a child
+    of the containerd-shim -- which is the whole reason a scope exists.
+    """
+    from gpuqueue import ledger as lg
+    path = lg.ledger_dir("GPU-test", directory) / f"{anchor}.aaa.json"
+    lg.write_record(lg.Record(
+        path=path, pid=anchor, usage_pid=None, vram_mb=512, owner="someone",
+        cmd=["docker", "exec", "trainer", "python", "train.py"],
+        started_at="2026-08-10T00:00:00Z", key="GPU-test",
+        scope_pid=anchor, scope_cgroup=scope))
+    return path
+
+
+def test_own_scopes_reads_every_directory_a_claim_could_be_in(
+        tmp_path, monkeypatch):
+    """The sibling of `test_own_pids_exempts_a_claim_written_under_the_
+    default_dir`, and it has to be a sibling rather than a widening of
+    `own_pids`: the spec keeps that function exactly as issue #19 left it.
+    """
+    daemon_dir = tmp_path / "daemon-claims"
+    daemon_dir.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(daemon_dir))
+    _write_scoped_claim(_cl.DEFAULT_CLAIM_DIR, _os.getpid(), _DOCKER_SCOPE)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": _DOCKER_SCOPE)
+
+    from gpuqueue import ledger as lg
+    assert lg.all_records(daemon_dir) == [], \
+        "the two environments must genuinely diverge or this proves nothing"
+
+    assert _pf.own_scopes() == {_DOCKER_SCOPE}
+
+
+def test_own_scopes_given_a_directory_reads_only_that_one(
+        tmp_path, monkeypatch):
+    """`own_pids`' convention, kept: a caller who names a directory is
+    asking about that directory, and widening the answer would make the
+    argument mean nothing."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    _write_scoped_claim(_cl.DEFAULT_CLAIM_DIR, _os.getpid(), _DOCKER_SCOPE)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": _DOCKER_SCOPE)
+
+    assert _pf.own_scopes(directory=empty) == set()
+    assert _pf.own_scopes() == {_DOCKER_SCOPE}, "the bare call must widen"
+
+
+def test_own_scopes_leaves_out_a_scope_that_has_gone_void(
+        tmp_path, monkeypatch):
+    """A record whose scope no longer holds covers nothing, so it must
+    exempt nothing. Otherwise a container that restarted onto a fresh
+    scope id leaves its predecessor's path standing as a permanent
+    amnesty for whatever the kernel puts there next."""
+    _write_scoped_claim(_cl.DEFAULT_CLAIM_DIR, _os.getpid(), _DOCKER_SCOPE)
+    # The anchor is alive -- it is this process -- but its cgroup is no
+    # longer the one the record claims.
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": "/system.slice/other")
+
+    assert _pf.own_scopes() == set()
+
+
+def test_a_scoped_claim_outside_the_configured_dir_still_spares_its_container(
+        q, tmp_path, monkeypatch):
+    """The outcome this branch exists to prevent, reached through the one
+    divergence the branch did not cover.
+
+    `[queue].claim_dir` and the daemon's `$GPU_CLAIM_DIR` agree here; it is
+    the interactive shell that diverges, exactly as in
+    `test_a_claim_the_daemons_environment_cannot_see_is_still_spared`. A
+    correctly formed `gpu-claim --scope-pid $(docker inspect ...)` issued
+    from that shell exempted nothing, and the container was SIGKILLed.
+    """
+    daemon_dir = tmp_path / "daemon-claims"
+    daemon_dir.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(daemon_dir))
+    _write_scoped_claim(_cl.DEFAULT_CLAIM_DIR, _os.getpid(), _DOCKER_SCOPE)
+
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=daemon_dir)
+    monkeypatch.setattr(rp, "own_pids", _pf.own_pids)   # undo the autouse stub
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": _DOCKER_SCOPE)
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 4321, "used_mb": 900,
+                                  "name": "tig-runtime"}])
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pytest.fail("signalled a claimed "
+                                                     "container"))
+
+    from gpuqueue import ledger as lg
+    assert lg.all_records(daemon_dir) == [], \
+        "the config and the daemon's environment must agree with each other"
+    assert 4321 not in _pf.own_pids(), \
+        "the pid-tree exemption must not be what spares it, or this proves "\
+        "nothing about scopes"
+
+    assert reap(q, cfg)["killed_pids"] == []
+
+
 def test_a_claim_the_daemons_environment_cannot_see_is_still_spared(
         q, tmp_path, holder_process, monkeypatch):
     """The reproduction, end to end: 14 of 29 runs on the deployment box,
