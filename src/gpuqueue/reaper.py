@@ -8,6 +8,7 @@ import signal
 import time
 from pathlib import Path
 
+from . import cgroups
 from . import ledger
 from .claim import sweep_stale, claim_dir, all_claim_dirs
 from .config import RunnerConfig
@@ -16,6 +17,13 @@ from .procs import descendants, pid_alive
 from .queue import QueueRoot
 
 MAX_ATTEMPTS = 1
+
+# Shorter than `_kill_tree`'s 10s on purpose. A convicted holder is one
+# we want to checkpoint; an unledgered process is contending for a card
+# someone may be blocked on, and this only has to be long enough for a
+# SIGTERM handler to write a line. Paid once per `orphan_cuda_interval_s`
+# inside the timer-gated sweep, not on every tick.
+ORPHAN_TERM_GRACE_S = 5.0
 
 
 def _signal(pid: int, sig: int) -> bool:
@@ -51,7 +59,8 @@ def requeue_orphans(queue: QueueRoot,
     return requeued, failed
 
 
-def kill_orphan_cuda(protect: set[int], records: list, apps: list[dict]) -> list[int]:
+def kill_orphan_cuda(protect: set[int], records: list,
+                     apps: list[dict]) -> list[dict]:
     """Kill CUDA processes no live claim accounts for.
 
     Takes `apps` rather than fetching them so one nvidia-smi call serves
@@ -92,10 +101,36 @@ def kill_orphan_cuda(protect: set[int], records: list, apps: list[dict]) -> list
     # catches the two-environment one that a single-process test cannot
     # express.
     exempt = set(protect) | own_pids()
-    killed = []
-    for app in unledgered:
-        if app["pid"] not in exempt and _kill(app["pid"]):
-            killed.append(app["pid"])
+    victims = [a for a in unledgered if a["pid"] not in exempt]
+    if not victims:
+        return []
+    # Read before signalling: /proc/<pid>/cgroup is gone the moment the
+    # process is, and this field is the one that tells the victim's
+    # operator it was their container and not their algorithm.
+    killed = [{"pid": a["pid"], "name": a.get("name"),
+               "used_mb": a.get("used_mb"),
+               "cgroup": cgroups.cgroup_of(a["pid"])}
+              for a in victims]
+    # SIGTERM everything, then one shared grace, then SIGKILL what is
+    # left. Batched rather than per-victim: a grace each would stall the
+    # runner tick by N x grace, and there is no reason the second
+    # victim's grace should start after the first's has finished.
+    #
+    # The ladder at all because a SIGKILLed process writes no stderr. Its
+    # caller sees `exit -9` with an empty message and reads it as its own
+    # bug -- on 2026-09-01 an agent rewrote a correct index and submitted
+    # a worse method on that reading (issue #24). `_kill_tree` has had
+    # this since it was written; the orphan sweep never did.
+    alive = [d for d in killed if _signal(d["pid"], signal.SIGTERM)]
+    if alive:
+        deadline = time.monotonic() + ORPHAN_TERM_GRACE_S
+        while time.monotonic() < deadline:
+            alive = [d for d in alive if not _exited(d["pid"])]
+            if not alive:
+                break
+            time.sleep(0.1)
+        for d in alive:
+            _kill(d["pid"])
     return killed
 
 
@@ -353,6 +388,13 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
     stale, stuck = sweep_stale(_swept_dirs(claims))
     requeued, failed = requeue_orphans(queue, active_ids)
     killed, convicted = [], []
+    # Records that claim a scope which no longer holds -- the anchor
+    # died, or the container restarted and got a fresh scope id. Reported
+    # beside `stale_claims` and `stuck_claims` because a claim that has
+    # quietly stopped covering anything is the same class of silent
+    # failure issue #24 is about. Initialised here so the key is always
+    # present even when the timer-gated branch below does not run.
+    void_scopes: list[str] = []
     # Where a claim would have spared a process from `kill_orphan_cuda`,
     # for the log line that follows a kill. See `_consulted_dirs`: both
     # the exemption ledgers and the one `attribute` read, because both
@@ -387,6 +429,13 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
             # records nothing will read is pure cost on every sweep of a
             # box where nvidia-smi is broken.
             records = ledger.live_records(ledger.all_records(claims))
+            # Gated on `scope_cgroup`, not `scope_pid`: the condition being
+            # reported is "this record claims a scope, and the scope no
+            # longer holds" -- a record with no scope at all was never
+            # making that claim and has nothing to go void.
+            void_scopes = [str(r.path) for r in records
+                          if r.scope_cgroup is not None
+                          and not ledger.scope_is_live(r)]
             if cfg.kill_orphan_cuda:
                 protect = _running_trees(queue)
                 # What the log names, so it names what was consulted
@@ -408,5 +457,11 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
     cleaned = clean_partials(queue)
     return {"stale_claims": stale, "stuck_claims": stuck,
             "requeued": requeued, "failed": failed,
-            "killed_pids": killed, "cleaned_paths": cleaned,
-            "convicted": convicted, "exemption_dirs": exemption_dirs}
+            # Two views of one list so they cannot drift. `killed_pids`
+            # is what `runner.py` has always logged and what the suite
+            # asserts on; `killed_details` is what the kill record needs.
+            "killed_pids": [d["pid"] for d in killed],
+            "killed_details": killed,
+            "cleaned_paths": cleaned,
+            "convicted": convicted, "exemption_dirs": exemption_dirs,
+            "void_scopes": void_scopes}

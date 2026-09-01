@@ -1550,3 +1550,35 @@ def test_a_second_stale_claim_is_logged_after_the_first(env, monkeypatch,
 
     assert sum(second["path"] in m for m in caplog.messages) == 1
     assert sum(first["path"] in m for m in caplog.messages) == 1
+
+
+# --- Saying that a scope went void (Addition R5) --------------------------
+#
+# `ledger.scope_is_live`'s own docstring promises "`reap()` reports which
+# records went void" -- silently dropping that report is the same class of
+# silent failure issue #24 is about: a claim that has quietly stopped
+# covering anything. Change-gated the same way as `stuck_claims`, and for
+# the same reason: the condition is permanent until the claim's owner
+# clears it, so an ungated line repeats at the poll interval forever.
+
+def test_a_void_scope_is_logged(env, monkeypatch, caplog):
+    r, _sha = env
+    path = "/var/lock/gpu/GPU-a.lock.d/4000000.json"
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {"void_scopes": [path]})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+
+    assert any(path in m for m in caplog.messages), caplog.messages
+
+
+def test_a_void_scope_is_not_re_logged_every_tick(env, monkeypatch, caplog):
+    r, _sha = env
+    path = "/var/lock/gpu/GPU-a.lock.d/4000000.json"
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {"void_scopes": [path]})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+        r._reap()
+
+    assert sum(path in m for m in caplog.messages) == 1

@@ -92,6 +92,12 @@ class Runner:
         # The record paths the sweep found stale but was refused permission
         # to remove, as of the last tick that reported them. See _reap.
         self._stuck_claims: set[str] = set()
+        # The record paths reported void as of the last tick that reported
+        # them -- change-gated the same way, and for the same reason: a
+        # void scope is permanent until its owner clears the claim, and
+        # this runs at the poll interval, so an ungated line would repeat
+        # until the operator stopped reading the log. See _reap.
+        self._void_scopes: set[str] = set()
         # Consecutive admit passes that could not identify the card. See
         # the GpuIdError branch in `admit`.
         self._gpuid_strikes = 0
@@ -255,13 +261,28 @@ class Runner:
                 "that pid next until its owner clears it",
                 path, rec.get("pid"), rec.get("owner"))
         self._stuck_claims = set(stuck)
+        # Reported when the set changes, same as `stuck_claims` just above:
+        # `_reap` runs at the poll interval and a void scope is permanent
+        # until its owner clears the claim, so an ungated line would repeat
+        # every tick until the operator stopped reading the log.
+        void_scopes = set(result.get("void_scopes") or [])
+        for path in sorted(void_scopes - self._void_scopes):
+            log.warning(
+                "claim %s names a cgroup it no longer covers -- the anchor "
+                "died, or the container restarted and got a fresh scope "
+                "id; the work inside it is unledgered and killable by the "
+                "orphan sweep",
+                path)
+        self._void_scopes = void_scopes
         killed = result.get("killed_pids") or []
         if killed:
-            # `killed_pids` went unlogged from the day it was returned. The
-            # process gets SIGKILL, so it writes nothing; the caller sees
-            # `exit -9` with an empty stderr and reads it as its own
-            # failure. Issue #19 was a session of ruling out OOM, host
-            # memory and the trainer itself before gpuq was even a suspect.
+            # `killed_pids` went unlogged from the day it was returned. A
+            # SIGKILLed process writes nothing; the caller sees `exit -9`
+            # with an empty stderr and reads it as its own failure. Issue
+            # #19 was a session of ruling out OOM, host memory and the
+            # trainer itself before gpuq was even a suspect. `kill_orphan_
+            # cuda` now SIGTERMs first and only SIGKILLs what survives the
+            # grace, so this line no longer claims a signal it didn't send.
             #
             # The ledgers are named because *which* claim directory was
             # consulted is exactly what was wrong there: a claim written
@@ -269,8 +290,9 @@ class Runner:
             # another. An operator who sees a pid of theirs here can
             # compare the list against where their own `gpu-claim` wrote.
             log.warning(
-                "orphan sweep SIGKILLed unledgered CUDA %s %s; exemptions "
-                "came from %s -- a claim outside those is invisible here",
+                "orphan sweep SIGTERMed, then SIGKILLed what survived the "
+                "grace, unledgered CUDA %s %s; exemptions came from %s -- "
+                "a claim outside those is invisible here",
                 "pid" if len(killed) == 1 else "pids",
                 ", ".join(str(p) for p in killed),
                 ", ".join(result.get("exemption_dirs") or ["(none)"]))

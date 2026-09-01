@@ -1,4 +1,5 @@
 import json
+import signal
 import pytest
 from gpuqueue import reaper as rp
 from gpuqueue.reaper import reap, MAX_ATTEMPTS
@@ -91,6 +92,13 @@ def test_kills_orphan_cuda_when_enabled(q, monkeypatch):
     cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True)
     monkeypatch.setattr(rp, "compute_apps",
                         lambda: [{"pid": 4321, "used_mb": 900, "name": "t.py"}])
+    # The sweep now SIGTERMs before it SIGKILLs. pid 4321 is not a real
+    # process, so the real `_signal` would fail the SIGTERM (no such
+    # process) and never reach `_kill` at all -- stub it so this test
+    # still exercises the escalation to `_kill`, and shrink the grace to
+    # 0 so the test does not pay ORPHAN_TERM_GRACE_S in wall-clock time.
+    monkeypatch.setattr(rp, "_signal", lambda pid, sig: True)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
     killed = []
     monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
     assert reap(q, cfg)["killed_pids"] == [4321]
@@ -913,3 +921,126 @@ def test_the_sweep_covers_every_ledger_that_can_grant_an_exemption(
 
 def _cl_refuse(rec):
     raise PermissionError(13, "Operation not permitted")
+
+
+def test_orphan_sweep_sigterms_before_it_sigkills(monkeypatch):
+    # A SIGKILLed process writes no stderr, so its caller sees `exit -9`
+    # and an empty message and reads it as its own bug. That is what cost
+    # the diagnosis in #24. SIGTERM first gives a handler the chance to
+    # say what happened; the watchdog's _kill_tree has had this since it
+    # was written and the orphan sweep never did.
+    sent = []
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append((pid, sig)) or True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    apps = [{"pid": 4321, "used_mb": 900, "name": "x"}]
+    killed = rp.kill_orphan_cuda(set(), [], apps)
+    assert [s for _, s in sent][0] == signal.SIGTERM
+    assert [d["pid"] for d in killed] == [4321]
+
+
+def test_orphan_sweep_sigkills_what_survives_the_grace(monkeypatch):
+    sent = []
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append((pid, sig)) or True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    apps = [{"pid": 4321, "used_mb": 900, "name": "x"}]
+    rp.kill_orphan_cuda(set(), [], apps)
+    assert [s for _, s in sent] == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_every_victim_is_sigtermed_before_any_is_sigkilled(monkeypatch):
+    # This is what "batched" means, and it is observable in the signal
+    # order alone -- no clock control needed. A per-victim grace would
+    # interleave TERM, KILL, TERM, KILL...; one shared grace sends every
+    # TERM first. The difference matters because a per-victim ladder
+    # stalls the runner tick by N x grace instead of by one.
+    sent = []
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append((pid, sig)) or True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    apps = [{"pid": p, "used_mb": 1, "name": "x"} for p in (2791919, 2792864, 2765642, 2761761)]
+    rp.kill_orphan_cuda(set(), [], apps)
+    sigs = [s for _, s in sent]
+    assert sigs == [signal.SIGTERM] * 4 + [signal.SIGKILL] * 4
+
+
+def test_a_kill_records_the_victims_cgroup(monkeypatch):
+    # The field that tells an operator it was their container rather than
+    # their algorithm. Read before signalling: /proc/<pid>/cgroup is gone
+    # the moment the process is.
+    monkeypatch.setattr(rp, "_signal", lambda pid, sig: True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(
+        rp.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc": "/system.slice/docker-abc.scope")
+    apps = [{"pid": 4321, "used_mb": 900, "name": "tig-runtime"}]
+    killed = rp.kill_orphan_cuda(set(), [], apps)
+    assert killed[0]["cgroup"] == "/system.slice/docker-abc.scope"
+    assert killed[0]["name"] == "tig-runtime"
+
+
+def test_an_exempt_process_is_never_signalled(monkeypatch):
+    sent = []
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append((pid, sig)) or True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    apps = [{"pid": 4321, "used_mb": 900, "name": "x"}]
+    assert rp.kill_orphan_cuda({4321}, [], apps) == []
+    assert sent == []
+
+
+# --- void scopes (Addition R5) -------------------------------------------
+#
+# A record whose scope no longer holds -- the anchor died, or the
+# container restarted and got a fresh scope id -- has quietly stopped
+# covering anything. `ledger.scope_is_live`'s own docstring already
+# promises "`reap()` reports which records went void"; these two tests are
+# what makes that promise true, alongside `stale_claims` and
+# `stuck_claims`, which is where the runner already looks for a claim
+# that is no longer what it says it is.
+
+def test_reap_reports_a_record_whose_scope_has_gone_void(q, tmp_path, monkeypatch):
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    rec_path = lg.ledger_dir("k", tmp_path) / f"{_os.getpid()}.aaa.json"
+    lg.write_record(lg.Record(
+        path=rec_path, pid=_os.getpid(), usage_pid=None, vram_mb=None,
+        owner="scoped", cmd=[], started_at="2026-08-10T00:00:00Z", key="k",
+        scope_pid=_os.getpid(), scope_cgroup="/system.slice/docker-abc.scope"))
+    # The anchor pid is alive (it's this test process), but its cgroup no
+    # longer matches what the record claims -- the container restarted and
+    # got a fresh scope id, or the pid was recycled onto something else.
+    monkeypatch.setattr(
+        rp.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc": "/system.slice/docker-xyz.scope")
+    result = reap(q, cfg)
+    assert str(rec_path) in result["void_scopes"]
+
+
+def test_reap_does_not_report_a_live_scope_as_void(q, tmp_path, monkeypatch):
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    rec_path = lg.ledger_dir("k", tmp_path) / f"{_os.getpid()}.aaa.json"
+    lg.write_record(lg.Record(
+        path=rec_path, pid=_os.getpid(), usage_pid=None, vram_mb=None,
+        owner="scoped", cmd=[], started_at="2026-08-10T00:00:00Z", key="k",
+        scope_pid=_os.getpid(), scope_cgroup="/system.slice/docker-abc.scope"))
+    # The anchor is alive and its cgroup still matches what was claimed.
+    monkeypatch.setattr(
+        rp.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc": "/system.slice/docker-abc.scope")
+    result = reap(q, cfg)
+    assert str(rec_path) not in result["void_scopes"]
