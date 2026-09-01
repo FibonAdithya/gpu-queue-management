@@ -1238,6 +1238,25 @@ def test_reap_reports_a_record_whose_scope_has_gone_void(q, tmp_path, monkeypatc
     assert str(rec_path) in result["void_scopes"]
 
 
+def test_a_tick_that_did_not_sweep_reports_void_scopes_as_unmeasured(
+        q, tmp_path):
+    """`None`, not `[]`, and the distinction is the whole point.
+
+    `reap` populates this only inside its timer-gated sweep, while
+    `runner._reap` runs on every tick and change-gates its warning on the
+    previous tick's set. An empty list here reads as "measured, and there
+    are none", clears that memo, and the next sweep reports every void
+    scope as new -- one warning per void claim per
+    `orphan_cuda_interval_s`, forever.
+    """
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    assert reap(q, cfg, include_orphan_cuda=False)["void_scopes"] is None
+    assert reap(q, cfg)["void_scopes"] == [], \
+        "a sweep that ran and found none must be distinguishable from a " \
+        "tick that never looked"
+
+
 def test_reap_does_not_report_a_live_scope_as_void(q, tmp_path, monkeypatch):
     from gpuqueue import ledger as lg
     cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,

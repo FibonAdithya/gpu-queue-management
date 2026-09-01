@@ -1573,11 +1573,25 @@ def test_a_void_scope_is_logged(env, monkeypatch, caplog):
 
 
 def test_a_void_scope_is_not_re_logged_every_tick(env, monkeypatch, caplog):
+    """Three ticks, and the middle one is the whole test.
+
+    `reap` measures void scopes only inside its timer-gated sweep, while
+    `_reap` runs on every tick. Two ticks that both report the same list
+    prove nothing, because the state that gets cleared is cleared by the
+    ticks *between* sweeps: an unmeasured tick that reads as "no void
+    scopes" resets the memo, and the next sweep reports every void scope
+    as new -- once per `orphan_cuda_interval_s`, forever, which is
+    verbatim the outcome the change-gating exists to prevent.
+    """
     r, _sha = env
     path = "/var/lock/gpu/GPU-a.lock.d/4000000.json"
-    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {"void_scopes": [path]})
+    # No key at all on the middle tick: not measured, as distinct from
+    # measured and empty.
+    results = iter([{"void_scopes": [path]}, {}, {"void_scopes": [path]}])
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: next(results))
 
     with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
         r._reap()
         r._reap()
 

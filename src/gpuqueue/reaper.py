@@ -432,9 +432,18 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
     # died, or the container restarted and got a fresh scope id. Reported
     # beside `stale_claims` and `stuck_claims` because a claim that has
     # quietly stopped covering anything is the same class of silent
-    # failure issue #24 is about. Initialised here so the key is always
-    # present even when the timer-gated branch below does not run.
-    void_scopes: list[str] = []
+    # failure issue #24 is about.
+    #
+    # None, not `[]`: "not measured this tick" is a different fact from
+    # "measured, and there are none", and only the timer-gated branch
+    # below measures. `runner._reap` runs on every tick and change-gates
+    # its warning on the previous tick's set, so an empty list here would
+    # clear that memo on every non-sweep tick and the next sweep would
+    # report every void scope as new -- once per `orphan_cuda_interval_s`,
+    # forever, which is exactly what the gating exists to prevent.
+    # `stuck_claims` needs no such distinction only because `sweep_stale`
+    # runs unconditionally at the top of this function.
+    void_scopes: list[str] | None = None
     # Where a claim would have spared a process from `kill_orphan_cuda`,
     # for the log line that follows a kill. See `_consulted_dirs`: both
     # the exemption ledgers and the one `attribute` read, because both

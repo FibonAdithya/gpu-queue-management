@@ -265,15 +265,25 @@ class Runner:
         # `_reap` runs at the poll interval and a void scope is permanent
         # until its owner clears the claim, so an ungated line would repeat
         # every tick until the operator stopped reading the log.
-        void_scopes = set(result.get("void_scopes") or [])
-        for path in sorted(void_scopes - self._void_scopes):
-            log.warning(
-                "claim %s names a cgroup it no longer covers -- the anchor "
-                "died, or the container restarted and got a fresh scope "
-                "id; the work inside it is unledgered and killable by the "
-                "orphan sweep",
-                path)
-        self._void_scopes = void_scopes
+        # `None` means this tick did not measure -- `reap` populates this
+        # only inside its timer-gated sweep, and this method runs every
+        # tick. Read as an empty set it would clear the memo below on
+        # every non-sweep tick, and the next sweep would report every void
+        # scope as new: one warning per void claim per
+        # `orphan_cuda_interval_s`, forever, which is the outcome the
+        # gating is here to prevent. So an unmeasured tick leaves the memo
+        # exactly as the last measurement left it.
+        measured = result.get("void_scopes")
+        if measured is not None:
+            void_scopes = set(measured)
+            for path in sorted(void_scopes - self._void_scopes):
+                log.warning(
+                    "claim %s names a cgroup it no longer covers -- the "
+                    "anchor died, or the container restarted and got a "
+                    "fresh scope id; the work inside it is unledgered and "
+                    "killable by the orphan sweep",
+                    path)
+            self._void_scopes = void_scopes
         killed = result.get("killed_pids") or []
         if killed:
             # `killed_pids` went unlogged from the day it was returned. A
