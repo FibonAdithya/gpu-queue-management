@@ -491,3 +491,77 @@ def test_scope_is_dead_when_the_anchor_moved_cgroup(tmp_path, monkeypatch):
 
 def test_a_record_with_no_scope_is_not_live_scoped(tmp_path):
     assert lg.scope_is_live(_scoped(tmp_path, None, None)) is False
+
+
+SCOPE = "/system.slice/docker-43faa0ee.scope"
+
+
+def _rec(tmp_path, name, *, usage_pid=None, scope_pid=None,
+         scope_cgroup=None):
+    return lg.Record(
+        path=tmp_path / name, pid=os.getpid(), usage_pid=usage_pid,
+        vram_mb=512, owner="me", cmd=[], started_at="", key="k",
+        scope_pid=scope_pid, scope_cgroup=scope_cgroup)
+
+
+def test_a_process_in_a_claimed_cgroup_is_charged_to_that_record(
+        tmp_path, monkeypatch):
+    # Issue #24 at unit scale: the CUDA process is not a descendant of
+    # anything the claim could name, and the claim covers it anyway.
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": SCOPE)
+    rec = _rec(tmp_path, "a.json", usage_pid=os.getpid(),
+               scope_pid=os.getpid(), scope_cgroup=SCOPE)
+    apps = [{"pid": 2791919, "used_mb": 900, "name": "tig-runtime"}]
+    owned, unledgered = lg.attribute(apps, [rec])
+    assert unledgered == []
+    assert owned[str(rec.path)] == apps
+
+
+def test_a_process_outside_every_scope_is_unledgered(tmp_path, monkeypatch):
+    # The other half: the feature must not exempt the whole box.
+    monkeypatch.setattr(
+        lg.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc":
+            SCOPE if pid == os.getpid() else "/system.slice/other.scope")
+    rec = _rec(tmp_path, "a.json", usage_pid=os.getpid(),
+               scope_pid=os.getpid(), scope_cgroup=SCOPE)
+    apps = [{"pid": 2791919, "used_mb": 900, "name": "stranger"}]
+    owned, unledgered = lg.attribute(apps, [rec])
+    assert unledgered == apps
+    assert owned == {}
+
+
+def test_a_dead_anchor_charges_nothing_to_its_recorded_cgroup(
+        tmp_path, monkeypatch):
+    # Honouring scope_cgroup without re-checking the anchor would exempt
+    # whatever now lives at that path.
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": SCOPE)
+    rec = _rec(tmp_path, "a.json", usage_pid=os.getpid(),
+               scope_pid=999999, scope_cgroup=SCOPE)
+    apps = [{"pid": 2791919, "used_mb": 900, "name": "tig-runtime"}]
+    owned, unledgered = lg.attribute(apps, [rec])
+    assert unledgered == apps
+
+
+def test_pid_tree_ownership_is_tested_before_scope_ownership(
+        tmp_path, monkeypatch):
+    # Two records could both claim this process: one owns its pid tree,
+    # the other's cgroup contains it. The tree is the more specific
+    # answer and must win, or a co-tenant's VRAM is charged to the
+    # container's declaration and neither reads correctly.
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": SCOPE)
+    monkeypatch.setattr(lg, "descendants", lambda pid: {2791919})
+    by_tree = _rec(tmp_path, "tree.json", usage_pid=os.getpid())
+    # usage_pid=None on purpose: `descendants` is stubbed for every pid,
+    # so giving this record a usage_pid too would put the app in BOTH
+    # records' pid trees, and the test would then turn on dict order
+    # rather than on the tree-before-scope rule it claims to check.
+    by_scope = _rec(tmp_path, "scope.json", usage_pid=None,
+                    scope_pid=os.getpid(), scope_cgroup=SCOPE)
+    apps = [{"pid": 2791919, "used_mb": 900, "name": "x"}]
+    owned, unledgered = lg.attribute(apps, [by_scope, by_tree])
+    assert str(by_tree.path) in owned
+    assert str(by_scope.path) not in owned

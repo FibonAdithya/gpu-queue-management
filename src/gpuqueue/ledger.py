@@ -434,6 +434,11 @@ def attribute(apps: list[dict],
 
     A record with no `usage_pid` has been admitted but not launched. It
     owns nothing, and must not adopt a stranger's process.
+
+    A record may also name a *scope*: a cgroup it is charged for but did
+    not spawn, which is how a container's CUDA process gets an owner at
+    all (issue #24). Scopes are consulted only after every pid tree has
+    been tried, so the tree stays the more specific answer.
     """
     # `records` is not filtered on `usage_pid` liveness, and need not be:
     # for gpu-claim and legacy records `pid == usage_pid`, so `live_records`
@@ -442,21 +447,46 @@ def attribute(apps: list[dict],
     # accrue at most one of the two strikes a conviction needs.
     trees = {str(r.path): {r.usage_pid} | descendants(r.usage_pid)
              for r in records if r.usage_pid is not None}
+    # Resolved once per call, not once per app. `scope_is_live` reads
+    # /proc for the anchor, and there are always more visible apps than
+    # scoped records.
+    scopes = {str(r.path): r.scope_cgroup
+              for r in records if scope_is_live(r)}
     owned: dict[str, list[dict]] = {}
     unledgered: list[dict] = []
     for app in apps:
-        # First match wins. If two records' trees overlap (a holder that
-        # forked another holder), the process is charged to whichever
-        # record sorts first and the other reads `used=0` -- under its
-        # declaration, so the overlap can only fail to convict, never
-        # convict the wrong holder.
-        for path, tree in trees.items():
-            if app["pid"] in tree:
-                owned.setdefault(path, []).append(app)
-                break
-        else:
+        path = _owner_of(app["pid"], trees, scopes)
+        if path is None:
             unledgered.append(app)
+        else:
+            owned.setdefault(path, []).append(app)
     return owned, unledgered
+
+
+def _owner_of(pid: int, trees: dict[str, set[int]],
+              scopes: dict[str, str]) -> str | None:
+    """Which record owns `pid`, or None.
+
+    First match wins, and pid trees are tried before scopes. If two
+    records' trees overlap (a holder that forked another holder) the
+    process is charged to whichever sorts first and the other reads
+    `used=0` -- under its declaration, so an overlap can only fail to
+    convict, never convict the wrong holder.
+
+    Trees before scopes for the same reason: a scope is the coarser
+    claim, covering a whole container, and a co-tenant that took its own
+    claim inside that container has named itself more precisely. Charging
+    it to the container's declaration instead would leave both readings
+    wrong -- the co-tenant's record showing `used=0` and the container's
+    inflated by a process that declared separately.
+    """
+    for path, tree in trees.items():
+        if pid in tree:
+            return path
+    for path, scope in scopes.items():
+        if cgroups.in_scope(pid, scope):
+            return path
+    return None
 
 
 def used_mb(apps: list[dict]) -> int:
