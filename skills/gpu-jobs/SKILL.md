@@ -83,6 +83,25 @@ A job that fails on CUDA out-of-memory is reported as such and is never
 retried: it is a configuration problem, not a transient. Make the model or
 the batch smaller.
 
+## A job died with signal 9 and no message
+
+A `SIGKILL` writes no stderr, so an `exit -9` with an empty message is
+not evidence of a bug in your own code. The queue's orphan sweep kills
+CUDA processes that no live claim accounts for, and that is what it
+looks like from the victim's side.
+
+Run `gpuq kills` first. If your pid is there, the queue killed it and
+the `cgroup` line names what it killed — check whether the work was
+running somewhere your claim did not cover. CUDA inside a container is
+the usual case, and the fix is to claim for it:
+
+    gpu-claim --vram-mb <MiB> \
+      --scope-pid $(docker inspect -f '{{.State.Pid}}' <container>) \
+      -- <your command>
+
+If your pid is *not* there, the queue did not kill it and the failure is
+somewhere else.
+
 ## Telling the owner something about gpuq
 
 Use `gpuq bug` for anything you want the owner to see about the queue itself.

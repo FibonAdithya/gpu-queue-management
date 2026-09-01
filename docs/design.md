@@ -21,9 +21,15 @@ training does not.
 
 ## Constraints
 
-- The target box is an **unprivileged container** (a hosted PyTorch image). No
-  Docker-in-Docker, no kernel modules, no sysctls. Long-running processes are
-  managed by **supervisor**.
+- The target box runs the queue as an **unprivileged host process** under
+  **supervisor**. No kernel modules, no sysctls, and nothing here may require
+  root. It was originally a hosted PyTorch container; on `tig-gpu` as of
+  2026-09-01 the runner is a host process in the root cgroup namespace
+  (`/system.slice/supervisor.service`), and GPU work of its *users* is what
+  now runs in containers. `cgroups.py` depends on that direction only: it
+  reads `/proc/<pid>/cgroup`, never `/sys/fs/cgroup`, so it degrades to
+  "covers nothing" rather than mis-exempting if the runner is ever
+  namespaced again.
 - The box is **ephemeral**. It may be destroyed and rebuilt; nothing on it may
   be hand-made, and host identity must be a single variable.
 - Consumers may be **agents, not people**. Interfaces must be inspectable
@@ -266,6 +272,36 @@ stable under a remap, so pinning `0` re-introduces the guess.
 On a box whose driver reports no uuid, the name-index fallback is still a
 usable lock key but is not something the driver can resolve. Nothing is
 pinned, a warning is logged, and jobs run exactly as they did before.
+
+### Claiming for a container
+
+A claim normally covers the claimant's own process tree. That cannot
+express containerised CUDA: a `docker exec`'d process is a child of the
+containerd-shim, not of container init, so it is outside the pid tree of
+anything a claim can name from the host shell.
+
+`gpu-claim --scope-pid <pid>` charges the claim for the **cgroup** that
+pid belongs to, and everything nested under it:
+
+    gpu-claim --vram-mb 3000 \
+      --scope-pid $(docker inspect -f '{{.State.Pid}}' my-container) \
+      -- ./run_experiment.py
+
+The record then carries `scope_pid` and `scope_cgroup`, and the scope is
+honoured only while the anchor is alive *and* still in the recorded
+cgroup — so a container restart voids the scope rather than drifting it
+onto whatever the kernel gives that pid next.
+
+Refused: the root cgroup, top-level slices, and login sessions. Those
+are what a mistyped `--scope-pid` resolves to, and each would disable
+orphan protection for the whole card while looking like a normal claim.
+
+The VRAM watchdog follows, because it shares `ledger.attribute`: a scoped
+record is convicted on its cgroup's usage. Conviction then kills the
+processes the record was charged for as well as its own pid tree — for a
+scoped record those are not the same set, and killing the tree alone
+would end the claim while the over-user kept the card, then have the next
+orphan sweep record that process as unledgered.
 
 ## Failure handling
 

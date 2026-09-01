@@ -11,6 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import cgroups
 from . import ledger
 # list_claims is re-exported, not used here; kept for callers.
 from .claim import all_claim_dirs, claim_dir, list_claims   # noqa: F401
@@ -89,6 +90,50 @@ def own_pids(directory=None) -> set[int]:
     return pids
 
 
+def own_scopes(directory=None) -> set[str]:
+    """Every cgroup scope the claim protocol accounts for.
+
+    The scope half of `own_pids`, deliberately built as a sibling rather
+    than folded into it: `own_pids` stays exactly as issue #19 left it.
+    What the two share is breadth, and that is the whole reason this
+    exists. `kill_orphan_cuda` took its scope exemption from
+    `ledger.attribute` alone, over records read from one directory
+    (`cfg.claim_dir`), while its pid exemption came from a bare
+    `own_pids()` reading every directory a claim could be in. So a
+    `--scope-pid` claim written to a directory in `all_claim_dirs()` that
+    is not `cfg.claim_dir` had its wrapper's pid tree spared and its
+    *container* SIGKILLed -- while a plain `gpu-claim -- python train.py`
+    in the same setup survived, because its trainer is a descendant.
+
+    That divergence is not hypothetical. `cli_claim` already documents
+    that the daemon reads `[queue].claim_dir` while "this process's
+    environment cannot name it": an interactive shell and a supervisor
+    unit systematically disagree about `$GPU_CLAIM_DIR`, which is issue
+    #19. Without this, a correctly formed `gpu-claim --scope-pid $(docker
+    inspect ...)` issued from a shell exempts nothing.
+
+    `scope_is_live` is consulted, so a record whose anchor died or whose
+    container restarted onto a fresh scope id exempts nothing. A void
+    scope left standing is an amnesty for whatever the kernel puts at
+    that path next -- the same unbounded window issue #21 was about, one
+    mechanism over.
+
+    An explicit `directory=` still means exactly that one, for the reason
+    `own_pids` gives: a caller who names a directory is asking about that
+    directory.
+
+    Over-exempting is the safe way to be wrong here, same as `own_pids`:
+    this is the last check before a SIGKILL.
+    """
+    scopes: set[str] = set()
+    dirs = [Path(directory)] if directory else all_claim_dirs()
+    for d in dirs:
+        for rec in ledger.live_records(ledger.all_records(d)):
+            if rec.scope_cgroup and ledger.scope_is_live(rec):
+                scopes.add(rec.scope_cgroup)
+    return scopes
+
+
 def unledgered_processes(allow: set[int] | None = None,
                          directory=None) -> list[dict]:
     """CUDA processes no live ledger record accounts for.
@@ -113,7 +158,13 @@ def unledgered_processes(allow: set[int] | None = None,
 foreign_processes = unledgered_processes
 
 
-def preflight(allow: set[int] | None = None, directory=None) -> None:
+def preflight(allow: set[int] | None = None, directory=None,
+              scope: str | None = None) -> None:
+    """Refuse to start when a CUDA process holds the card with no claim.
+
+    `scope` is a cgroup the caller is about to claim; processes inside it
+    are not contention.
+    """
     # One query, not two: asking twice costs a second nvidia-smi and lets
     # the "can we see the list?" check and the "who is on the card?" check
     # disagree about what they saw.
@@ -128,6 +179,13 @@ def preflight(allow: set[int] | None = None, directory=None) -> None:
     exempt = set(allow or set()) | {os.getpid(), os.getppid()}
     exempt |= descendants(os.getpid())
     stray = [a for a in unledgered if a["pid"] not in exempt]
+    if scope:
+        # A claim that has not been taken yet. `attribute` covers a scope
+        # once the record is on disk, but this runs *before* that, so the
+        # container's in-flight CUDA has nothing to be charged to and
+        # would read as a stranger holding the card. Filtering here is
+        # what lets a busy container be claimed at all.
+        stray = [a for a in stray if not cgroups.in_scope(a["pid"], scope)]
     if stray:
         lines = [f"  pid {a['pid']:>7}  {a['used_mb'] or '?'} MiB  {a['name']}"
                  for a in stray]

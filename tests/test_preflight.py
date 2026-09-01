@@ -192,3 +192,21 @@ def test_unledgered_processes_consults_one_ledger(tmp_path, monkeypatch):
 
     assert [a["pid"] for a in pf.unledgered_processes()] == [999_002]
     assert seen == [ours]
+
+
+def test_preflight_does_not_refuse_a_process_in_the_prospective_scope(
+        tmp_path, monkeypatch):
+    # preflight runs BEFORE the claim exists, so there is no record to
+    # attribute the container's in-flight CUDA to. Without the
+    # prospective scope, claiming a busy container is refused and
+    # claiming an idle one races the next request -- the feature fails
+    # exactly when it is needed.
+    scope = "/system.slice/docker-43faa0ee.scope"
+    monkeypatch.setattr(
+        pf, "compute_apps",
+        lambda: [{"pid": 2791919, "used_mb": 900, "name": "tig-runtime"}])
+    monkeypatch.setattr(pf.cgroups, "in_scope",
+                        lambda pid, s, proc_root="/proc": s == scope)
+    with pytest.raises(pf.PreflightFailed):
+        pf.preflight(directory=tmp_path)
+    pf.preflight(directory=tmp_path, scope=scope)  # must not raise

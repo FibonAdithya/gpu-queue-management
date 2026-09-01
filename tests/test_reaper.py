@@ -1,4 +1,10 @@
 import json
+# The stdlib module, always spelled `signal`. It used to be imported a
+# second time as `_signal` further down, one character from `reaper._signal`
+# -- a function these tests monkeypatch by that name -- so a reader had to
+# check which of the two any given line meant. One import, and `rp._signal`
+# is the only thing that spelling refers to.
+import signal
 import pytest
 from gpuqueue import reaper as rp
 from gpuqueue.reaper import reap, MAX_ATTEMPTS
@@ -91,6 +97,18 @@ def test_kills_orphan_cuda_when_enabled(q, monkeypatch):
     cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True)
     monkeypatch.setattr(rp, "compute_apps",
                         lambda: [{"pid": 4321, "used_mb": 900, "name": "t.py"}])
+    # The sweep now SIGTERMs before it SIGKILLs. pid 4321 is not a real
+    # process, so the real `_signal` would fail the SIGTERM (no such
+    # process) and never reach `_kill` at all -- stub it so this test
+    # still exercises the escalation to `_kill`, and shrink the grace to
+    # 0 so the test does not pay ORPHAN_TERM_GRACE_S in wall-clock time.
+    monkeypatch.setattr(rp, "_signal", lambda pid, sig: True)
+    # `_exited` too, like every sibling: the zeroed grace makes the loop
+    # body unreachable today, so the real `_exited` is only ever consulted
+    # if that boundary changes -- and then this test would fail for a
+    # reason that has nothing to do with what it asserts.
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
     killed = []
     monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
     assert reap(q, cfg)["killed_pids"] == [4321]
@@ -110,12 +128,19 @@ def test_does_not_kill_pids_of_running_jobs(q, monkeypatch):
     monkeypatch.setattr(rp, "compute_apps",
                         lambda: [{"pid": 4321, "used_mb": 900, "name": "t.py"}])
     monkeypatch.setattr(rp, "_kill", lambda pid: pytest.fail("killed a live job"))
+    # The ladder starts at SIGTERM, so `_kill` alone no longer covers this:
+    # an exemption that broke would send a real SIGTERM to whatever holds
+    # pid 4321 on this box.
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pytest.fail("signalled a live job"))
     assert reap(q, cfg)["killed_pids"] == []
 
 def test_does_not_kill_when_cuda_list_is_invisible(q, monkeypatch):
     cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True)
     monkeypatch.setattr(rp, "compute_apps", lambda: None)
     monkeypatch.setattr(rp, "_kill", lambda pid: pytest.fail("killed blind"))
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pytest.fail("signalled blind"))
     assert reap(q, cfg)["killed_pids"] == []
 
 
@@ -162,7 +187,6 @@ def test_reap_can_skip_the_expensive_cuda_sweep(tmp_path, monkeypatch):
 # `own_pids` to set(), which is why the suite cannot currently see this.
 
 import os as _os
-import signal as _signal
 import subprocess as _sp
 import sys as _sys
 import time as _time
@@ -245,7 +269,7 @@ def holder_process(tmp_path):
     finally:
         for pid in (child, holder):
             try:
-                _os.kill(pid, _signal.SIGKILL)
+                _os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
 
@@ -310,6 +334,130 @@ def test_own_pids_given_a_directory_reads_only_that_one(
 
     assert holder not in _pf.own_pids(directory=empty)
     assert holder in _pf.own_pids(), "the bare call must still widen"
+
+
+# --- the scope exemption, at the same breadth as the pid one -------------
+#
+# `kill_orphan_cuda` builds its exemption from two sources, and until this
+# section they were not the same width. The *pid* half is `own_pids()`,
+# which reads every directory a claim could be in; the *scope* half lived
+# only in `ledger.attribute`, over records from `cfg.claim_dir` alone. So a
+# `--scope-pid` claim written to a directory that is in `all_claim_dirs()`
+# but is not `cfg.claim_dir` had its wrapper's pid tree spared and its
+# container SIGKILLed -- while a plain `gpu-claim -- python train.py` in
+# the same setup survived, because its trainer is a descendant.
+#
+# That split is issue #19's, not a hypothetical: `cli_claim` already
+# documents that the daemon reads `[queue].claim_dir` while an interactive
+# shell "cannot name it".
+
+_DOCKER_SCOPE = "/system.slice/docker-43faa0ee4d16.scope"
+
+
+def _write_scoped_claim(directory, anchor: int, scope: str):
+    """A `gpu-claim --scope-pid` record, in whichever directory that run's
+    own `$GPU_CLAIM_DIR` resolved to.
+
+    `usage_pid=None` on purpose: the container's CUDA process is not in the
+    claiming process's tree at all -- a `docker exec`'d process is a child
+    of the containerd-shim -- which is the whole reason a scope exists.
+    """
+    from gpuqueue import ledger as lg
+    path = lg.ledger_dir("GPU-test", directory) / f"{anchor}.aaa.json"
+    lg.write_record(lg.Record(
+        path=path, pid=anchor, usage_pid=None, vram_mb=512, owner="someone",
+        cmd=["docker", "exec", "trainer", "python", "train.py"],
+        started_at="2026-08-10T00:00:00Z", key="GPU-test",
+        scope_pid=anchor, scope_cgroup=scope))
+    return path
+
+
+def test_own_scopes_reads_every_directory_a_claim_could_be_in(
+        tmp_path, monkeypatch):
+    """The sibling of `test_own_pids_exempts_a_claim_written_under_the_
+    default_dir`, and it has to be a sibling rather than a widening of
+    `own_pids`: the spec keeps that function exactly as issue #19 left it.
+    """
+    daemon_dir = tmp_path / "daemon-claims"
+    daemon_dir.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(daemon_dir))
+    _write_scoped_claim(_cl.DEFAULT_CLAIM_DIR, _os.getpid(), _DOCKER_SCOPE)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": _DOCKER_SCOPE)
+
+    from gpuqueue import ledger as lg
+    assert lg.all_records(daemon_dir) == [], \
+        "the two environments must genuinely diverge or this proves nothing"
+
+    assert _pf.own_scopes() == {_DOCKER_SCOPE}
+
+
+def test_own_scopes_given_a_directory_reads_only_that_one(
+        tmp_path, monkeypatch):
+    """`own_pids`' convention, kept: a caller who names a directory is
+    asking about that directory, and widening the answer would make the
+    argument mean nothing."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    _write_scoped_claim(_cl.DEFAULT_CLAIM_DIR, _os.getpid(), _DOCKER_SCOPE)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": _DOCKER_SCOPE)
+
+    assert _pf.own_scopes(directory=empty) == set()
+    assert _pf.own_scopes() == {_DOCKER_SCOPE}, "the bare call must widen"
+
+
+def test_own_scopes_leaves_out_a_scope_that_has_gone_void(
+        tmp_path, monkeypatch):
+    """A record whose scope no longer holds covers nothing, so it must
+    exempt nothing. Otherwise a container that restarted onto a fresh
+    scope id leaves its predecessor's path standing as a permanent
+    amnesty for whatever the kernel puts there next."""
+    _write_scoped_claim(_cl.DEFAULT_CLAIM_DIR, _os.getpid(), _DOCKER_SCOPE)
+    # The anchor is alive -- it is this process -- but its cgroup is no
+    # longer the one the record claims.
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": "/system.slice/other")
+
+    assert _pf.own_scopes() == set()
+
+
+def test_a_scoped_claim_outside_the_configured_dir_still_spares_its_container(
+        q, tmp_path, monkeypatch):
+    """The outcome this branch exists to prevent, reached through the one
+    divergence the branch did not cover.
+
+    `[queue].claim_dir` and the daemon's `$GPU_CLAIM_DIR` agree here; it is
+    the interactive shell that diverges, exactly as in
+    `test_a_claim_the_daemons_environment_cannot_see_is_still_spared`. A
+    correctly formed `gpu-claim --scope-pid $(docker inspect ...)` issued
+    from that shell exempted nothing, and the container was SIGKILLed.
+    """
+    daemon_dir = tmp_path / "daemon-claims"
+    daemon_dir.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(daemon_dir))
+    _write_scoped_claim(_cl.DEFAULT_CLAIM_DIR, _os.getpid(), _DOCKER_SCOPE)
+
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=daemon_dir)
+    monkeypatch.setattr(rp, "own_pids", _pf.own_pids)   # undo the autouse stub
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": _DOCKER_SCOPE)
+    monkeypatch.setattr(rp, "compute_apps",
+                        lambda: [{"pid": 4321, "used_mb": 900,
+                                  "name": "tig-runtime"}])
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pytest.fail("signalled a claimed "
+                                                     "container"))
+
+    from gpuqueue import ledger as lg
+    assert lg.all_records(daemon_dir) == [], \
+        "the config and the daemon's environment must agree with each other"
+    assert 4321 not in _pf.own_pids(), \
+        "the pid-tree exemption must not be what spares it, or this proves "\
+        "nothing about scopes"
+
+    assert reap(q, cfg)["killed_pids"] == []
 
 
 def test_a_claim_the_daemons_environment_cannot_see_is_still_spared(
@@ -435,6 +583,8 @@ def test_a_ledgered_co_tenants_process_is_not_an_orphan(q, tmp_path, monkeypatch
     monkeypatch.setattr(lg, "descendants",
                         lambda pid: {5150} if pid == _os.getpid() else set())
     monkeypatch.setattr(rp, "_kill", lambda pid: pytest.fail("killed a co-tenant"))
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pytest.fail("signalled a co-tenant"))
     assert reap(q, cfg)["killed_pids"] == []
 
 
@@ -444,9 +594,19 @@ def test_an_unledgered_process_is_still_killed(q, tmp_path, monkeypatch):
     monkeypatch.setattr(rp, "compute_apps",
                         lambda: [{"pid": 4321, "used_mb": 900, "name": "x.py"}])
     monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    # `_signal` too, not just `_kill`. pid 4321 is not a real process, so
+    # the real `_signal` fails the SIGTERM and the victim never reaches the
+    # escalation at all -- this asserted on a list that was returned
+    # regardless of whether anything was signalled, so it no longer proved
+    # a kill landed. Stubbing it also stops the suite firing a real SIGTERM
+    # at whatever pid 4321 is after a `pid_max` wrap.
+    monkeypatch.setattr(rp, "_signal", lambda pid, sig: True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
     killed = []
     monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
     assert reap(q, cfg)["killed_pids"] == [4321]
+    assert killed == [4321]
 
 
 # --- the VRAM watchdog ---------------------------------------------------
@@ -571,7 +731,7 @@ def test_a_convicted_holder_is_sigtermed_before_sigkill(monkeypatch):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-    assert sent == [_signal.SIGTERM], "escalated past SIGTERM needlessly"
+    assert sent == [signal.SIGTERM], "escalated past SIGTERM needlessly"
 
 
 def test_kill_tree_does_not_wait_out_a_zombie(monkeypatch):
@@ -622,7 +782,13 @@ def test_a_conviction_whose_kill_failed_is_not_reported_as_killed(
     monkeypatch.setattr(lg, "all_records", lambda d: [rec])
     monkeypatch.setattr(rp, "compute_apps",
                         lambda: [{"pid": 500, "used_mb": 3070, "name": "t"}])
-    monkeypatch.setattr(rp, "_kill_tree", lambda pid: False)  # EPERM
+    # `_kill_pids` is the seam the conviction path goes through:
+    # `_kill_convicted` targets the pid tree *and* whatever the record
+    # was charged for, which for a scoped record is not in its tree.
+    # Patched here rather than at `_kill_tree`, which that path no
+    # longer calls -- stubbing a function nothing reaches would let the
+    # real ladder deliver signals to pid 500.
+    monkeypatch.setattr(rp, "_kill_pids", lambda pids: False)  # EPERM
 
     strikes = {}
     reap(q, cfg, vram_strikes=strikes)                    # first strike
@@ -662,7 +828,7 @@ def test_a_blind_sweep_does_not_bank_a_vram_strike(q, tmp_path, monkeypatch):
                        kill_orphan_cuda=False, enforce_vram=True)
     rec = _rec(tmp_path, "1.a.json", 500, 512, owner="alice")
     monkeypatch.setattr(lg, "all_records", lambda d: [rec])
-    monkeypatch.setattr(rp, "_kill_tree", lambda pid: True)
+    monkeypatch.setattr(rp, "_kill_pids", lambda pids: True)
     over = [{"pid": 500, "used_mb": 3070, "name": "t"}]
     seen = iter([over, None, over])
     monkeypatch.setattr(rp, "compute_apps", lambda: next(seen))
@@ -682,7 +848,7 @@ def test_a_conviction_whose_kill_landed_says_so(q, tmp_path, monkeypatch):
     monkeypatch.setattr(lg, "all_records", lambda d: [rec])
     monkeypatch.setattr(rp, "compute_apps",
                         lambda: [{"pid": 500, "used_mb": 3070, "name": "t"}])
-    monkeypatch.setattr(rp, "_kill_tree", lambda pid: True)
+    monkeypatch.setattr(rp, "_kill_pids", lambda pids: True)
 
     strikes = {}
     reap(q, cfg, vram_strikes=strikes)
@@ -715,6 +881,8 @@ def test_sweep_spares_the_whole_tree_of_a_running_job(q, tmp_path, monkeypatch):
                         lambda pid: {4242} if pid == os.getpid() else set())
     killed = []
     monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pytest.fail("signalled a live job"))
 
     assert reap(q, cfg)["killed_pids"] == []
     assert killed == []
@@ -734,9 +902,18 @@ def test_sweep_still_kills_a_process_under_nobody(q, tmp_path, monkeypatch):
                         lambda: [{"pid": 9999, "used_mb": 100}])
     monkeypatch.setattr(rp, "descendants",
                         lambda pid: {4242} if pid == os.getpid() else set())
-    monkeypatch.setattr(rp, "_kill", lambda pid: True)
+    # See `test_an_unledgered_process_is_still_killed`: without a `_signal`
+    # stub the real SIGTERM to pid 9999 fails, nothing is escalated, and
+    # this asserted on a list returned regardless -- while firing a real
+    # signal at whatever pid 9999 is after a `pid_max` wrap.
+    monkeypatch.setattr(rp, "_signal", lambda pid, sig: True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
+    killed = []
+    monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
 
     assert reap(q, cfg)["killed_pids"] == [9999]
+    assert killed == [9999]
 
 
 # --- Which ledgers the sweep consulted (issue #19) -----------------------
@@ -913,3 +1090,302 @@ def test_the_sweep_covers_every_ledger_that_can_grant_an_exemption(
 
 def _cl_refuse(rec):
     raise PermissionError(13, "Operation not permitted")
+
+
+def test_orphan_sweep_sigterms_before_it_sigkills(monkeypatch):
+    # A SIGKILLed process writes no stderr, so its caller sees `exit -9`
+    # and an empty message and reads it as its own bug. That is what cost
+    # the diagnosis in #24. SIGTERM first gives a handler the chance to
+    # say what happened; the watchdog's _kill_tree has had this since it
+    # was written and the orphan sweep never did.
+    sent = []
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append((pid, sig)) or True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    apps = [{"pid": 4321, "used_mb": 900, "name": "x"}]
+    killed = rp.kill_orphan_cuda(set(), [], apps)
+    assert [s for _, s in sent][0] == signal.SIGTERM
+    assert [d["pid"] for d in killed] == [4321]
+
+
+def test_orphan_sweep_sigkills_what_survives_the_grace(monkeypatch):
+    sent = []
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append((pid, sig)) or True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    apps = [{"pid": 4321, "used_mb": 900, "name": "x"}]
+    rp.kill_orphan_cuda(set(), [], apps)
+    assert [s for _, s in sent] == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_every_victim_is_sigtermed_before_any_is_sigkilled(monkeypatch):
+    # This is what "batched" means, and it is observable in the signal
+    # order alone -- no clock control needed. A per-victim grace would
+    # interleave TERM, KILL, TERM, KILL...; one shared grace sends every
+    # TERM first. The difference matters because a per-victim ladder
+    # stalls the runner tick by N x grace instead of by one.
+    sent = []
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append((pid, sig)) or True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    apps = [{"pid": p, "used_mb": 1, "name": "x"} for p in (2791919, 2792864, 2765642, 2761761)]
+    rp.kill_orphan_cuda(set(), [], apps)
+    sigs = [s for _, s in sent]
+    assert sigs == [signal.SIGTERM] * 4 + [signal.SIGKILL] * 4
+
+
+def test_a_kill_records_the_victims_cgroup(monkeypatch):
+    # The field that tells an operator it was their container rather than
+    # their algorithm. Read before signalling: /proc/<pid>/cgroup is gone
+    # the moment the process is.
+    monkeypatch.setattr(rp, "_signal", lambda pid, sig: True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(
+        rp.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc": "/system.slice/docker-abc.scope")
+    apps = [{"pid": 4321, "used_mb": 900, "name": "tig-runtime"}]
+    killed = rp.kill_orphan_cuda(set(), [], apps)
+    assert killed[0]["cgroup"] == "/system.slice/docker-abc.scope"
+    assert killed[0]["name"] == "tig-runtime"
+
+
+def test_a_victim_whose_sigterm_failed_is_not_reported_as_killed(monkeypatch):
+    """`_signal` swallows two failures that mean the sweep did nothing.
+
+    ESRCH: the process exited on its own between the nvidia-smi sample and
+    the SIGTERM. EPERM: it belongs to another user -- this claim directory
+    is shared with hand-run `gpu-claim` jobs -- so it goes on holding the
+    card. Either way it is dropped from the escalation list and never
+    reaches SIGKILL either, so reporting it as killed is a claim about a
+    signal that was not delivered.
+
+    It matters because `skills/gpu-jobs/SKILL.md` tells an agent that a
+    pid in `gpuq kills` was killed by the queue. A process that crashed on
+    its own, named there, stops the agent debugging its real crash --
+    issue #24's misdiagnosis with the arrow reversed.
+    """
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pid != 4321)   # EPERM on 4321
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    apps = [{"pid": 4321, "used_mb": 900, "name": "someone-elses"},
+            {"pid": 4322, "used_mb": 900, "name": "ours"}]
+    killed = rp.kill_orphan_cuda(set(), [], apps)
+    assert [d["pid"] for d in killed] == [4322], \
+        "reported a kill for a process no signal reached"
+
+
+def test_the_grace_loop_stops_as_soon_as_everything_has_exited(monkeypatch):
+    """The `_exited` filter is what keeps the shared grace from being paid
+    in full. Delete it and `alive` never empties, so every sweep that kills
+    anything burns ORPHAN_TERM_GRACE_S on the runner's single thread and
+    escalates to SIGKILL a process that took the SIGTERM.
+
+    The real grace is deliberately not zeroed here -- that is the property
+    under test -- and the test still runs in microseconds, because the loop
+    breaks on its first pass.
+    """
+    assert rp.ORPHAN_TERM_GRACE_S >= 1.0, "the real grace, not a zeroed one"
+    sent = []
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append(sig) or True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    started = _time.monotonic()
+    rp.kill_orphan_cuda(set(), [], [{"pid": 4321, "used_mb": 1, "name": "x"}])
+    assert sent == [signal.SIGTERM], "escalated past SIGTERM needlessly"
+    assert _time.monotonic() - started < 1.0, "paid the whole grace"
+
+
+def test_an_exempt_process_is_never_signalled(monkeypatch):
+    sent = []
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append((pid, sig)) or True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    apps = [{"pid": 4321, "used_mb": 900, "name": "x"}]
+    assert rp.kill_orphan_cuda({4321}, [], apps) == []
+    assert sent == []
+
+
+# --- void scopes (Addition R5) -------------------------------------------
+#
+# A record whose scope no longer holds -- the anchor died, or the
+# container restarted and got a fresh scope id -- has quietly stopped
+# covering anything. `ledger.scope_is_live`'s own docstring already
+# promises "`reap()` reports which records went void"; these two tests are
+# what makes that promise true, alongside `stale_claims` and
+# `stuck_claims`, which is where the runner already looks for a claim
+# that is no longer what it says it is.
+
+def test_reap_reports_a_record_whose_scope_has_gone_void(q, tmp_path, monkeypatch):
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    rec_path = lg.ledger_dir("k", tmp_path) / f"{_os.getpid()}.aaa.json"
+    lg.write_record(lg.Record(
+        path=rec_path, pid=_os.getpid(), usage_pid=None, vram_mb=None,
+        owner="scoped", cmd=[], started_at="2026-08-10T00:00:00Z", key="k",
+        scope_pid=_os.getpid(), scope_cgroup="/system.slice/docker-abc.scope"))
+    # The anchor pid is alive (it's this test process), but its cgroup no
+    # longer matches what the record claims -- the container restarted and
+    # got a fresh scope id, or the pid was recycled onto something else.
+    monkeypatch.setattr(
+        rp.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc": "/system.slice/docker-xyz.scope")
+    result = reap(q, cfg)
+    assert str(rec_path) in result["void_scopes"]
+
+
+def test_a_tick_that_did_not_sweep_reports_void_scopes_as_unmeasured(
+        q, tmp_path):
+    """`None`, not `[]`, and the distinction is the whole point.
+
+    `reap` populates this only inside its timer-gated sweep, while
+    `runner._reap` runs on every tick and change-gates its warning on the
+    previous tick's set. An empty list here reads as "measured, and there
+    are none", clears that memo, and the next sweep reports every void
+    scope as new -- one warning per void claim per
+    `orphan_cuda_interval_s`, forever.
+    """
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    assert reap(q, cfg, include_orphan_cuda=False)["void_scopes"] is None
+    assert reap(q, cfg)["void_scopes"] == [], \
+        "a sweep that ran and found none must be distinguishable from a " \
+        "tick that never looked"
+
+
+def test_reap_does_not_report_a_live_scope_as_void(q, tmp_path, monkeypatch):
+    from gpuqueue import ledger as lg
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=tmp_path)
+    rec_path = lg.ledger_dir("k", tmp_path) / f"{_os.getpid()}.aaa.json"
+    lg.write_record(lg.Record(
+        path=rec_path, pid=_os.getpid(), usage_pid=None, vram_mb=None,
+        owner="scoped", cmd=[], started_at="2026-08-10T00:00:00Z", key="k",
+        scope_pid=_os.getpid(), scope_cgroup="/system.slice/docker-abc.scope"))
+    # The anchor is alive and its cgroup still matches what was claimed.
+    monkeypatch.setattr(
+        rp.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc": "/system.slice/docker-abc.scope")
+    result = reap(q, cfg)
+    assert str(rec_path) not in result["void_scopes"]
+
+
+# --- a conviction reaches what it was charged for ------------------------
+
+def test_a_scoped_conviction_kills_the_processes_it_was_charged_for(
+        tmp_path, monkeypatch):
+    """A scoped record's usage_pid tree is not where its VRAM is.
+
+    `--scope-pid` exists precisely because a container's CUDA is not a
+    descendant of anything the claim can name from the host shell (issue
+    #24), so `ledger.attribute` charges those processes to the record
+    while `_kill_tree(usage_pid)` reaches only the `gpu-claim` wrapper.
+    Convicting on usage the kill cannot touch ends the claim, leaves the
+    over-user on the card, and logs `killed` over a process nothing
+    signalled -- the same "the message said something other than what
+    happened" this branch spent five commits removing.
+    """
+    from gpuqueue import ledger as lg
+    SCOPE = "/system.slice/docker-abc.scope"
+    CONTAINER_PID = 424242
+    monkeypatch.setattr(
+        rp.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc": (
+            SCOPE if pid in (_os.getpid(), CONTAINER_PID)
+            else "/user.slice/elsewhere.scope"))
+    rec = lg.Record(path=tmp_path / "c.json", pid=_os.getpid(),
+                    usage_pid=_os.getpid(), vram_mb=1000, owner="scoped",
+                    cmd=[], started_at="t", key="k",
+                    scope_pid=_os.getpid(), scope_cgroup=SCOPE)
+    apps = [{"pid": CONTAINER_PID, "used_mb": 40000, "name": "python"}]
+    strikes = {}
+    for _ in range(rp.WATCHDOG_STRIKES):
+        convicted = rp.check_vram([rec], apps, strikes)
+    assert len(convicted) == 1
+
+    # The ladder itself is `_kill_pids`, tested above; what is under test
+    # here is which pids reach it.
+    targeted = []
+    monkeypatch.setattr(rp, "_kill_pids",
+                        lambda pids: targeted.append(set(pids)) or True)
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    rp._kill_convicted(convicted[0])
+    assert CONTAINER_PID in targeted[0], \
+        "convicted a record for VRAM the kill never reached"
+
+
+def test_an_ordinary_conviction_still_kills_only_its_own_tree(
+        tmp_path, monkeypatch):
+    """The union above must not become an amnesty in the other direction:
+    a record with no scope kills exactly what it always did."""
+    from gpuqueue import ledger as lg
+    rec = lg.Record(path=tmp_path / "c.json", pid=_os.getpid(),
+                    usage_pid=1111, vram_mb=10, owner="plain", cmd=[],
+                    started_at="t", key="k")
+    kids = lambda pid: {2222} if pid == 1111 else set()   # noqa: E731
+    monkeypatch.setattr(rp, "descendants", kids)
+    monkeypatch.setattr(lg, "descendants", kids)
+    apps = [{"pid": 2222, "used_mb": 900, "name": "x"}]
+    strikes = {}
+    for _ in range(rp.WATCHDOG_STRIKES):
+        convicted = rp.check_vram([rec], apps, strikes)
+    assert len(convicted) == 1
+    targeted = []
+    monkeypatch.setattr(rp, "_kill_pids",
+                        lambda pids: targeted.append(set(pids)) or True)
+    rp._kill_convicted(convicted[0])
+    assert targeted[0] == {1111, 2222}
+
+
+def test_a_conviction_with_nothing_to_kill_is_not_reported_as_killed(
+        tmp_path, monkeypatch):
+    """An admitted-but-unlaunched record owns nothing; `bool(usage_pid)`
+    used to be what stopped `_kill_tree(None)`."""
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    assert rp._kill_convicted({"usage_pid": None, "pids": []}) is False
+
+
+def test_a_void_scope_outside_the_runners_own_claim_dir_is_reported(
+        q, tmp_path, monkeypatch):
+    """The void report must have the breadth the exemption has.
+
+    `own_scopes()` honours a scope claimed in any of `all_claim_dirs()`,
+    because an interactive shell and a supervisor unit systematically
+    disagree about `$GPU_CLAIM_DIR` -- that disagreement is issue #19.
+    Reading only `cfg.claim_dir` here means the claims most likely to go
+    void are the ones never reported void: the operator's exemption stops
+    covering their container, nothing says so, and the next sweep kills
+    it. That silence is what issue #24 is.
+    """
+    from gpuqueue import ledger as lg
+    theirs = tmp_path / "shell-claims"
+    daemons = tmp_path / "daemon-claims"
+    theirs.mkdir()
+    daemons.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(theirs))
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=daemons)
+    rec_path = lg.ledger_dir("k", theirs) / f"{_os.getpid()}.aaa.json"
+    lg.write_record(lg.Record(
+        path=rec_path, pid=_os.getpid(), usage_pid=None, vram_mb=None,
+        owner="scoped", cmd=[], started_at="2026-08-10T00:00:00Z", key="k",
+        scope_pid=_os.getpid(),
+        scope_cgroup="/system.slice/docker-abc.scope"))
+    monkeypatch.setattr(
+        rp.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc": "/system.slice/docker-xyz.scope")
+    assert str(rec_path) in reap(q, cfg)["void_scopes"]

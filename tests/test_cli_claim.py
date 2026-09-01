@@ -13,7 +13,8 @@ KEY = "4b8f2c1a-0000-0000-0000-000000000001"
 def fake_gpu(tmp_path, monkeypatch):
     monkeypatch.setenv("GPU_CLAIM_DIR", str(tmp_path))
     monkeypatch.setattr(cli_claim, "gpu_key", lambda index=0: KEY)
-    monkeypatch.setattr(cli_claim, "preflight", lambda allow=None, directory=None: None)
+    monkeypatch.setattr(cli_claim, "preflight",
+                        lambda allow=None, directory=None, scope=None: None)
     # Otherwise every test here shells out to nvidia-smi for the capacity,
     # and answers differently on a box that has a card than on one that
     # does not.
@@ -46,7 +47,7 @@ def test_gpu_claim_passes_the_declaration_through(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli_claim, "gpu_claim", fake_claim)
     monkeypatch.setattr(cli_claim, "gpu_key", lambda index=0: "k")
-    monkeypatch.setattr(cli_claim, "preflight", lambda: None)
+    monkeypatch.setattr(cli_claim, "preflight", lambda **kw: None)
     cli_claim.main(["--vram-mb", "512", "--", "true"])
     assert seen["vram_mb"] == 512
 
@@ -62,19 +63,19 @@ def test_gpu_claim_without_a_declaration_takes_the_whole_card(tmp_path, monkeypa
 
     monkeypatch.setattr(cli_claim, "gpu_claim", fake_claim)
     monkeypatch.setattr(cli_claim, "gpu_key", lambda index=0: "k")
-    monkeypatch.setattr(cli_claim, "preflight", lambda: None)
+    monkeypatch.setattr(cli_claim, "preflight", lambda **kw: None)
     cli_claim.main(["--", "true"])
     assert seen["vram_mb"] is None
 
 def test_preflight_failure_exits_69(monkeypatch, capsys):
-    def fail(allow=None, directory=None):
+    def fail(allow=None, directory=None, scope=None):
         raise PreflightFailed("pid 4321 train.py")
     monkeypatch.setattr(cli_claim, "preflight", fail)
     assert cli_claim.main(["--", "true"]) == 69
     assert "4321" in capsys.readouterr().err
 
 def test_no_preflight_flag_skips_it(monkeypatch):
-    def fail(allow=None, directory=None):
+    def fail(allow=None, directory=None, scope=None):
         raise PreflightFailed("should not be called")
     monkeypatch.setattr(cli_claim, "preflight", fail)
     assert cli_claim.main(["--no-preflight", "--", "true"]) == 0
@@ -325,6 +326,10 @@ def test_the_warning_names_sigkill_only_for_a_third_directory(
     cli_claim.main(["--", "true"])
     on_third = capsys.readouterr().err
     assert "SIGKILL" in on_third, on_third
+    # The sweep has had a SIGTERM rung since this branch added one, and a
+    # warning that names only the SIGKILL tells the operator their run
+    # will die with no stderr when in fact a handler gets a grace.
+    assert "SIGTERM" in on_third, on_third
 
 
 def test_status_warns_before_reporting_a_claim_the_reaper_cannot_see(
@@ -450,3 +455,96 @@ def test_reap_says_why_it_could_not_remove_a_record(tmp_path, monkeypatch,
     assert str(stuck) in err, err
     assert "Read-only file system" in err, err
     assert "another user" not in err, err
+
+
+DOCKER_SCOPE = "/system.slice/docker-43faa0ee4d16.scope"
+
+
+def test_scope_pid_is_passed_into_the_claim(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    seen = {}
+
+    @contextmanager
+    def fake_claim(**kw):
+        seen.update(kw)
+        yield None
+
+    monkeypatch.setattr(cli_claim, "gpu_claim", fake_claim)
+    monkeypatch.setattr(cli_claim.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": DOCKER_SCOPE)
+    assert cli_claim.main(["--scope-pid", "2818873", "--", "true"]) == 0
+    assert seen["scope_pid"] == 2818873
+    assert seen["scope_cgroup"] == DOCKER_SCOPE
+
+
+def test_scope_pid_prints_the_resolved_scope(monkeypatch, capsys):
+    # The operator's sanity check that they named a container and not the
+    # box. Without it a wrong --scope-pid looks exactly like a right one.
+    monkeypatch.setattr(cli_claim.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": DOCKER_SCOPE)
+    monkeypatch.setattr(cli_claim.cgroups, "scope_process_count",
+                        lambda scope, proc_root="/proc": 3)
+    cli_claim.main(["--scope-pid", "2818873", "--", "true"])
+    err = capsys.readouterr().err
+    assert DOCKER_SCOPE in err
+    # The whole phrase: DOCKER_SCOPE already contains a "3", so a bare
+    # `"3" in err` passes with the count deleted entirely.
+    assert "3 live processes" in err
+
+
+def test_scope_pid_naming_the_whole_box_is_refused(monkeypatch, capsys):
+    monkeypatch.setattr(cli_claim.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": "/")
+    assert cli_claim.main(["--scope-pid", "1", "--", "true"]) == 2
+    assert "whole box" in capsys.readouterr().err
+
+
+def test_scope_pid_naming_a_login_session_is_refused(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli_claim.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc":
+            "/user.slice/user-0.slice/session-1848.scope")
+    assert cli_claim.main(["--scope-pid", "2838576", "--", "true"]) == 2
+    assert "login session" in capsys.readouterr().err
+
+
+def test_scope_pid_that_is_not_running_is_refused(monkeypatch, capsys):
+    monkeypatch.setattr(cli_claim.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    monkeypatch.setattr(cli_claim, "pid_alive", lambda pid: False)
+    assert cli_claim.main(["--scope-pid", "999999", "--", "true"]) == 2
+    assert "not a running process" in capsys.readouterr().err
+
+
+def test_scope_pid_on_a_cgroup_v1_box_is_refused(monkeypatch, capsys):
+    # A live pid with no unified path is a v1 box, and the operator's
+    # next move is nothing like "fix the pid".
+    monkeypatch.setattr(cli_claim.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    monkeypatch.setattr(cli_claim, "pid_alive", lambda pid: True)
+    # Read fine, and there was no `0::` line: that is what makes this a v1
+    # box rather than an entry we were not allowed to open.
+    monkeypatch.setattr(cli_claim.cgroups, "read_error",
+                        lambda pid, proc_root="/proc": None)
+    assert cli_claim.main(["--scope-pid", "2818873", "--", "true"]) == 2
+    assert "cgroup v2" in capsys.readouterr().err
+
+
+def test_scope_pid_whose_proc_entry_is_unreadable_is_not_called_a_v1_box(
+        monkeypatch, capsys):
+    """`cgroup_of` returns None on any OSError, so a `hidepid` mount or a
+    pid belonging to another user produced "this box is not running cgroup
+    v2". That is false, and it sends the operator to check a kernel
+    feature that is working. The branch is reachable: `pid_alive` is
+    `kill(pid, 0)`, which answers True on EPERM.
+    """
+    monkeypatch.setattr(cli_claim.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    monkeypatch.setattr(cli_claim, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli_claim.cgroups, "read_error",
+                        lambda pid, proc_root="/proc": "Permission denied")
+    assert cli_claim.main(["--scope-pid", "2818873", "--", "true"]) == 2
+    err = capsys.readouterr().err
+    assert "Permission denied" in err, err
+    assert "cgroup v2" not in err, \
+        "named a kernel feature that is working fine"

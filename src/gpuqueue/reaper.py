@@ -8,14 +8,23 @@ import signal
 import time
 from pathlib import Path
 
+from . import cgroups
+from . import killlog
 from . import ledger
 from .claim import sweep_stale, claim_dir, all_claim_dirs
 from .config import RunnerConfig
-from .preflight import compute_apps, own_pids
+from .preflight import compute_apps, own_pids, own_scopes
 from .procs import descendants, pid_alive
 from .queue import QueueRoot
 
 MAX_ATTEMPTS = 1
+
+# Shorter than `_kill_tree`'s 10s on purpose. A convicted holder is one
+# we want to checkpoint; an unledgered process is contending for a card
+# someone may be blocked on, and this only has to be long enough for a
+# SIGTERM handler to write a line. Paid once per `orphan_cuda_interval_s`
+# inside the timer-gated sweep, not on every tick.
+ORPHAN_TERM_GRACE_S = 5.0
 
 
 def _signal(pid: int, sig: int) -> bool:
@@ -51,7 +60,8 @@ def requeue_orphans(queue: QueueRoot,
     return requeued, failed
 
 
-def kill_orphan_cuda(protect: set[int], records: list, apps: list[dict]) -> list[int]:
+def kill_orphan_cuda(protect: set[int], records: list,
+                     apps: list[dict]) -> list[dict]:
     """Kill CUDA processes no live claim accounts for.
 
     Takes `apps` rather than fetching them so one nvidia-smi call serves
@@ -91,12 +101,77 @@ def kill_orphan_cuda(protect: set[int], records: list, apps: list[dict]) -> list
     # `test_a_claim_the_daemons_environment_cannot_see_is_still_spared`
     # catches the two-environment one that a single-process test cannot
     # express.
+    #
+    # `own_scopes()` is the same argument one mechanism over, and it is
+    # here for the same reason it is bare. The scope exemption used to
+    # live *only* inside `ledger.attribute` above, over `records` from a
+    # single directory, while the pid exemption beside it read every
+    # directory a claim could be in. A `--scope-pid` claim written to a
+    # directory in `all_claim_dirs()` that is not `cfg.claim_dir` then had
+    # its wrapper's pid tree spared and its container SIGKILLed, while a
+    # plain `gpu-claim -- python train.py` in the same setup survived
+    # because its trainer is a descendant. Two exemptions of different
+    # breadth is what issue #19 was; making them the same breadth is what
+    # fixed it, and a scope is not exempt from that.
     exempt = set(protect) | own_pids()
-    killed = []
-    for app in unledgered:
-        if app["pid"] not in exempt and _kill(app["pid"]):
-            killed.append(app["pid"])
-    return killed
+    scopes = own_scopes()
+    victims = [a for a in unledgered
+               if a["pid"] not in exempt
+               and not any(cgroups.in_scope(a["pid"], s) for s in scopes)]
+    if not victims:
+        return []
+    # Read before signalling: /proc/<pid>/cgroup is gone the moment the
+    # process is, and this field is the one that tells the victim's
+    # operator it was their container and not their algorithm.
+    killed = [{"pid": a["pid"], "name": a.get("name"),
+               "used_mb": a.get("used_mb"),
+               "cgroup": cgroups.cgroup_of(a["pid"]),
+               # Filled in below. Present from the start so every record
+               # this writes has the field, whether or not the ladder got
+               # that far.
+               "sigkilled": False}
+              for a in victims]
+    # SIGTERM everything, then one shared grace, then SIGKILL what is
+    # left. Batched rather than per-victim: a grace each would stall the
+    # runner tick by N x grace, and there is no reason the second
+    # victim's grace should start after the first's has finished.
+    #
+    # The ladder at all because a SIGKILLed process writes no stderr. Its
+    # caller sees `exit -9` with an empty message and reads it as its own
+    # bug -- on 2026-09-01 an agent rewrote a correct index and submitted
+    # a worse method on that reading (issue #24). `_kill_tree` has had
+    # this since it was written; the orphan sweep never did.
+    #
+    # Only what was actually signalled is returned, and `signalled` is its
+    # own name because the grace loop below reassigns `alive` down to the
+    # survivors. `_signal` swallows two failures that mean nothing was
+    # done: ESRCH, where the victim exited on its own between the
+    # nvidia-smi sample and the SIGTERM, and EPERM, where it belongs to
+    # another user -- this claim directory is shared with hand-run
+    # `gpu-claim` jobs -- and goes on holding the card. Neither is
+    # escalated to SIGKILL either, since both drop out of the list here.
+    #
+    # Reporting them anyway put them in `kills.jsonl`, and
+    # `skills/gpu-jobs/SKILL.md` tells an agent that a pid there was killed
+    # by the queue: a process that crashed on its own would be named as a
+    # queue kill and the agent would stop debugging its real crash. That is
+    # issue #24's misdiagnosis with the arrow reversed, so `killed` stays
+    # purely the pre-signal cgroup snapshot and this is the answer.
+    signalled = [d for d in killed if _signal(d["pid"], signal.SIGTERM)]
+    alive = list(signalled)
+    if alive:
+        deadline = time.monotonic() + ORPHAN_TERM_GRACE_S
+        while time.monotonic() < deadline:
+            alive = [d for d in alive if not _exited(d["pid"])]
+            if not alive:
+                break
+            time.sleep(0.1)
+        for d in alive:
+            # Recorded per victim so the runner's line can say what the
+            # ladder actually did rather than describing both rungs
+            # whenever it kills anything.
+            d["sigkilled"] = _kill(d["pid"])
+    return signalled
 
 
 def _running_trees(queue: QueueRoot) -> set[int]:
@@ -217,7 +292,16 @@ def _kill_tree(pid: int) -> bool:
     on this shared claim directory means another user's process and an
     EPERM `_signal` swallowed.
     """
-    tree = {pid} | descendants(pid)
+    return _kill_pids({pid} | descendants(pid))
+
+
+def _kill_pids(tree: set[int]) -> bool:
+    """The ladder itself, over a pid set the caller chose.
+
+    Split out of `_kill_tree` because a scoped record's VRAM is not in its
+    pid tree; see `_kill_convicted`. The set is enumerated by the caller
+    and never re-read, which is what bounds the wait at 10s + 5s.
+    """
     for sig, grace in ((signal.SIGTERM, 10.0), (signal.SIGKILL, 5.0)):
         alive = [p for p in tree if not _exited(p)]
         if not alive:
@@ -230,6 +314,38 @@ def _kill_tree(pid: int) -> bool:
                 return True
             time.sleep(0.1)
     return all(_exited(p) for p in tree)
+
+
+def _kill_convicted(c: dict) -> bool:
+    """Get a convicted holder off the card -- all of it, not just its tree.
+
+    `_kill_tree(usage_pid)` was the whole of this while every record owned
+    a pid tree. A scoped record does not: `--scope-pid` exists precisely
+    because a container's CUDA is not a descendant of anything a claim can
+    name from the host shell (issue #24), so `ledger.attribute` charges
+    those processes to the record while the usage_pid tree holds only the
+    `gpu-claim` wrapper. Killing the tree alone ended the claim, left the
+    over-user on the card, and had the runner log `killed` over a process
+    nothing signalled -- and the next orphan sweep then recorded that
+    process in `kills.jsonl` as `orphan_sweep_unledgered`, sending its
+    owner to add a scope they already had.
+
+    `pids` is exactly what `attribute` charged, so for a record with no
+    scope it is already inside the tree and this is the union it always
+    was. Only the processes on the card, not every process in the cgroup:
+    the claim is charged for the cgroup's VRAM, not licensed to kill a
+    container's init.
+    """
+    targets: set[int] = set()
+    if c.get("usage_pid"):
+        targets |= {c["usage_pid"]} | descendants(c["usage_pid"])
+    targets |= set(c.get("pids") or [])
+    if not targets:
+        # An admitted-but-unlaunched record owns nothing. `bool(usage_pid)`
+        # used to be what stopped `_kill_tree(None)`; the guard moves here
+        # rather than disappearing.
+        return False
+    return _kill_pids(targets)
 
 
 def check_vram(records: list, apps: list[dict],
@@ -272,7 +388,13 @@ def check_vram(records: list, apps: list[dict],
             # this function has just finished explaining is ambiguous, and
             # nothing consumed it. `owner` is what identifies the holder.
             convicted.append({"owner": rec.owner, "declared": rec.vram_mb,
-                              "used": used, "usage_pid": rec.usage_pid})
+                              "used": used, "usage_pid": rec.usage_pid,
+                              # What `used` was actually measured over.
+                              # For a scoped record these are the only
+                              # pids the kill can reach; see
+                              # `_kill_convicted`.
+                              "pids": sorted(a["pid"]
+                                             for a in owned.get(key, []))})
     for key in list(strikes):
         if key not in seen:
             strikes.pop(key)  # the holder is gone; its strikes go with it
@@ -353,6 +475,22 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
     stale, stuck = sweep_stale(_swept_dirs(claims))
     requeued, failed = requeue_orphans(queue, active_ids)
     killed, convicted = [], []
+    # Records that claim a scope which no longer holds -- the anchor
+    # died, or the container restarted and got a fresh scope id. Reported
+    # beside `stale_claims` and `stuck_claims` because a claim that has
+    # quietly stopped covering anything is the same class of silent
+    # failure issue #24 is about.
+    #
+    # None, not `[]`: "not measured this tick" is a different fact from
+    # "measured, and there are none", and only the timer-gated branch
+    # below measures. `runner._reap` runs on every tick and change-gates
+    # its warning on the previous tick's set, so an empty list here would
+    # clear that memo on every non-sweep tick and the next sweep would
+    # report every void scope as new -- once per `orphan_cuda_interval_s`,
+    # forever, which is exactly what the gating exists to prevent.
+    # `stuck_claims` needs no such distinction only because `sweep_stale`
+    # runs unconditionally at the top of this function.
+    void_scopes: list[str] | None = None
     # Where a claim would have spared a process from `kill_orphan_cuda`,
     # for the log line that follows a kill. See `_consulted_dirs`: both
     # the exemption ledgers and the one `attribute` read, because both
@@ -387,12 +525,39 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
             # records nothing will read is pure cost on every sweep of a
             # box where nvidia-smi is broken.
             records = ledger.live_records(ledger.all_records(claims))
+            # Gated on `scope_cgroup`, not `scope_pid`: the condition being
+            # reported is "this record claims a scope, and the scope no
+            # longer holds" -- a record with no scope at all was never
+            # making that claim and has nothing to go void.
+            # Over every swept directory, not `claims` alone. The
+            # exemption this reports the loss of comes from
+            # `own_scopes()`, which reads them all -- and it has to,
+            # because an interactive shell and a supervisor unit
+            # systematically disagree about `$GPU_CLAIM_DIR` (issue #19).
+            # Read from `cfg.claim_dir` only, the claims most likely to go
+            # void were the ones never reported void: the operator's
+            # exemption quietly stops covering their container and the
+            # next sweep kills it, which is issue #24's silence exactly.
+            # `records` stays as it is -- it is what `attribute` and the
+            # watchdog measure over, a narrower question.
+            void_scopes = [str(r.path)
+                           for d in _swept_dirs(claims)
+                           for r in ledger.live_records(ledger.all_records(d))
+                           if r.scope_cgroup is not None
+                           and not ledger.scope_is_live(r)]
             if cfg.kill_orphan_cuda:
                 protect = _running_trees(queue)
                 # What the log names, so it names what was consulted
                 # rather than what we assume it consulted.
                 exemption_dirs = _consulted_dirs(claims)
                 killed = kill_orphan_cuda(protect, records, apps)
+                # Written here rather than in `kill_orphan_cuda` because
+                # that function does not know the queue root, and giving
+                # it one would tie the kill decision to the queue's
+                # layout. `exemption_dirs` is already in hand on this
+                # line, which is the whole reason the record can name
+                # what was consulted.
+                killlog.append(queue.root, killed, exemption_dirs)
             if cfg.enforce_vram and vram_strikes is not None:
                 convicted = check_vram(records, apps, vram_strikes)
                 for c in convicted:
@@ -403,10 +568,15 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
                     # goes on over-using the card. Reporting the
                     # conviction alone would have the runner log `killed`
                     # over a process that is still running.
-                    c["killed"] = bool(c["usage_pid"]) and _kill_tree(
-                        c["usage_pid"])
+                    c["killed"] = _kill_convicted(c)
     cleaned = clean_partials(queue)
     return {"stale_claims": stale, "stuck_claims": stuck,
             "requeued": requeued, "failed": failed,
-            "killed_pids": killed, "cleaned_paths": cleaned,
-            "convicted": convicted, "exemption_dirs": exemption_dirs}
+            # Two views of one list so they cannot drift. `killed_pids`
+            # is what `runner.py` has always logged and what the suite
+            # asserts on; `killed_details` is what the kill record needs.
+            "killed_pids": [d["pid"] for d in killed],
+            "killed_details": killed,
+            "cleaned_paths": cleaned,
+            "convicted": convicted, "exemption_dirs": exemption_dirs,
+            "void_scopes": void_scopes}

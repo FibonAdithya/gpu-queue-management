@@ -1474,6 +1474,47 @@ def test_a_kill_is_logged_with_the_ledgers_it_consulted(env, monkeypatch,
     assert "/workspace/lock/gpu" in msg and "/var/lock/gpu" in msg, msg
 
 
+def test_a_kill_line_does_not_claim_a_sigkill_that_never_happened(
+        env, monkeypatch, caplog):
+    """The line said "SIGTERMed, then SIGKILLed what survived the grace"
+    on every sweep that killed anything, including one where every victim
+    exited on the SIGTERM. A branch about log lines meaning what they say
+    does not get to describe a rung of the ladder it did not climb.
+    """
+    r, sha = env
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {
+        "killed_pids": [4321],
+        "killed_details": [{"pid": 4321, "sigkilled": False}],
+        "exemption_dirs": ["/workspace/lock/gpu"]})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+
+    msg = "\n".join(caplog.messages)
+    assert "4321" in msg, msg
+    assert "SIGTERM" in msg, msg
+    assert "SIGKILL" not in msg, msg
+
+
+def test_a_kill_line_names_what_it_had_to_sigkill(env, monkeypatch, caplog):
+    r, sha = env
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {
+        "killed_pids": [4321, 4322],
+        "killed_details": [{"pid": 4321, "sigkilled": False},
+                           {"pid": 4322, "sigkilled": True}],
+        "exemption_dirs": ["/workspace/lock/gpu"]})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+
+    msg = "\n".join(caplog.messages)
+    assert "SIGKILL" in msg, msg
+    kill_half = msg.split("SIGKILL", 1)[1]
+    assert "4322" in kill_half, msg
+    assert "4321" not in kill_half, \
+        "named a victim that took the SIGTERM as one that survived it"
+
+
 def test_a_sweep_that_killed_nothing_says_nothing(env, monkeypatch, caplog):
     r, sha = env
     monkeypatch.setattr(rn, "reap", lambda *a, **kw: {
@@ -1550,3 +1591,49 @@ def test_a_second_stale_claim_is_logged_after_the_first(env, monkeypatch,
 
     assert sum(second["path"] in m for m in caplog.messages) == 1
     assert sum(first["path"] in m for m in caplog.messages) == 1
+
+
+# --- Saying that a scope went void (Addition R5) --------------------------
+#
+# `ledger.scope_is_live`'s own docstring promises "`reap()` reports which
+# records went void" -- silently dropping that report is the same class of
+# silent failure issue #24 is about: a claim that has quietly stopped
+# covering anything. Change-gated the same way as `stuck_claims`, and for
+# the same reason: the condition is permanent until the claim's owner
+# clears it, so an ungated line repeats at the poll interval forever.
+
+def test_a_void_scope_is_logged(env, monkeypatch, caplog):
+    r, _sha = env
+    path = "/var/lock/gpu/GPU-a.lock.d/4000000.json"
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {"void_scopes": [path]})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+
+    assert any(path in m for m in caplog.messages), caplog.messages
+
+
+def test_a_void_scope_is_not_re_logged_every_tick(env, monkeypatch, caplog):
+    """Three ticks, and the middle one is the whole test.
+
+    `reap` measures void scopes only inside its timer-gated sweep, while
+    `_reap` runs on every tick. Two ticks that both report the same list
+    prove nothing, because the state that gets cleared is cleared by the
+    ticks *between* sweeps: an unmeasured tick that reads as "no void
+    scopes" resets the memo, and the next sweep reports every void scope
+    as new -- once per `orphan_cuda_interval_s`, forever, which is
+    verbatim the outcome the change-gating exists to prevent.
+    """
+    r, _sha = env
+    path = "/var/lock/gpu/GPU-a.lock.d/4000000.json"
+    # No key at all on the middle tick: not measured, as distinct from
+    # measured and empty.
+    results = iter([{"void_scopes": [path]}, {}, {"void_scopes": [path]}])
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: next(results))
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+        r._reap()
+        r._reap()
+
+    assert sum(path in m for m in caplog.messages) == 1

@@ -17,6 +17,8 @@ from . import claim as _claim, config
 from .claim import (gpu_claim, ClaimBusy, CannotEverFit, sweep_stale,
                     list_claims, default_usable_mb, claim_dir,
                     all_claim_dirs)
+from . import cgroups
+from .claim import pid_alive
 from .gpuid import gpu_key, cuda_visible_value, GpuIdError
 from .preflight import preflight, PreflightFailed
 
@@ -41,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "context and the allocator's high-water mark, "
                         "not torch's max_memory_allocated). Omit to "
                         "take the whole card.")
+    p.add_argument("--scope-pid", dest="scope_pid", type=int, default=None,
+                   help="claim on behalf of the cgroup this pid belongs "
+                        "to, for CUDA that runs in a container rather "
+                        "than in this command's own process tree. Name "
+                        "any pid inside the target, e.g. --scope-pid "
+                        "$(docker inspect -f '{{.State.Pid}}' <container>).")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     return p
 
@@ -132,7 +140,8 @@ def _warn_if_the_runner_reads_elsewhere() -> None:
         # the reaper can build covers this run.
         msg += (f"; and the orphan sweep exempts only the claim directories "
                 f"the reaper's own process can see -- its $GPU_CLAIM_DIR "
-                f"and {default} -- so kill_orphan_cuda will SIGKILL it")
+                f"and {default} -- so it will SIGTERM this run and then "
+                f"SIGKILL whatever survives the grace")
     print(f"{msg}. Export GPU_CLAIM_DIR={theirs} before claiming.",
           file=sys.stderr)
 
@@ -142,6 +151,56 @@ def _same_dir(a: Path, b: Path) -> bool:
         return a.resolve() == b.resolve()
     except OSError:
         return a == b
+
+
+def _resolve_scope(scope_pid: int) -> str | None:
+    """The cgroup `--scope-pid` names, or None after reporting why not.
+
+    Resolution and refusal happen here, at claim time, rather than in the
+    reaper an hour later: an over-broad scope does not fail, it silently
+    disables orphan protection for the card, and the operator's only
+    other signal would be a SIGKILL that never comes.
+    """
+    if scope_pid <= 0:
+        print(f"gpu-claim: --scope-pid must be a pid, got {scope_pid}",
+              file=sys.stderr)
+        return None
+    scope = cgroups.cgroup_of(scope_pid)
+    if scope is None:
+        # Three causes with three different next moves, and `cgroup_of`
+        # collapses all of them to None on purpose -- it must never guess
+        # a path. A pid that is gone is a typo or a race the operator
+        # retries; an entry that could not be *read* is a `hidepid` mount
+        # or another user's process, and `pid_alive` answers True on
+        # EPERM so that case reaches here with /proc perfectly healthy;
+        # only an entry we read with no `0::` line in it is a v1 box.
+        # Reporting the middle one as the last named a kernel feature
+        # that is working and sent the operator nowhere useful.
+        if not pid_alive(scope_pid):
+            print(f"gpu-claim: --scope-pid {scope_pid} is not a running "
+                  f"process", file=sys.stderr)
+            return None
+        why = cgroups.read_error(scope_pid)
+        if why is not None:
+            print(f"gpu-claim: cannot read /proc/{scope_pid}/cgroup: "
+                  f"{why}. A `hidepid` mount or a pid owned by another "
+                  f"user does this; run gpu-claim as that process's owner",
+                  file=sys.stderr)
+        else:
+            print(f"gpu-claim: pid {scope_pid} has no unified cgroup path; "
+                  f"--scope-pid needs cgroup v2 and this box is not "
+                  f"running it", file=sys.stderr)
+        return None
+    reason = cgroups.refuse_reason(scope)
+    if reason is not None:
+        print(f"gpu-claim: --scope-pid {scope_pid}: {reason}",
+              file=sys.stderr)
+        return None
+    n = cgroups.scope_process_count(scope)
+    where = "" if n is None else \
+        f" ({n} live process{'' if n == 1 else 'es'})"
+    print(f"gpu-claim: scope {scope}{where}", file=sys.stderr)
+    return scope
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -203,6 +262,12 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
+    scope_cgroup = None
+    if args.scope_pid is not None:
+        scope_cgroup = _resolve_scope(args.scope_pid)
+        if scope_cgroup is None:
+            return 2
+
     try:
         key = gpu_key(args.gpu_index)
     except GpuIdError as e:
@@ -211,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.no_preflight:
         try:
-            preflight()
+            preflight(scope=scope_cgroup)
         except PreflightFailed as e:
             print(f"gpu-claim: {e}", file=sys.stderr)
             return EX_UNAVAILABLE
@@ -222,7 +287,9 @@ def main(argv: list[str] | None = None) -> int:
         # named, and it is the card the key and the pin already point at.
         with gpu_claim(key=key, owner=args.owner, cmd=cmd, wait=args.wait,
                        vram_mb=args.vram_mb,
-                       usable_mb=default_usable_mb(args.gpu_index)):
+                       usable_mb=default_usable_mb(args.gpu_index),
+                       scope_pid=args.scope_pid,
+                       scope_cgroup=scope_cgroup):
             return subprocess.run(cmd, env=_child_env(args.gpu_index)).returncode
     except CannotEverFit as e:
         # Ahead of ClaimBusy, which it subclasses: 75 means "try again

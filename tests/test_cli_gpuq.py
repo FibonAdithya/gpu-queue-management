@@ -313,3 +313,119 @@ def test_submit_rejects_a_nonsense_declaration(tmp_path, capsys):
                "--vram-mb", "0", "--", "python", "t.py"])
     assert rc == 2
     assert "vram_mb" in capsys.readouterr().err
+
+
+def test_kills_prints_recent_kills(tmp_path, monkeypatch, capsys):
+    # The thing an agent that sees `killed by signal 9` can be TOLD to
+    # run. A file nobody thinks to open is barely better than the runner
+    # log nobody thinks to open, which is #24's actual complaint.
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    killlog.append(tmp_path, [{"pid": 2791919, "name": "tig-runtime",
+                               "used_mb": 900,
+                               "cgroup": "/system.slice/docker-abc.scope"}],
+                   ["/workspace/lock/gpu"])
+    assert main(["kills"]) == 0
+    out = capsys.readouterr().out
+    assert "2791919" in out
+    assert "docker-abc.scope" in out
+
+
+def test_kills_with_no_kills_says_so(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    assert main(["kills"]) == 0
+    assert "no kills" in capsys.readouterr().out.lower()
+
+
+def test_kills_notes_truncation_with_both_counts(tmp_path, monkeypatch,
+                                                  capsys):
+    # `entries` and `total` must come from one read (fix round 1): a
+    # separate second read for `total` could straddle a concurrent
+    # sweep's append and report a window that never existed.
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    for i in range(5):
+        killlog.append(tmp_path, [{"pid": i, "name": "p", "used_mb": 1,
+                                   "cgroup": "/c"}], [])
+    assert main(["kills", "--limit", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "showing the most recent 2 of 5" in out
+    assert "--limit 5" in out
+
+
+def test_kills_omits_truncation_notice_when_everything_fits(tmp_path,
+                                                             monkeypatch,
+                                                             capsys):
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    for i in range(3):
+        killlog.append(tmp_path, [{"pid": i, "name": "p", "used_mb": 1,
+                                   "cgroup": "/c"}], [])
+    assert main(["kills", "--limit", "20"]) == 0
+    out = capsys.readouterr().out
+    assert "showing the most recent" not in out
+
+
+def test_kills_limit_zero_does_not_claim_the_queue_has_no_kills(
+        tmp_path, monkeypatch, capsys):
+    """"no kills recorded" is a fact about the queue, not about the flag.
+
+    Printed for `--limit 0` against a queue that *has* kills, it tells an
+    agent chasing a signal death that the queue killed nothing -- which is
+    the same wrong answer, from the same file, that `gpuq kills` exists to
+    prevent. `read_with_total` already hands back the total.
+    """
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    killlog.append(tmp_path, [{"pid": 2791919, "name": "tig-runtime",
+                               "used_mb": 900, "cgroup": "/c"}], [])
+    assert main(["kills", "--limit", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "no kills recorded" not in out, \
+        "reported a queue with a kill in it as one with none"
+    assert "1 recorded" in out, out
+
+
+def test_kills_with_a_negative_limit_says_the_same(tmp_path, monkeypatch,
+                                                   capsys):
+    """`_apply_limit` treats every non-positive limit alike, so the
+    reporting must too -- otherwise `--limit -1` is the one spelling that
+    still lies about the queue."""
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    killlog.append(tmp_path, [{"pid": 2791919, "name": "t", "used_mb": 9,
+                               "cgroup": "/c"}], [])
+    assert main(["kills", "--limit", "-3"]) == 0
+    out = capsys.readouterr().out
+    assert "no kills recorded" not in out, out
+    assert "1 recorded" in out, out
+
+
+def test_kills_prints_a_zero_used_mb_as_zero(tmp_path, monkeypatch, capsys):
+    """`e.get('used_mb') or '?'` reads a real, measured 0 MiB as "we could
+    not measure it" -- and 0 is what a process that had just started, or
+    one nvidia-smi sampled between allocations, actually reports. `?` says
+    the record is incomplete when it is not."""
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    killlog.append(tmp_path, [{"pid": 2791919, "name": "t", "used_mb": 0,
+                               "cgroup": "/c"}], [])
+    assert main(["kills"]) == 0
+    out = capsys.readouterr().out
+    assert "0 MiB" in out, out
+    assert "? MiB" not in out, out
+
+
+def test_kills_limit_zero_prints_no_entries(tmp_path, monkeypatch, capsys):
+    # The falsy-zero trap, now guarded at the CLI layer too: `--limit 0`
+    # must not fall back to "everything".
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    killlog.append(tmp_path, [{"pid": 2791919, "name": "tig-runtime",
+                               "used_mb": 900,
+                               "cgroup": "/system.slice/docker-abc.scope"}],
+                   [])
+    assert main(["kills", "--limit", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "2791919" not in out
+    assert "docker-abc.scope" not in out
