@@ -366,6 +366,56 @@ def test_kills_omits_truncation_notice_when_everything_fits(tmp_path,
     assert "showing the most recent" not in out
 
 
+def test_kills_limit_zero_does_not_claim_the_queue_has_no_kills(
+        tmp_path, monkeypatch, capsys):
+    """"no kills recorded" is a fact about the queue, not about the flag.
+
+    Printed for `--limit 0` against a queue that *has* kills, it tells an
+    agent chasing a signal death that the queue killed nothing -- which is
+    the same wrong answer, from the same file, that `gpuq kills` exists to
+    prevent. `read_with_total` already hands back the total.
+    """
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    killlog.append(tmp_path, [{"pid": 2791919, "name": "tig-runtime",
+                               "used_mb": 900, "cgroup": "/c"}], [])
+    assert main(["kills", "--limit", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "no kills recorded" not in out, \
+        "reported a queue with a kill in it as one with none"
+    assert "1 recorded" in out, out
+
+
+def test_kills_with_a_negative_limit_says_the_same(tmp_path, monkeypatch,
+                                                   capsys):
+    """`_apply_limit` treats every non-positive limit alike, so the
+    reporting must too -- otherwise `--limit -1` is the one spelling that
+    still lies about the queue."""
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    killlog.append(tmp_path, [{"pid": 2791919, "name": "t", "used_mb": 9,
+                               "cgroup": "/c"}], [])
+    assert main(["kills", "--limit", "-3"]) == 0
+    out = capsys.readouterr().out
+    assert "no kills recorded" not in out, out
+    assert "1 recorded" in out, out
+
+
+def test_kills_prints_a_zero_used_mb_as_zero(tmp_path, monkeypatch, capsys):
+    """`e.get('used_mb') or '?'` reads a real, measured 0 MiB as "we could
+    not measure it" -- and 0 is what a process that had just started, or
+    one nvidia-smi sampled between allocations, actually reports. `?` says
+    the record is incomplete when it is not."""
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    killlog.append(tmp_path, [{"pid": 2791919, "name": "t", "used_mb": 0,
+                               "cgroup": "/c"}], [])
+    assert main(["kills"]) == 0
+    out = capsys.readouterr().out
+    assert "0 MiB" in out, out
+    assert "? MiB" not in out, out
+
+
 def test_kills_limit_zero_prints_no_entries(tmp_path, monkeypatch, capsys):
     # The falsy-zero trap, now guarded at the CLI layer too: `--limit 0`
     # must not fall back to "everything".

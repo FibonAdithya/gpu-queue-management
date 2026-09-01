@@ -1,4 +1,9 @@
 import json
+# The stdlib module, always spelled `signal`. It used to be imported a
+# second time as `_signal` further down, one character from `reaper._signal`
+# -- a function these tests monkeypatch by that name -- so a reader had to
+# check which of the two any given line meant. One import, and `rp._signal`
+# is the only thing that spelling refers to.
 import signal
 import pytest
 from gpuqueue import reaper as rp
@@ -182,7 +187,6 @@ def test_reap_can_skip_the_expensive_cuda_sweep(tmp_path, monkeypatch):
 # `own_pids` to set(), which is why the suite cannot currently see this.
 
 import os as _os
-import signal as _signal
 import subprocess as _sp
 import sys as _sys
 import time as _time
@@ -265,7 +269,7 @@ def holder_process(tmp_path):
     finally:
         for pid in (child, holder):
             try:
-                _os.kill(pid, _signal.SIGKILL)
+                _os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
 
@@ -727,7 +731,7 @@ def test_a_convicted_holder_is_sigtermed_before_sigkill(monkeypatch):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-    assert sent == [_signal.SIGTERM], "escalated past SIGTERM needlessly"
+    assert sent == [signal.SIGTERM], "escalated past SIGTERM needlessly"
 
 
 def test_kill_tree_does_not_wait_out_a_zombie(monkeypatch):

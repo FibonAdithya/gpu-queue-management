@@ -63,6 +63,30 @@ def cgroup_of(pid: int, proc_root: str = "/proc") -> str | None:
     return None
 
 
+def read_error(pid: int, proc_root: str = "/proc") -> str | None:
+    """Why `/proc/<pid>/cgroup` could not be read, or None if it could.
+
+    The distinction `cgroup_of` deliberately refuses to make. It answers
+    None for three different reasons and must not guess between them, so
+    the one caller with an operator to tell -- `cli_claim._resolve_scope`
+    -- asks here instead. "Unreadable" and "read it, and there was no
+    `0::` line" have completely different next moves, and reporting the
+    first as the second names a kernel feature that is working fine.
+
+    Reachable with /proc perfectly healthy: a `hidepid` mount, or a pid
+    belonging to another user, gives EACCES, while `pid_alive` -- which is
+    `kill(pid, 0)` -- answers True on EPERM.
+
+    The strerror rather than the exception, because this goes straight
+    into a message an operator reads.
+    """
+    try:
+        Path(proc_root, str(pid), "cgroup").read_text()
+    except OSError as e:
+        return e.strerror or str(e)
+    return None
+
+
 def refuse_reason(scope: str) -> str | None:
     """Why this scope may not be claimed, or None if it may.
 

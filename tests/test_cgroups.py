@@ -43,6 +43,21 @@ def test_cgroup_of_is_none_for_a_pid_that_is_gone(tmp_path):
     assert cgroups.cgroup_of(99999, root) is None
 
 
+def test_read_error_is_none_when_the_entry_can_be_read(tmp_path):
+    """The half `cgroup_of` cannot express. It collapses "unreadable" and
+    "read it, no `0::` line" into one None, on purpose -- it must never
+    guess a path -- so the caller with someone to tell asks separately."""
+    root = _proc(tmp_path, {42: "1:name=systemd:/whatever\n"})
+    assert cgroups.cgroup_of(42, root) is None    # a v1 box
+    assert cgroups.read_error(42, root) is None   # but perfectly readable
+
+
+def test_read_error_names_the_os_error(tmp_path):
+    root = _proc(tmp_path, {42: f"0::{DOCKER}\n"})
+    assert cgroups.read_error(43, root) is not None, \
+        "an entry that is not there must not read as one we could open"
+
+
 def test_in_scope_covers_a_nested_cgroup(tmp_path):
     # A container that makes its own sub-cgroups is still inside it.
     root = _proc(tmp_path, {42: f"0::{DOCKER}/worker\n"})

@@ -299,12 +299,28 @@ class Runner:
             # under one `$GPU_CLAIM_DIR` and an exemption set built under
             # another. An operator who sees a pid of theirs here can
             # compare the list against where their own `gpu-claim` wrote.
+            #
+            # What the ladder actually did, not what it can do. The line
+            # used to say "SIGTERMed, then SIGKILLed what survived the
+            # grace" on every sweep that killed anything, including one
+            # where every victim exited on the SIGTERM -- and a branch
+            # about log lines meaning what they say does not get to
+            # describe a rung it did not climb. `killed_details` carries
+            # `sigkilled` per victim; a caller that did not supply it
+            # (older stubs, and any future one) simply reports no
+            # escalation, which is the claim that needs evidence.
+            escalated = [d.get("pid") for d in
+                         (result.get("killed_details") or [])
+                         if d.get("sigkilled")]
             log.warning(
-                "orphan sweep SIGTERMed, then SIGKILLed what survived the "
-                "grace, unledgered CUDA %s %s; exemptions came from %s -- "
-                "a claim outside those is invisible here",
+                "orphan sweep SIGTERMed unledgered CUDA %s %s%s; exemptions "
+                "came from %s -- a claim outside those is invisible here",
                 "pid" if len(killed) == 1 else "pids",
                 ", ".join(str(p) for p in killed),
+                ("" if not escalated else
+                 ", then SIGKILLed "
+                 + ", ".join(str(p) for p in escalated)
+                 + " for surviving the grace"),
                 ", ".join(result.get("exemption_dirs") or ["(none)"]))
         for c in result.get("convicted", []):
             # Only a conviction that got the holder off the card stamps the

@@ -192,7 +192,17 @@ def _cmd_kills(args) -> int:
     # that swap and describe a truncation window that never existed.
     entries, total = killlog.read_with_total(q.root, limit=args.limit)
     if not entries:
-        print("no kills recorded")
+        # "no kills recorded" is a fact about the queue, not about the
+        # flag. Printed for a `--limit` that selects nothing from a queue
+        # that HAS kills, it tells an agent chasing a signal death that
+        # the queue killed nothing -- the same wrong answer, out of the
+        # same file, that this subcommand exists to prevent. `total` comes
+        # from the same snapshot as `entries`, so the two cannot disagree.
+        if total:
+            print(f"no kills shown: --limit {args.limit} selects none of "
+                  f"the {total} recorded -- pass a positive --limit")
+        else:
+            print("no kills recorded")
         return 0
     if total > len(entries):
         # Say so rather than truncating quietly. An operator who sees
@@ -200,8 +210,13 @@ def _cmd_kills(args) -> int:
         print(f"showing the most recent {len(entries)} of {total} "
               f"-- pass --limit {total} for all")
     for e in entries:
+        # `is None`, not `or`: a measured 0 MiB is a real reading -- a
+        # process that had just started, or one nvidia-smi sampled between
+        # allocations -- and `?` claims the record is incomplete when it
+        # is not.
+        used = e.get("used_mb")
         print(f"{e.get('ts', '?')}  pid {e.get('pid')}  "
-              f"{e.get('used_mb') or '?'} MiB  {e.get('name') or '?'}")
+              f"{'?' if used is None else used} MiB  {e.get('name') or '?'}")
         print(f"    cgroup:  {e.get('cgroup') or '(none read)'}")
         print(f"    reason:  {e.get('reason')}")
         print(f"    ledgers: "

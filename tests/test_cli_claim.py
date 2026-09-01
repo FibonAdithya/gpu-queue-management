@@ -326,6 +326,10 @@ def test_the_warning_names_sigkill_only_for_a_third_directory(
     cli_claim.main(["--", "true"])
     on_third = capsys.readouterr().err
     assert "SIGKILL" in on_third, on_third
+    # The sweep has had a SIGTERM rung since this branch added one, and a
+    # warning that names only the SIGKILL tells the operator their run
+    # will die with no stderr when in fact a handler gets a grace.
+    assert "SIGTERM" in on_third, on_third
 
 
 def test_status_warns_before_reporting_a_claim_the_reaper_cannot_see(
@@ -518,5 +522,29 @@ def test_scope_pid_on_a_cgroup_v1_box_is_refused(monkeypatch, capsys):
     monkeypatch.setattr(cli_claim.cgroups, "cgroup_of",
                         lambda pid, proc_root="/proc": None)
     monkeypatch.setattr(cli_claim, "pid_alive", lambda pid: True)
+    # Read fine, and there was no `0::` line: that is what makes this a v1
+    # box rather than an entry we were not allowed to open.
+    monkeypatch.setattr(cli_claim.cgroups, "read_error",
+                        lambda pid, proc_root="/proc": None)
     assert cli_claim.main(["--scope-pid", "2818873", "--", "true"]) == 2
     assert "cgroup v2" in capsys.readouterr().err
+
+
+def test_scope_pid_whose_proc_entry_is_unreadable_is_not_called_a_v1_box(
+        monkeypatch, capsys):
+    """`cgroup_of` returns None on any OSError, so a `hidepid` mount or a
+    pid belonging to another user produced "this box is not running cgroup
+    v2". That is false, and it sends the operator to check a kernel
+    feature that is working. The branch is reachable: `pid_alive` is
+    `kill(pid, 0)`, which answers True on EPERM.
+    """
+    monkeypatch.setattr(cli_claim.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    monkeypatch.setattr(cli_claim, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli_claim.cgroups, "read_error",
+                        lambda pid, proc_root="/proc": "Permission denied")
+    assert cli_claim.main(["--scope-pid", "2818873", "--", "true"]) == 2
+    err = capsys.readouterr().err
+    assert "Permission denied" in err, err
+    assert "cgroup v2" not in err, \
+        "named a kernel feature that is working fine"

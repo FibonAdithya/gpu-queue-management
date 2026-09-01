@@ -1474,6 +1474,47 @@ def test_a_kill_is_logged_with_the_ledgers_it_consulted(env, monkeypatch,
     assert "/workspace/lock/gpu" in msg and "/var/lock/gpu" in msg, msg
 
 
+def test_a_kill_line_does_not_claim_a_sigkill_that_never_happened(
+        env, monkeypatch, caplog):
+    """The line said "SIGTERMed, then SIGKILLed what survived the grace"
+    on every sweep that killed anything, including one where every victim
+    exited on the SIGTERM. A branch about log lines meaning what they say
+    does not get to describe a rung of the ladder it did not climb.
+    """
+    r, sha = env
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {
+        "killed_pids": [4321],
+        "killed_details": [{"pid": 4321, "sigkilled": False}],
+        "exemption_dirs": ["/workspace/lock/gpu"]})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+
+    msg = "\n".join(caplog.messages)
+    assert "4321" in msg, msg
+    assert "SIGTERM" in msg, msg
+    assert "SIGKILL" not in msg, msg
+
+
+def test_a_kill_line_names_what_it_had_to_sigkill(env, monkeypatch, caplog):
+    r, sha = env
+    monkeypatch.setattr(rn, "reap", lambda *a, **kw: {
+        "killed_pids": [4321, 4322],
+        "killed_details": [{"pid": 4321, "sigkilled": False},
+                           {"pid": 4322, "sigkilled": True}],
+        "exemption_dirs": ["/workspace/lock/gpu"]})
+
+    with caplog.at_level(logging.WARNING, logger="gpuqueue.runner"):
+        r._reap()
+
+    msg = "\n".join(caplog.messages)
+    assert "SIGKILL" in msg, msg
+    kill_half = msg.split("SIGKILL", 1)[1]
+    assert "4322" in kill_half, msg
+    assert "4321" not in kill_half, \
+        "named a victim that took the SIGTERM as one that survived it"
+
+
 def test_a_sweep_that_killed_nothing_says_nothing(env, monkeypatch, caplog):
     r, sha = env
     monkeypatch.setattr(rn, "reap", lambda *a, **kw: {

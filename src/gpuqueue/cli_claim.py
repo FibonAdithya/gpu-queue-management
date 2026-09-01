@@ -140,7 +140,8 @@ def _warn_if_the_runner_reads_elsewhere() -> None:
         # the reaper can build covers this run.
         msg += (f"; and the orphan sweep exempts only the claim directories "
                 f"the reaper's own process can see -- its $GPU_CLAIM_DIR "
-                f"and {default} -- so kill_orphan_cuda will SIGKILL it")
+                f"and {default} -- so it will SIGTERM this run and then "
+                f"SIGKILL whatever survives the grace")
     print(f"{msg}. Export GPU_CLAIM_DIR={theirs} before claiming.",
           file=sys.stderr)
 
@@ -166,12 +167,25 @@ def _resolve_scope(scope_pid: int) -> str | None:
         return None
     scope = cgroups.cgroup_of(scope_pid)
     if scope is None:
-        # Two causes with different next moves: a pid that is gone is a
-        # typo or a race the operator retries, a box with no unified
-        # hierarchy cannot support this flag at all.
+        # Three causes with three different next moves, and `cgroup_of`
+        # collapses all of them to None on purpose -- it must never guess
+        # a path. A pid that is gone is a typo or a race the operator
+        # retries; an entry that could not be *read* is a `hidepid` mount
+        # or another user's process, and `pid_alive` answers True on
+        # EPERM so that case reaches here with /proc perfectly healthy;
+        # only an entry we read with no `0::` line in it is a v1 box.
+        # Reporting the middle one as the last named a kernel feature
+        # that is working and sent the operator nowhere useful.
         if not pid_alive(scope_pid):
             print(f"gpu-claim: --scope-pid {scope_pid} is not a running "
                   f"process", file=sys.stderr)
+            return None
+        why = cgroups.read_error(scope_pid)
+        if why is not None:
+            print(f"gpu-claim: cannot read /proc/{scope_pid}/cgroup: "
+                  f"{why}. A `hidepid` mount or a pid owned by another "
+                  f"user does this; run gpu-claim as that process's owner",
+                  file=sys.stderr)
         else:
             print(f"gpu-claim: pid {scope_pid} has no unified cgroup path; "
                   f"--scope-pid needs cgroup v2 and this box is not "
