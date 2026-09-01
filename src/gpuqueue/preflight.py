@@ -11,6 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import cgroups
 from . import ledger
 # list_claims is re-exported, not used here; kept for callers.
 from .claim import all_claim_dirs, claim_dir, list_claims   # noqa: F401
@@ -113,7 +114,13 @@ def unledgered_processes(allow: set[int] | None = None,
 foreign_processes = unledgered_processes
 
 
-def preflight(allow: set[int] | None = None, directory=None) -> None:
+def preflight(allow: set[int] | None = None, directory=None,
+              scope: str | None = None) -> None:
+    """Refuse to start when a CUDA process holds the card with no claim.
+
+    `scope` is a cgroup the caller is about to claim; processes inside it
+    are not contention.
+    """
     # One query, not two: asking twice costs a second nvidia-smi and lets
     # the "can we see the list?" check and the "who is on the card?" check
     # disagree about what they saw.
@@ -128,6 +135,13 @@ def preflight(allow: set[int] | None = None, directory=None) -> None:
     exempt = set(allow or set()) | {os.getpid(), os.getppid()}
     exempt |= descendants(os.getpid())
     stray = [a for a in unledgered if a["pid"] not in exempt]
+    if scope:
+        # A claim that has not been taken yet. `attribute` covers a scope
+        # once the record is on disk, but this runs *before* that, so the
+        # container's in-flight CUDA has nothing to be charged to and
+        # would read as a stranger holding the card. Filtering here is
+        # what lets a busy container be claimed at all.
+        stray = [a for a in stray if not cgroups.in_scope(a["pid"], scope)]
     if stray:
         lines = [f"  pid {a['pid']:>7}  {a['used_mb'] or '?'} MiB  {a['name']}"
                  for a in stray]

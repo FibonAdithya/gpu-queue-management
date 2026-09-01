@@ -273,6 +273,29 @@ On a box whose driver reports no uuid, the name-index fallback is still a
 usable lock key but is not something the driver can resolve. Nothing is
 pinned, a warning is logged, and jobs run exactly as they did before.
 
+### Claiming for a container
+
+A claim normally covers the claimant's own process tree. That cannot
+express containerised CUDA: a `docker exec`'d process is a child of the
+containerd-shim, not of container init, so it is outside the pid tree of
+anything a claim can name from the host shell.
+
+`gpu-claim --scope-pid <pid>` charges the claim for the **cgroup** that
+pid belongs to, and everything nested under it:
+
+    gpu-claim --vram-mb 3000 \
+      --scope-pid $(docker inspect -f '{{.State.Pid}}' my-container) \
+      -- ./run_experiment.py
+
+The record then carries `scope_pid` and `scope_cgroup`, and the scope is
+honoured only while the anchor is alive *and* still in the recorded
+cgroup — so a container restart voids the scope rather than drifting it
+onto whatever the kernel gives that pid next.
+
+Refused: the root cgroup, top-level slices, and login sessions. Those
+are what a mistyped `--scope-pid` resolves to, and each would disable
+orphan protection for the whole card while looking like a normal claim.
+
 ## Failure handling
 
 | Failure | Response |

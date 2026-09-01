@@ -260,7 +260,9 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
               directory: Path | None = None, vram_mb: int | None = None,
               usable_mb: int | None | object = _ASK_THE_CARD,
               own_usage: bool = True,
-              max_holders: int | None | object = _ASK_THE_CONFIG):
+              max_holders: int | None | object = _ASK_THE_CONFIG,
+              scope_pid: int | None = None,
+              scope_cgroup: str | None = None):
     """Hold a share of the card. `vram_mb=None` means the whole of it.
 
     `own_usage=False` is for the runner, which takes the card before the
@@ -292,6 +294,13 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
     cause, so it gets its own cadence and a one-time explanation instead
     of silently retrying at the capacity rate for however long that run
     lasts.
+
+    `scope_pid`/`scope_cgroup` charge this claim for a cgroup it did not
+    spawn -- a container's CUDA work, which is not a descendant of
+    anything a claim can name from the host shell (issue #24). `usage_pid`
+    is still set alongside: ownership is the union of the pid tree and
+    the scope, because the wrapped command may touch the card itself and
+    over-exempting is the safe way to be wrong.
     """
     # The same rule `JobSpec.validate` applies on the submit path, applied
     # here because this is the other way into the ledger. A declaration
@@ -320,7 +329,8 @@ def gpu_claim(key: str | None = None, owner: str | None = None,
                 key, vram_mb=vram_mb, owner=owner or _default_owner(),
                 cmd=cmd, directory=d, usable_mb=usable_mb,
                 usage_pid=os.getpid() if own_usage else None,
-                max_holders=max_holders)
+                max_holders=max_holders,
+                scope_pid=scope_pid, scope_cgroup=scope_cgroup)
             break
         except MutexTimeout:
             if not wait:
