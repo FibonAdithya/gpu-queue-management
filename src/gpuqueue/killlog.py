@@ -51,8 +51,9 @@ def append(queue_root, entries: list[dict], consulted: list[str]) -> None:
     tmp.replace(p)
 
 
-def read(queue_root, limit: int | None = None) -> list[dict]:
-    """Recorded kills, oldest first. A corrupt line is skipped, not fatal.
+def _read_all(queue_root) -> list[dict]:
+    """Every recorded kill, oldest first, one disk read. A corrupt line is
+    skipped, not fatal.
 
     Same posture as `ledger._load`: whoever is reading this is mid-
     incident, and one bad line must not hide the record they came for.
@@ -68,10 +69,36 @@ def read(queue_root, limit: int | None = None) -> list[dict]:
             out.append(json.loads(line))
         except ValueError:
             continue
+    return out
+
+
+def _apply_limit(out: list[dict], limit: int | None) -> list[dict]:
     if limit is None:
         return out
     # Not `out[-limit:] if limit else out`: `--limit 0` falls to the
     # falsy branch and prints everything, and `out[-0:]` is the whole
     # list anyway, so even an `is not None` guard reads zero as "no
-    # limit".
+    # limit". This is the one place that contract is decided; every
+    # caller -- `read` and `read_with_total` alike -- goes through it
+    # rather than re-deciding it.
     return out[-limit:] if limit > 0 else []
+
+
+def read(queue_root, limit: int | None = None) -> list[dict]:
+    """Recorded kills, oldest first, limited per `_apply_limit`."""
+    return _apply_limit(_read_all(queue_root), limit)
+
+
+def read_with_total(queue_root,
+                     limit: int | None = None) -> tuple[list[dict], int]:
+    """`(limited entries, total recorded)` from a single disk read.
+
+    `append` swaps the file atomically (`tmp.replace`), so two separate
+    reads -- one for the shown entries, one for the total -- can straddle
+    a concurrent sweep's append and disagree about what "total" means.
+    A caller reporting a truncation window (`gpuq kills`'s "showing the
+    most recent N of M") needs N and M to come from the same snapshot,
+    or the window it describes may never have existed.
+    """
+    out = _read_all(queue_root)
+    return _apply_limit(out, limit), len(out)

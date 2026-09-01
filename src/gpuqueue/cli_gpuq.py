@@ -187,11 +187,13 @@ def _cmd_kills(args) -> int:
     an empty message. An agent that sees a signal death runs this.
     """
     q = _queue(args)
-    entries = killlog.read(q.root, limit=args.limit)
+    # One read: the runner appends to this file concurrently and swaps
+    # it atomically, so a second separate read for `total` could straddle
+    # that swap and describe a truncation window that never existed.
+    entries, total = killlog.read_with_total(q.root, limit=args.limit)
     if not entries:
         print("no kills recorded")
         return 0
-    total = len(killlog.read(q.root))
     if total > len(entries):
         # Say so rather than truncating quietly. An operator who sees
         # four kills and had five is chasing the wrong window.

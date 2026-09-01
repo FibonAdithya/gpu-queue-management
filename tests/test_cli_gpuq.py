@@ -335,3 +335,47 @@ def test_kills_with_no_kills_says_so(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
     assert main(["kills"]) == 0
     assert "no kills" in capsys.readouterr().out.lower()
+
+
+def test_kills_notes_truncation_with_both_counts(tmp_path, monkeypatch,
+                                                  capsys):
+    # `entries` and `total` must come from one read (fix round 1): a
+    # separate second read for `total` could straddle a concurrent
+    # sweep's append and report a window that never existed.
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    for i in range(5):
+        killlog.append(tmp_path, [{"pid": i, "name": "p", "used_mb": 1,
+                                   "cgroup": "/c"}], [])
+    assert main(["kills", "--limit", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "showing the most recent 2 of 5" in out
+    assert "--limit 5" in out
+
+
+def test_kills_omits_truncation_notice_when_everything_fits(tmp_path,
+                                                             monkeypatch,
+                                                             capsys):
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    for i in range(3):
+        killlog.append(tmp_path, [{"pid": i, "name": "p", "used_mb": 1,
+                                   "cgroup": "/c"}], [])
+    assert main(["kills", "--limit", "20"]) == 0
+    out = capsys.readouterr().out
+    assert "showing the most recent" not in out
+
+
+def test_kills_limit_zero_prints_no_entries(tmp_path, monkeypatch, capsys):
+    # The falsy-zero trap, now guarded at the CLI layer too: `--limit 0`
+    # must not fall back to "everything".
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    killlog.append(tmp_path, [{"pid": 2791919, "name": "tig-runtime",
+                               "used_mb": 900,
+                               "cgroup": "/system.slice/docker-abc.scope"}],
+                   [])
+    assert main(["kills", "--limit", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "2791919" not in out
+    assert "docker-abc.scope" not in out
