@@ -1686,9 +1686,34 @@ Steps 2-3, which are still outstanding.
   that claim is invisible and the container is SIGKILLed anyway — issue
   #19's shape, reached through the new feature.
 
-### Still outstanding
+### Done on the box, 2026-09-01
 
-- [ ] **Step 1: Deploy and restart the runner**
+All four steps ran against the live `tig-pentesting-tig-scorer-1` at
+deployed commit `e72995e`. Recorded on #24; the summary is below and the
+checkboxes are ticked in place.
+
+`kill_orphan_cuda` is `false` on this box for the c004 experiment. It was
+turned on for the verification window and restored afterwards — `diff`
+against the pre-verification backup is empty.
+
+- **The premise, re-measured.** A `docker exec`'d CUDA process had ppid
+  **2818851**, the containerd-shim, not container init 2818873.
+- **Step 2, no claim:** `16:30:22 orphan sweep SIGTERMed unledgered CUDA
+  pid 2943713`, dead ~50s after starting. `gpuq kills` named the scorer's
+  cgroup. The line says SIGTERMed with no escalation clause, so the victim
+  took the SIGTERM inside the grace.
+- **Step 3, scoped claim:** taken with `$GPU_CLAIM_DIR` unset, so the
+  record landed in `/var/lock/gpu` against the runner's
+  `/workspace/lock/gpu` — the divergent case, which is the only one where
+  `own_scopes()` breadth matters. `gpu-claim` printed `scope
+  /system.slice/docker-43faa0ee….scope (4 live processes)` and did **not**
+  refuse, though the CUDA was already on the card before the claim: §5's
+  trap. The holder survived **170s**, about three sweep intervals.
+- **It discriminates.** Claim released; the same two pids were swept three
+  minutes later, in one line — `SIGTERMed unledgered CUDA pids 2944556,
+  2944895` — which is the batched ladder's one shared grace, observed live.
+
+- [x] **Step 1: Deploy and restart the runner**
 
 The deployed tree is an **editable install at
 `/workspace/gpu-queue-management`** (on `main` at 9a5da12 as of
@@ -1702,7 +1727,7 @@ ssh tig-gpu 'cd /workspace/gpu-queue-management && git fetch && \
   git checkout <branch> && supervisorctl restart gpuq-runner'
 ```
 
-- [ ] **Step 2: Confirm the sweep kills an unclaimed container process**
+- [x] **Step 2: Confirm the sweep kills an unclaimed container process**
 
 Drive CUDA work through the scorer with no claim held, and watch:
 
@@ -1714,7 +1739,7 @@ Expected: an `orphan sweep SIGTERMed` line, then `gpuq kills` shows the
 pid with the scorer's cgroup. This is the **discriminating** half — if
 this does not kill, the test that follows proves nothing.
 
-- [ ] **Step 3: Confirm a scoped claim spares it**
+- [x] **Step 3: Confirm a scoped claim spares it**
 
 ```bash
 ssh tig-gpu 'PID=$(docker inspect -f "{{.State.Pid}}" tig-pentesting-tig-scorer-1); \
@@ -1732,7 +1757,7 @@ match the runner's. The divergence measured above is the realistic case,
 and a shell that borrows the runner's value would test the one
 configuration the bug could not occur in.
 
-- [ ] **Step 4: Record the result on the issue**
+- [x] **Step 4: Record the result on the issue**
 
 Post both outcomes to #24 — the kill without a claim and the survival
 with one. A single "it worked" does not distinguish a working exemption
