@@ -1648,11 +1648,58 @@ consulted."
 After Task 6, before closing #24. `tig-gpu` is reachable over ssh and
 `tig-pentesting-tig-scorer-1` is live.
 
-- [ ] **Step 1: Deploy the branch and restart the runner**
+### Already done, read-only, 2026-09-01
+
+These were measured on the box without deploying anything or restarting
+the runner. They confirm the design's premises; they do **not** replace
+Steps 2-3, which are still outstanding.
+
+- **Every deployment fact in the spec's §1 table still holds.**
+  `/proc/1/cgroup` is `0::/init.scope` (cgroup v2 unified, root
+  namespace); the runner is a **host** process (pid 2892850) in
+  `/system.slice/supervisor.service`; the scorer is up at init pid
+  2818873, cgroup `/system.slice/docker-43faa0ee4d16….scope` — the same
+  pid and cgroup the spec recorded.
+- **The premise re-measured against the live container.** A
+  `docker exec`'d process had ppid **2818851**, the containerd-shim, not
+  container init 2818873. `ps --ppid` descendants of init returned
+  **nothing**; the cgroup contained **both** processes. This is exactly
+  why a pid tree cannot express containerised CUDA.
+- **`cgroups.py` answers correctly against a real `/proc`** (module
+  copied to `/tmp` and run standalone — it imports nothing from
+  `gpuqueue`, so this needed no install): `in_scope(exec'd, scope)` True,
+  `in_scope(host shell, scope)` False, `refuse_reason(container scope)`
+  None, `scope_process_count` 2, and both a login session and `/`
+  refused with their intended messages.
+- **The claim-directory divergence is LIVE on this box**, which is what
+  makes `preflight.own_scopes()` load-bearing rather than defensive:
+
+  | | `$GPU_CLAIM_DIR` | `all_claim_dirs()` |
+  |---|---|---|
+  | runner (supervisor unit) | `/workspace/lock/gpu` | `['/workspace/lock/gpu', '/var/lock/gpu']` |
+  | interactive shell | *unset* | `['/var/lock/gpu']` |
+
+  `gpuq.toml` sets no `[queue].claim_dir`. So a `--scope-pid` claim taken
+  from a shell lands in `/var/lock/gpu`, while a scope exemption built
+  from `cfg.claim_dir or claim_dir()` in the runner reads only
+  `/workspace/lock/gpu`. Without `own_scopes()` reading every directory,
+  that claim is invisible and the container is SIGKILLed anyway — issue
+  #19's shape, reached through the new feature.
+
+### Still outstanding
+
+- [ ] **Step 1: Deploy and restart the runner**
+
+The deployed tree is an **editable install at
+`/workspace/gpu-queue-management`** (on `main` at 9a5da12 as of
+2026-09-01), with the venv at `/opt/gpuq/venv`. An earlier draft of this
+plan said `/opt/gpuq/src`; **that path does not exist** and the command
+failed at `cd`. Because the install is editable, no `pip install -e .` is
+needed for a pure-Python change — checkout and restart is enough.
 
 ```bash
-ssh tig-gpu 'cd /opt/gpuq/src && git fetch && git checkout <branch> && \
-  /opt/gpuq/venv/bin/pip install -e . && supervisorctl restart gpuq-runner'
+ssh tig-gpu 'cd /workspace/gpu-queue-management && git fetch && \
+  git checkout <branch> && supervisorctl restart gpuq-runner'
 ```
 
 - [ ] **Step 2: Confirm the sweep kills an unclaimed container process**
@@ -1679,6 +1726,11 @@ across at least two sweep intervals (>120s at the default 60s).
 
 Expected: no kill; `gpu-claim --status` shows the scope; `nvidia-smi`
 shows the work completing.
+
+Run this from a shell with `$GPU_CLAIM_DIR` **unset**, not exported to
+match the runner's. The divergence measured above is the realistic case,
+and a shell that borrows the runner's value would test the one
+configuration the bug could not occur in.
 
 - [ ] **Step 4: Record the result on the issue**
 
