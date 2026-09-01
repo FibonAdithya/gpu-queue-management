@@ -782,7 +782,13 @@ def test_a_conviction_whose_kill_failed_is_not_reported_as_killed(
     monkeypatch.setattr(lg, "all_records", lambda d: [rec])
     monkeypatch.setattr(rp, "compute_apps",
                         lambda: [{"pid": 500, "used_mb": 3070, "name": "t"}])
-    monkeypatch.setattr(rp, "_kill_tree", lambda pid: False)  # EPERM
+    # `_kill_pids` is the seam the conviction path goes through:
+    # `_kill_convicted` targets the pid tree *and* whatever the record
+    # was charged for, which for a scoped record is not in its tree.
+    # Patched here rather than at `_kill_tree`, which that path no
+    # longer calls -- stubbing a function nothing reaches would let the
+    # real ladder deliver signals to pid 500.
+    monkeypatch.setattr(rp, "_kill_pids", lambda pids: False)  # EPERM
 
     strikes = {}
     reap(q, cfg, vram_strikes=strikes)                    # first strike
@@ -822,7 +828,7 @@ def test_a_blind_sweep_does_not_bank_a_vram_strike(q, tmp_path, monkeypatch):
                        kill_orphan_cuda=False, enforce_vram=True)
     rec = _rec(tmp_path, "1.a.json", 500, 512, owner="alice")
     monkeypatch.setattr(lg, "all_records", lambda d: [rec])
-    monkeypatch.setattr(rp, "_kill_tree", lambda pid: True)
+    monkeypatch.setattr(rp, "_kill_pids", lambda pids: True)
     over = [{"pid": 500, "used_mb": 3070, "name": "t"}]
     seen = iter([over, None, over])
     monkeypatch.setattr(rp, "compute_apps", lambda: next(seen))
@@ -842,7 +848,7 @@ def test_a_conviction_whose_kill_landed_says_so(q, tmp_path, monkeypatch):
     monkeypatch.setattr(lg, "all_records", lambda d: [rec])
     monkeypatch.setattr(rp, "compute_apps",
                         lambda: [{"pid": 500, "used_mb": 3070, "name": "t"}])
-    monkeypatch.setattr(rp, "_kill_tree", lambda pid: True)
+    monkeypatch.setattr(rp, "_kill_pids", lambda pids: True)
 
     strikes = {}
     reap(q, cfg, vram_strikes=strikes)
@@ -1276,3 +1282,110 @@ def test_reap_does_not_report_a_live_scope_as_void(q, tmp_path, monkeypatch):
         lambda pid, proc_root="/proc": "/system.slice/docker-abc.scope")
     result = reap(q, cfg)
     assert str(rec_path) not in result["void_scopes"]
+
+
+# --- a conviction reaches what it was charged for ------------------------
+
+def test_a_scoped_conviction_kills_the_processes_it_was_charged_for(
+        tmp_path, monkeypatch):
+    """A scoped record's usage_pid tree is not where its VRAM is.
+
+    `--scope-pid` exists precisely because a container's CUDA is not a
+    descendant of anything the claim can name from the host shell (issue
+    #24), so `ledger.attribute` charges those processes to the record
+    while `_kill_tree(usage_pid)` reaches only the `gpu-claim` wrapper.
+    Convicting on usage the kill cannot touch ends the claim, leaves the
+    over-user on the card, and logs `killed` over a process nothing
+    signalled -- the same "the message said something other than what
+    happened" this branch spent five commits removing.
+    """
+    from gpuqueue import ledger as lg
+    SCOPE = "/system.slice/docker-abc.scope"
+    CONTAINER_PID = 424242
+    monkeypatch.setattr(
+        rp.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc": (
+            SCOPE if pid in (_os.getpid(), CONTAINER_PID)
+            else "/user.slice/elsewhere.scope"))
+    rec = lg.Record(path=tmp_path / "c.json", pid=_os.getpid(),
+                    usage_pid=_os.getpid(), vram_mb=1000, owner="scoped",
+                    cmd=[], started_at="t", key="k",
+                    scope_pid=_os.getpid(), scope_cgroup=SCOPE)
+    apps = [{"pid": CONTAINER_PID, "used_mb": 40000, "name": "python"}]
+    strikes = {}
+    for _ in range(rp.WATCHDOG_STRIKES):
+        convicted = rp.check_vram([rec], apps, strikes)
+    assert len(convicted) == 1
+
+    # The ladder itself is `_kill_pids`, tested above; what is under test
+    # here is which pids reach it.
+    targeted = []
+    monkeypatch.setattr(rp, "_kill_pids",
+                        lambda pids: targeted.append(set(pids)) or True)
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    rp._kill_convicted(convicted[0])
+    assert CONTAINER_PID in targeted[0], \
+        "convicted a record for VRAM the kill never reached"
+
+
+def test_an_ordinary_conviction_still_kills_only_its_own_tree(
+        tmp_path, monkeypatch):
+    """The union above must not become an amnesty in the other direction:
+    a record with no scope kills exactly what it always did."""
+    from gpuqueue import ledger as lg
+    rec = lg.Record(path=tmp_path / "c.json", pid=_os.getpid(),
+                    usage_pid=1111, vram_mb=10, owner="plain", cmd=[],
+                    started_at="t", key="k")
+    kids = lambda pid: {2222} if pid == 1111 else set()   # noqa: E731
+    monkeypatch.setattr(rp, "descendants", kids)
+    monkeypatch.setattr(lg, "descendants", kids)
+    apps = [{"pid": 2222, "used_mb": 900, "name": "x"}]
+    strikes = {}
+    for _ in range(rp.WATCHDOG_STRIKES):
+        convicted = rp.check_vram([rec], apps, strikes)
+    assert len(convicted) == 1
+    targeted = []
+    monkeypatch.setattr(rp, "_kill_pids",
+                        lambda pids: targeted.append(set(pids)) or True)
+    rp._kill_convicted(convicted[0])
+    assert targeted[0] == {1111, 2222}
+
+
+def test_a_conviction_with_nothing_to_kill_is_not_reported_as_killed(
+        tmp_path, monkeypatch):
+    """An admitted-but-unlaunched record owns nothing; `bool(usage_pid)`
+    used to be what stopped `_kill_tree(None)`."""
+    monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    assert rp._kill_convicted({"usage_pid": None, "pids": []}) is False
+
+
+def test_a_void_scope_outside_the_runners_own_claim_dir_is_reported(
+        q, tmp_path, monkeypatch):
+    """The void report must have the breadth the exemption has.
+
+    `own_scopes()` honours a scope claimed in any of `all_claim_dirs()`,
+    because an interactive shell and a supervisor unit systematically
+    disagree about `$GPU_CLAIM_DIR` -- that disagreement is issue #19.
+    Reading only `cfg.claim_dir` here means the claims most likely to go
+    void are the ones never reported void: the operator's exemption stops
+    covering their container, nothing says so, and the next sweep kills
+    it. That silence is what issue #24 is.
+    """
+    from gpuqueue import ledger as lg
+    theirs = tmp_path / "shell-claims"
+    daemons = tmp_path / "daemon-claims"
+    theirs.mkdir()
+    daemons.mkdir()
+    monkeypatch.setenv("GPU_CLAIM_DIR", str(theirs))
+    cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True,
+                       claim_dir=daemons)
+    rec_path = lg.ledger_dir("k", theirs) / f"{_os.getpid()}.aaa.json"
+    lg.write_record(lg.Record(
+        path=rec_path, pid=_os.getpid(), usage_pid=None, vram_mb=None,
+        owner="scoped", cmd=[], started_at="2026-08-10T00:00:00Z", key="k",
+        scope_pid=_os.getpid(),
+        scope_cgroup="/system.slice/docker-abc.scope"))
+    monkeypatch.setattr(
+        rp.cgroups, "cgroup_of",
+        lambda pid, proc_root="/proc": "/system.slice/docker-xyz.scope")
+    assert str(rec_path) in reap(q, cfg)["void_scopes"]

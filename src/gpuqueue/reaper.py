@@ -292,7 +292,16 @@ def _kill_tree(pid: int) -> bool:
     on this shared claim directory means another user's process and an
     EPERM `_signal` swallowed.
     """
-    tree = {pid} | descendants(pid)
+    return _kill_pids({pid} | descendants(pid))
+
+
+def _kill_pids(tree: set[int]) -> bool:
+    """The ladder itself, over a pid set the caller chose.
+
+    Split out of `_kill_tree` because a scoped record's VRAM is not in its
+    pid tree; see `_kill_convicted`. The set is enumerated by the caller
+    and never re-read, which is what bounds the wait at 10s + 5s.
+    """
     for sig, grace in ((signal.SIGTERM, 10.0), (signal.SIGKILL, 5.0)):
         alive = [p for p in tree if not _exited(p)]
         if not alive:
@@ -305,6 +314,38 @@ def _kill_tree(pid: int) -> bool:
                 return True
             time.sleep(0.1)
     return all(_exited(p) for p in tree)
+
+
+def _kill_convicted(c: dict) -> bool:
+    """Get a convicted holder off the card -- all of it, not just its tree.
+
+    `_kill_tree(usage_pid)` was the whole of this while every record owned
+    a pid tree. A scoped record does not: `--scope-pid` exists precisely
+    because a container's CUDA is not a descendant of anything a claim can
+    name from the host shell (issue #24), so `ledger.attribute` charges
+    those processes to the record while the usage_pid tree holds only the
+    `gpu-claim` wrapper. Killing the tree alone ended the claim, left the
+    over-user on the card, and had the runner log `killed` over a process
+    nothing signalled -- and the next orphan sweep then recorded that
+    process in `kills.jsonl` as `orphan_sweep_unledgered`, sending its
+    owner to add a scope they already had.
+
+    `pids` is exactly what `attribute` charged, so for a record with no
+    scope it is already inside the tree and this is the union it always
+    was. Only the processes on the card, not every process in the cgroup:
+    the claim is charged for the cgroup's VRAM, not licensed to kill a
+    container's init.
+    """
+    targets: set[int] = set()
+    if c.get("usage_pid"):
+        targets |= {c["usage_pid"]} | descendants(c["usage_pid"])
+    targets |= set(c.get("pids") or [])
+    if not targets:
+        # An admitted-but-unlaunched record owns nothing. `bool(usage_pid)`
+        # used to be what stopped `_kill_tree(None)`; the guard moves here
+        # rather than disappearing.
+        return False
+    return _kill_pids(targets)
 
 
 def check_vram(records: list, apps: list[dict],
@@ -347,7 +388,13 @@ def check_vram(records: list, apps: list[dict],
             # this function has just finished explaining is ambiguous, and
             # nothing consumed it. `owner` is what identifies the holder.
             convicted.append({"owner": rec.owner, "declared": rec.vram_mb,
-                              "used": used, "usage_pid": rec.usage_pid})
+                              "used": used, "usage_pid": rec.usage_pid,
+                              # What `used` was actually measured over.
+                              # For a scoped record these are the only
+                              # pids the kill can reach; see
+                              # `_kill_convicted`.
+                              "pids": sorted(a["pid"]
+                                             for a in owned.get(key, []))})
     for key in list(strikes):
         if key not in seen:
             strikes.pop(key)  # the holder is gone; its strikes go with it
@@ -482,9 +529,22 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
             # reported is "this record claims a scope, and the scope no
             # longer holds" -- a record with no scope at all was never
             # making that claim and has nothing to go void.
-            void_scopes = [str(r.path) for r in records
-                          if r.scope_cgroup is not None
-                          and not ledger.scope_is_live(r)]
+            # Over every swept directory, not `claims` alone. The
+            # exemption this reports the loss of comes from
+            # `own_scopes()`, which reads them all -- and it has to,
+            # because an interactive shell and a supervisor unit
+            # systematically disagree about `$GPU_CLAIM_DIR` (issue #19).
+            # Read from `cfg.claim_dir` only, the claims most likely to go
+            # void were the ones never reported void: the operator's
+            # exemption quietly stops covering their container and the
+            # next sweep kills it, which is issue #24's silence exactly.
+            # `records` stays as it is -- it is what `attribute` and the
+            # watchdog measure over, a narrower question.
+            void_scopes = [str(r.path)
+                           for d in _swept_dirs(claims)
+                           for r in ledger.live_records(ledger.all_records(d))
+                           if r.scope_cgroup is not None
+                           and not ledger.scope_is_live(r)]
             if cfg.kill_orphan_cuda:
                 protect = _running_trees(queue)
                 # What the log names, so it names what was consulted
@@ -508,8 +568,7 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
                     # goes on over-using the card. Reporting the
                     # conviction alone would have the runner log `killed`
                     # over a process that is still running.
-                    c["killed"] = bool(c["usage_pid"]) and _kill_tree(
-                        c["usage_pid"])
+                    c["killed"] = _kill_convicted(c)
     cleaned = clean_partials(queue)
     return {"stale_claims": stale, "stuck_claims": stuck,
             "requeued": requeued, "failed": failed,

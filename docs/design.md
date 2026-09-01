@@ -296,6 +296,13 @@ Refused: the root cgroup, top-level slices, and login sessions. Those
 are what a mistyped `--scope-pid` resolves to, and each would disable
 orphan protection for the whole card while looking like a normal claim.
 
+The VRAM watchdog follows, because it shares `ledger.attribute`: a scoped
+record is convicted on its cgroup's usage. Conviction then kills the
+processes the record was charged for as well as its own pid tree — for a
+scoped record those are not the same set, and killing the tree alone
+would end the claim while the over-user kept the card, then have the next
+orphan sweep record that process as unledgered.
+
 ## Failure handling
 
 | Failure | Response |
