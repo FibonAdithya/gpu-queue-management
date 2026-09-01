@@ -21,9 +21,15 @@ training does not.
 
 ## Constraints
 
-- The target box is an **unprivileged container** (a hosted PyTorch image). No
-  Docker-in-Docker, no kernel modules, no sysctls. Long-running processes are
-  managed by **supervisor**.
+- The target box runs the queue as an **unprivileged host process** under
+  **supervisor**. No kernel modules, no sysctls, and nothing here may require
+  root. It was originally a hosted PyTorch container; on `tig-gpu` as of
+  2026-09-01 the runner is a host process in the root cgroup namespace
+  (`/system.slice/supervisor.service`), and GPU work of its *users* is what
+  now runs in containers. `cgroups.py` depends on that direction only: it
+  reads `/proc/<pid>/cgroup`, never `/sys/fs/cgroup`, so it degrades to
+  "covers nothing" rather than mis-exempting if the runner is ever
+  namespaced again.
 - The box is **ephemeral**. It may be destroyed and rebuilt; nothing on it may
   be hand-made, and host identity must be a single variable.
 - Consumers may be **agents, not people**. Interfaces must be inspectable
