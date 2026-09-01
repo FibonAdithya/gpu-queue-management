@@ -17,7 +17,7 @@
 - **Never read `/sys/fs/cgroup`.** Only the reverse direction (pid → cgroup path via `/proc/<pid>/cgroup`) is implemented, so this works without the cgroup mount visible.
 - **Every new `Record` field is read with `.get(...)`.** `_load` returns `None` on any exception; a `d["scope_pid"]` would make every pre-upgrade record on disk unreadable, blinding the reaper to live claims. That is issue #19's failure with a new cause.
 - **`preflight.own_pids` is not modified.** Its pid-tree exemption stays exactly as issue #19 left it.
-- **Run the full suite before every commit:** `python -m pytest -q`.
+- **Run the full suite before every commit:** `.venv/bin/python -m pytest -q`. Baseline on `main` at 2026-09-01 is **546 passed**. There is no bare `python` on PATH, so the venv interpreter is not optional.
 - **Mutation-check each new test** before committing the task: break the code under test, confirm the test fails, restore. The plan names the mutation for each test.
 
 ---
@@ -159,7 +159,7 @@ def test_scope_process_count_is_none_when_proc_is_unreadable(tmp_path):
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `python -m pytest tests/test_cgroups.py -q`
+Run: `.venv/bin/python -m pytest tests/test_cgroups.py -q`
 Expected: FAIL — `ModuleNotFoundError: No module named 'gpuqueue.cgroups'`
 
 - [ ] **Step 3: Write the implementation**
@@ -290,12 +290,12 @@ def scope_process_count(scope: str, proc_root: str = "/proc") -> int | None:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `python -m pytest tests/test_cgroups.py -q`
-Expected: PASS (14 tests)
+Run: `.venv/bin/python -m pytest tests/test_cgroups.py -q`
+Expected: PASS (16 tests — the parametrized case is four)
 
 - [ ] **Step 5: Mutation-check the two load-bearing tests**
 
-1. In `cgroup_of`, replace the loop body with `return text.splitlines()[0].strip()`. Run `python -m pytest tests/test_cgroups.py -q`. Expected: `test_cgroup_of_is_none_on_a_cgroup_v1_box` FAILS. Restore.
+1. In `cgroup_of`, replace the loop body with `return text.splitlines()[0].strip()`. Run `.venv/bin/python -m pytest tests/test_cgroups.py -q`. Expected: `test_cgroup_of_is_none_on_a_cgroup_v1_box` FAILS. Restore.
 2. In `in_scope`, change the last line to `return cg.startswith(scope)`. Run again. Expected: `test_in_scope_rejects_a_sibling_sharing_a_prefix` FAILS. Restore.
 3. In `refuse_reason`, delete the `_SESSION` branch. Run again. Expected: `test_refuse_reason_rejects_a_login_session` FAILS. Restore.
 
@@ -325,7 +325,7 @@ Replace with:
 
 - [ ] **Step 7: Run the full suite**
 
-Run: `python -m pytest -q`
+Run: `.venv/bin/python -m pytest -q`
 Expected: PASS, with 14 more tests than before.
 
 - [ ] **Step 8: Commit**
@@ -376,14 +376,14 @@ def test_a_record_written_without_scope_keys_still_loads(tmp_path):
                              "vram_mb": 512, "owner": "someone",
                              "cmd": ["train"], "started_at": "",
                              "key": "k"}))
-    rec = ledger._load(p)
+    rec = lg._load(p)
     assert rec is not None
     assert rec.pid == 4321
     assert rec.scope_pid is None and rec.scope_cgroup is None
 
 
 def test_acquire_records_the_scope(tmp_path):
-    rec = ledger.acquire("k", vram_mb=512, owner="me", cmd=["x"],
+    rec = lg.acquire("k", vram_mb=512, owner="me", cmd=["x"],
                          directory=tmp_path, usable_mb=8000,
                          usage_pid=os.getpid(),
                          scope_pid=4321,
@@ -391,12 +391,12 @@ def test_acquire_records_the_scope(tmp_path):
     on_disk = json.loads(rec.path.read_text())
     assert on_disk["scope_pid"] == 4321
     assert on_disk["scope_cgroup"] == "/system.slice/docker-abc.scope"
-    assert ledger._load(rec.path).scope_cgroup == \
+    assert lg._load(rec.path).scope_cgroup == \
         "/system.slice/docker-abc.scope"
 
 
 def _scoped(tmp_path, scope_pid, scope_cgroup):
-    return ledger.Record(
+    return lg.Record(
         path=tmp_path / "r.json", pid=os.getpid(), usage_pid=os.getpid(),
         vram_mb=512, owner="me", cmd=[], started_at="", key="k",
         scope_pid=scope_pid, scope_cgroup=scope_cgroup)
@@ -404,39 +404,39 @@ def _scoped(tmp_path, scope_pid, scope_cgroup):
 
 def test_scope_is_live_when_the_anchor_still_sits_where_it_did(
         tmp_path, monkeypatch):
-    monkeypatch.setattr(ledger.cgroups, "cgroup_of",
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
                         lambda pid, proc_root="/proc": "/system.slice/d.scope")
     rec = _scoped(tmp_path, os.getpid(), "/system.slice/d.scope")
-    assert ledger.scope_is_live(rec) is True
+    assert lg.scope_is_live(rec) is True
 
 
 def test_scope_is_dead_when_the_anchor_is_gone(tmp_path, monkeypatch):
     # A dead anchor whose pid the kernel later reuses would otherwise
     # drift the exemption onto an unrelated process's cgroup.
-    monkeypatch.setattr(ledger.cgroups, "cgroup_of",
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
                         lambda pid, proc_root="/proc": "/system.slice/d.scope")
     rec = _scoped(tmp_path, 999999, "/system.slice/d.scope")
-    assert ledger.scope_is_live(rec) is False
+    assert lg.scope_is_live(rec) is False
 
 
 def test_scope_is_dead_when_the_anchor_moved_cgroup(tmp_path, monkeypatch):
     # The container restarted: same pid alive, new docker scope id. A
     # check of `pid_alive` alone would honour the stale path.
-    monkeypatch.setattr(ledger.cgroups, "cgroup_of",
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
                         lambda pid, proc_root="/proc": "/system.slice/NEW.scope")
     rec = _scoped(tmp_path, os.getpid(), "/system.slice/OLD.scope")
-    assert ledger.scope_is_live(rec) is False
+    assert lg.scope_is_live(rec) is False
 
 
 def test_a_record_with_no_scope_is_not_live_scoped(tmp_path):
-    assert ledger.scope_is_live(_scoped(tmp_path, None, None)) is False
+    assert lg.scope_is_live(_scoped(tmp_path, None, None)) is False
 ```
 
-Ensure `tests/test_ledger.py` imports `json` and `os` at the top; add them if absent.
+`tests/test_ledger.py` already imports `json`, `os` and binds the module as `from gpuqueue import ledger as lg` — use that alias, do not add a second name for the same module.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `python -m pytest tests/test_ledger.py -q -k "scope"`
+Run: `.venv/bin/python -m pytest tests/test_ledger.py -q -k "scope"`
 Expected: FAIL — `TypeError: __init__() got an unexpected keyword argument 'scope_pid'` and `AttributeError: module 'gpuqueue.ledger' has no attribute 'scope_is_live'`
 
 - [ ] **Step 3: Write the implementation**
@@ -553,18 +553,18 @@ def acquire(key: str, *, vram_mb: int | None, owner: str,
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `python -m pytest tests/test_ledger.py -q`
+Run: `.venv/bin/python -m pytest tests/test_ledger.py -q`
 Expected: PASS
 
 - [ ] **Step 5: Mutation-check**
 
-1. In `_load`, change `scope_pid=(int(d["scope_pid"]) if d.get(...))` to `scope_pid=int(d["scope_pid"])`. Run `python -m pytest tests/test_ledger.py -q`. Expected: `test_a_record_written_without_scope_keys_still_loads` FAILS. Restore.
+1. In `_load`, change `scope_pid=(int(d["scope_pid"]) if d.get(...))` to `scope_pid=int(d["scope_pid"])`. Run `.venv/bin/python -m pytest tests/test_ledger.py -q`. Expected: `test_a_record_written_without_scope_keys_still_loads` FAILS. Restore.
 2. In `scope_is_live`, delete the `pid_alive` check. Expected: `test_scope_is_dead_when_the_anchor_is_gone` FAILS. Restore.
 3. In `scope_is_live`, replace the final line with `return True`. Expected: `test_scope_is_dead_when_the_anchor_moved_cgroup` FAILS. Restore.
 
 - [ ] **Step 6: Run the full suite**
 
-Run: `python -m pytest -q`
+Run: `.venv/bin/python -m pytest -q`
 Expected: PASS. Nothing else reads these fields yet, so no existing test should change behaviour.
 
 - [ ] **Step 7: Commit**
@@ -608,7 +608,7 @@ SCOPE = "/system.slice/docker-43faa0ee.scope"
 
 def _rec(tmp_path, name, *, usage_pid=None, scope_pid=None,
          scope_cgroup=None):
-    return ledger.Record(
+    return lg.Record(
         path=tmp_path / name, pid=os.getpid(), usage_pid=usage_pid,
         vram_mb=512, owner="me", cmd=[], started_at="", key="k",
         scope_pid=scope_pid, scope_cgroup=scope_cgroup)
@@ -618,12 +618,12 @@ def test_a_process_in_a_claimed_cgroup_is_charged_to_that_record(
         tmp_path, monkeypatch):
     # Issue #24 at unit scale: the CUDA process is not a descendant of
     # anything the claim could name, and the claim covers it anyway.
-    monkeypatch.setattr(ledger.cgroups, "cgroup_of",
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
                         lambda pid, proc_root="/proc": SCOPE)
     rec = _rec(tmp_path, "a.json", usage_pid=os.getpid(),
                scope_pid=os.getpid(), scope_cgroup=SCOPE)
     apps = [{"pid": 2791919, "used_mb": 900, "name": "tig-runtime"}]
-    owned, unledgered = ledger.attribute(apps, [rec])
+    owned, unledgered = lg.attribute(apps, [rec])
     assert unledgered == []
     assert owned[str(rec.path)] == apps
 
@@ -631,13 +631,13 @@ def test_a_process_in_a_claimed_cgroup_is_charged_to_that_record(
 def test_a_process_outside_every_scope_is_unledgered(tmp_path, monkeypatch):
     # The other half: the feature must not exempt the whole box.
     monkeypatch.setattr(
-        ledger.cgroups, "cgroup_of",
+        lg.cgroups, "cgroup_of",
         lambda pid, proc_root="/proc":
             SCOPE if pid == os.getpid() else "/system.slice/other.scope")
     rec = _rec(tmp_path, "a.json", usage_pid=os.getpid(),
                scope_pid=os.getpid(), scope_cgroup=SCOPE)
     apps = [{"pid": 2791919, "used_mb": 900, "name": "stranger"}]
-    owned, unledgered = ledger.attribute(apps, [rec])
+    owned, unledgered = lg.attribute(apps, [rec])
     assert unledgered == apps
     assert owned == {}
 
@@ -646,12 +646,12 @@ def test_a_dead_anchor_charges_nothing_to_its_recorded_cgroup(
         tmp_path, monkeypatch):
     # Honouring scope_cgroup without re-checking the anchor would exempt
     # whatever now lives at that path.
-    monkeypatch.setattr(ledger.cgroups, "cgroup_of",
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
                         lambda pid, proc_root="/proc": SCOPE)
     rec = _rec(tmp_path, "a.json", usage_pid=os.getpid(),
                scope_pid=999999, scope_cgroup=SCOPE)
     apps = [{"pid": 2791919, "used_mb": 900, "name": "tig-runtime"}]
-    owned, unledgered = ledger.attribute(apps, [rec])
+    owned, unledgered = lg.attribute(apps, [rec])
     assert unledgered == apps
 
 
@@ -661,21 +661,25 @@ def test_pid_tree_ownership_is_tested_before_scope_ownership(
     # the other's cgroup contains it. The tree is the more specific
     # answer and must win, or a co-tenant's VRAM is charged to the
     # container's declaration and neither reads correctly.
-    monkeypatch.setattr(ledger.cgroups, "cgroup_of",
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
                         lambda pid, proc_root="/proc": SCOPE)
-    monkeypatch.setattr(ledger, "descendants", lambda pid: {2791919})
+    monkeypatch.setattr(lg, "descendants", lambda pid: {2791919})
     by_tree = _rec(tmp_path, "tree.json", usage_pid=os.getpid())
-    by_scope = _rec(tmp_path, "scope.json", usage_pid=os.getpid(),
+    # usage_pid=None on purpose: `descendants` is stubbed for every pid,
+    # so giving this record a usage_pid too would put the app in BOTH
+    # records' pid trees, and the test would then turn on dict order
+    # rather than on the tree-before-scope rule it claims to check.
+    by_scope = _rec(tmp_path, "scope.json", usage_pid=None,
                     scope_pid=os.getpid(), scope_cgroup=SCOPE)
     apps = [{"pid": 2791919, "used_mb": 900, "name": "x"}]
-    owned, unledgered = ledger.attribute(apps, [by_scope, by_tree])
+    owned, unledgered = lg.attribute(apps, [by_scope, by_tree])
     assert str(by_tree.path) in owned
     assert str(by_scope.path) not in owned
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `python -m pytest tests/test_ledger.py -q -k "charged or unledgered or anchor or tested_before"`
+Run: `.venv/bin/python -m pytest tests/test_ledger.py -q -k "charged or unledgered or anchor or tested_before"`
 Expected: FAIL — the scoped process lands in `unledgered`.
 
 - [ ] **Step 3: Write the implementation**
@@ -738,7 +742,7 @@ def _owner_of(pid: int, trees: dict[str, set[int]],
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `python -m pytest tests/test_ledger.py -q`
+Run: `.venv/bin/python -m pytest tests/test_ledger.py -q`
 Expected: PASS
 
 - [ ] **Step 5: Mutation-check**
@@ -749,7 +753,7 @@ Expected: PASS
 
 - [ ] **Step 6: Run the full suite**
 
-Run: `python -m pytest -q`
+Run: `.venv/bin/python -m pytest -q`
 Expected: PASS. `preflight`, `kill_orphan_cuda` and `check_vram` all route through `attribute`, so this is where a regression in any of them would show.
 
 - [ ] **Step 7: Commit**
@@ -840,7 +844,9 @@ def test_scope_pid_prints_the_resolved_scope(monkeypatch, capsys):
     cli_claim.main(["--scope-pid", "2818873", "--", "true"])
     err = capsys.readouterr().err
     assert DOCKER_SCOPE in err
-    assert "3" in err
+    # The whole phrase: DOCKER_SCOPE already contains a "3", so a bare
+    # `"3" in err` passes with the count deleted entirely.
+    assert "3 live processes" in err
 
 
 def test_scope_pid_naming_the_whole_box_is_refused(monkeypatch, capsys):
@@ -892,18 +898,18 @@ def test_preflight_does_not_refuse_a_process_in_the_prospective_scope(
     monkeypatch.setattr(
         preflight, "compute_apps",
         lambda: [{"pid": 2791919, "used_mb": 900, "name": "tig-runtime"}])
-    monkeypatch.setattr(preflight.cgroups, "in_scope",
+    monkeypatch.setattr(pf.cgroups, "in_scope",
                         lambda pid, s, proc_root="/proc": s == scope)
-    with pytest.raises(preflight.PreflightFailed):
-        preflight.preflight(directory=tmp_path)
-    preflight.preflight(directory=tmp_path, scope=scope)  # must not raise
+    with pytest.raises(pf.PreflightFailed):
+        pf.preflight(directory=tmp_path)
+    pf.preflight(directory=tmp_path, scope=scope)  # must not raise
 ```
 
-Ensure `tests/test_preflight.py` imports `pytest` and `from gpuqueue import preflight`; add if absent.
+`tests/test_preflight.py` already imports `os` and `pytest` and binds the module as `from gpuqueue import preflight as pf` — use that alias.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `python -m pytest tests/test_cli_claim.py tests/test_preflight.py -q`
+Run: `.venv/bin/python -m pytest tests/test_cli_claim.py tests/test_preflight.py -q`
 Expected: FAIL — `unrecognized arguments: --scope-pid`, and `preflight() got an unexpected keyword argument 'scope'`.
 
 - [ ] **Step 4: Implement — `preflight`**
@@ -1054,12 +1060,12 @@ Change the `gpu_claim` call (:222-225):
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `python -m pytest tests/test_cli_claim.py tests/test_preflight.py -q`
+Run: `.venv/bin/python -m pytest tests/test_cli_claim.py tests/test_preflight.py -q`
 Expected: PASS
 
 - [ ] **Step 8: Mutation-check**
 
-1. Delete the `if scope:` block from `preflight.py`. Run `python -m pytest tests/test_preflight.py -q`. Expected: `test_preflight_does_not_refuse_a_process_in_the_prospective_scope` FAILS. Restore.
+1. Delete the `if scope:` block from `preflight.py`. Run `.venv/bin/python -m pytest tests/test_preflight.py -q`. Expected: `test_preflight_does_not_refuse_a_process_in_the_prospective_scope` FAILS. Restore.
 2. In `_resolve_scope`, drop the `refuse_reason` check. Expected: `test_scope_pid_naming_the_whole_box_is_refused` and `test_scope_pid_naming_a_login_session_is_refused` FAIL. Restore.
 3. In `_resolve_scope`, collapse the two `scope is None` branches into one message. Expected: one of `test_scope_pid_that_is_not_running_is_refused` / `test_scope_pid_on_a_cgroup_v1_box_is_refused` FAILS. Restore.
 
@@ -1095,7 +1101,7 @@ orphan protection for the whole card while looking like a normal claim.
 - [ ] **Step 10: Run the full suite and commit**
 
 ```bash
-python -m pytest -q
+.venv/bin/python -m pytest -q
 git add src/gpuqueue/cli_claim.py src/gpuqueue/claim.py \
         src/gpuqueue/preflight.py tests/test_cli_claim.py \
         tests/test_preflight.py docs/design.md
@@ -1140,27 +1146,27 @@ def test_orphan_sweep_sigterms_before_it_sigkills(monkeypatch):
     # say what happened; the watchdog's _kill_tree has had this since it
     # was written and the orphan sweep never did.
     sent = []
-    monkeypatch.setattr(reaper, "_signal",
+    monkeypatch.setattr(rp, "_signal",
                         lambda pid, sig: sent.append((pid, sig)) or True)
-    monkeypatch.setattr(reaper, "_exited", lambda pid: True)
-    monkeypatch.setattr(reaper.cgroups, "cgroup_of",
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
                         lambda pid, proc_root="/proc": None)
     apps = [{"pid": 4321, "used_mb": 900, "name": "x"}]
-    killed = reaper.kill_orphan_cuda(set(), [], apps)
+    killed = rp.kill_orphan_cuda(set(), [], apps)
     assert [s for _, s in sent][0] == signal.SIGTERM
     assert [d["pid"] for d in killed] == [4321]
 
 
 def test_orphan_sweep_sigkills_what_survives_the_grace(monkeypatch):
     sent = []
-    monkeypatch.setattr(reaper, "_signal",
+    monkeypatch.setattr(rp, "_signal",
                         lambda pid, sig: sent.append((pid, sig)) or True)
-    monkeypatch.setattr(reaper, "_exited", lambda pid: False)
-    monkeypatch.setattr(reaper, "ORPHAN_TERM_GRACE_S", 0.0)
-    monkeypatch.setattr(reaper.cgroups, "cgroup_of",
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
                         lambda pid, proc_root="/proc": None)
     apps = [{"pid": 4321, "used_mb": 900, "name": "x"}]
-    reaper.kill_orphan_cuda(set(), [], apps)
+    rp.kill_orphan_cuda(set(), [], apps)
     assert [s for _, s in sent] == [signal.SIGTERM, signal.SIGKILL]
 
 
@@ -1171,14 +1177,14 @@ def test_every_victim_is_sigtermed_before_any_is_sigkilled(monkeypatch):
     # TERM first. The difference matters because a per-victim ladder
     # stalls the runner tick by N x grace instead of by one.
     sent = []
-    monkeypatch.setattr(reaper, "_signal",
+    monkeypatch.setattr(rp, "_signal",
                         lambda pid, sig: sent.append((pid, sig)) or True)
-    monkeypatch.setattr(reaper, "_exited", lambda pid: False)
-    monkeypatch.setattr(reaper, "ORPHAN_TERM_GRACE_S", 0.0)
-    monkeypatch.setattr(reaper.cgroups, "cgroup_of",
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
                         lambda pid, proc_root="/proc": None)
-    apps = [{"pid": p, "used_mb": 1, "name": "x"} for p in (1, 2, 3, 4)]
-    reaper.kill_orphan_cuda(set(), [], apps)
+    apps = [{"pid": p, "used_mb": 1, "name": "x"} for p in (2791919, 2792864, 2765642, 2761761)]
+    rp.kill_orphan_cuda(set(), [], apps)
     sigs = [s for _, s in sent]
     assert sigs == [signal.SIGTERM] * 4 + [signal.SIGKILL] * 4
 
@@ -1187,34 +1193,34 @@ def test_a_kill_records_the_victims_cgroup(monkeypatch):
     # The field that tells an operator it was their container rather than
     # their algorithm. Read before signalling: /proc/<pid>/cgroup is gone
     # the moment the process is.
-    monkeypatch.setattr(reaper, "_signal", lambda pid, sig: True)
-    monkeypatch.setattr(reaper, "_exited", lambda pid: True)
+    monkeypatch.setattr(rp, "_signal", lambda pid, sig: True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
     monkeypatch.setattr(
-        reaper.cgroups, "cgroup_of",
+        rp.cgroups, "cgroup_of",
         lambda pid, proc_root="/proc": "/system.slice/docker-abc.scope")
     apps = [{"pid": 4321, "used_mb": 900, "name": "tig-runtime"}]
-    killed = reaper.kill_orphan_cuda(set(), [], apps)
+    killed = rp.kill_orphan_cuda(set(), [], apps)
     assert killed[0]["cgroup"] == "/system.slice/docker-abc.scope"
     assert killed[0]["name"] == "tig-runtime"
 
 
 def test_an_exempt_process_is_never_signalled(monkeypatch):
     sent = []
-    monkeypatch.setattr(reaper, "_signal",
+    monkeypatch.setattr(rp, "_signal",
                         lambda pid, sig: sent.append((pid, sig)) or True)
-    monkeypatch.setattr(reaper, "_exited", lambda pid: True)
-    monkeypatch.setattr(reaper.cgroups, "cgroup_of",
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
                         lambda pid, proc_root="/proc": None)
     apps = [{"pid": 4321, "used_mb": 900, "name": "x"}]
-    assert reaper.kill_orphan_cuda({4321}, [], apps) == []
+    assert rp.kill_orphan_cuda({4321}, [], apps) == []
     assert sent == []
 ```
 
-Ensure `tests/test_reaper.py` imports `signal` and `from gpuqueue import reaper`; add if absent.
+`tests/test_reaper.py` binds the module as `from gpuqueue import reaper as rp` — use that alias. It does **not** import `signal`; add `import signal` at the top.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `python -m pytest tests/test_reaper.py -q -k "sigterm or sigkills or grace or cgroup or signalled"`
+Run: `.venv/bin/python -m pytest tests/test_reaper.py -q -k "sigterm or sigkills or grace or cgroup or signalled"`
 Expected: FAIL — `kill_orphan_cuda` returns ints and only ever sends SIGKILL.
 
 - [ ] **Step 3: Write the implementation**
@@ -1298,7 +1304,7 @@ stays as-is; change only the return dict (:410-412):
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `python -m pytest tests/test_reaper.py -q`
+Run: `.venv/bin/python -m pytest tests/test_reaper.py -q`
 Expected: PASS, including the twelve pre-existing `killed_pids == [...]` assertions.
 
 - [ ] **Step 5: Mutation-check**
@@ -1310,7 +1316,7 @@ Expected: PASS, including the twelve pre-existing `killed_pids == [...]` asserti
 - [ ] **Step 6: Run the full suite and commit**
 
 ```bash
-python -m pytest -q
+.venv/bin/python -m pytest -q
 git add src/gpuqueue/reaper.py tests/test_reaper.py
 git commit -m "fix: give the orphan sweep a signal its victim can survive
 
@@ -1339,7 +1345,7 @@ their container and not their algorithm."
 - Test: `tests/test_killlog.py`, `tests/test_cli_gpuq.py`
 
 **Interfaces:**
-- Consumes: `reap()`'s `killed_details` (Task 5), `_consulted_dirs` (existing, `reaper.py:329`).
+- Consumes: `reap()`'s `killed_details` (Task 5), `_consulted_dirs` (existing, `reaper.py:311`).
 - Produces:
   - `killlog.append(queue_root: Path, entries: list[dict], consulted: list[str]) -> None`
   - `killlog.read(queue_root: Path, limit: int | None = None) -> list[dict]`
@@ -1372,12 +1378,17 @@ def test_append_writes_a_readable_record(tmp_path):
 
 def test_append_is_capped(tmp_path):
     # A rare-event log with no bound is how a box fills its disk.
-    for i in range(killlog.MAX_ENTRIES + 50):
-        killlog.append(tmp_path, [dict(ENTRY, pid=i)], [])
+    # Seeded in one write rather than 1050 appends: each append rewrites
+    # the whole file, so the loop form is quadratic for no extra cover.
+    seed = [dict(ENTRY, pid=i) for i in range(killlog.MAX_ENTRIES)]
+    killlog.append(tmp_path, seed, [])
+    killlog.append(tmp_path, [dict(ENTRY, pid=999001)], [])
     got = killlog.read(tmp_path)
     assert len(got) == killlog.MAX_ENTRIES
-    # The cap keeps the NEWEST, which is the half an operator is reading.
-    assert got[-1]["pid"] == killlog.MAX_ENTRIES + 49
+    # The cap keeps the NEWEST, which is the half an operator is reading;
+    # dropping from the wrong end would leave a log that never updates.
+    assert got[-1]["pid"] == 999001
+    assert got[0]["pid"] == 1
 
 
 def test_read_of_an_absent_file_is_empty_not_an_error(tmp_path):
@@ -1385,7 +1396,7 @@ def test_read_of_an_absent_file_is_empty_not_an_error(tmp_path):
 
 
 def test_a_corrupt_line_does_not_hide_the_good_ones(tmp_path):
-    # Same posture as `ledger._load`: garbage must not blind a reader to
+    # Same posture as `lg._load`: garbage must not blind a reader to
     # the records around it.
     killlog.append(tmp_path, [ENTRY], [])
     p = tmp_path / killlog.KILLS_FILENAME
@@ -1418,7 +1429,7 @@ def test_kills_prints_recent_kills(tmp_path, monkeypatch, capsys):
                                "used_mb": 900,
                                "cgroup": "/system.slice/docker-abc.scope"}],
                    ["/workspace/lock/gpu"])
-    assert cli_gpuq.main(["kills"]) == 0
+    assert main(["kills"]) == 0
     out = capsys.readouterr().out
     assert "2791919" in out
     assert "docker-abc.scope" in out
@@ -1426,13 +1437,13 @@ def test_kills_prints_recent_kills(tmp_path, monkeypatch, capsys):
 
 def test_kills_with_no_kills_says_so(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
-    assert cli_gpuq.main(["kills"]) == 0
+    assert main(["kills"]) == 0
     assert "no kills" in capsys.readouterr().out.lower()
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `python -m pytest tests/test_killlog.py tests/test_cli_gpuq.py -q -k "kill"`
+Run: `.venv/bin/python -m pytest tests/test_killlog.py tests/test_cli_gpuq.py -q -k "kill"`
 Expected: FAIL — `ModuleNotFoundError: No module named 'gpuqueue.killlog'`
 
 - [ ] **Step 3: Implement `killlog.py`**
@@ -1508,7 +1519,13 @@ def read(queue_root, limit: int | None = None) -> list[dict]:
             out.append(json.loads(line))
         except ValueError:
             continue
-    return out[-limit:] if limit else out
+    if limit is None:
+        return out
+    # Not `out[-limit:] if limit else out`: `--limit 0` falls to the
+    # falsy branch and prints everything, and `out[-0:]` is the whole
+    # list anyway, so even an `is not None` guard reads zero as "no
+    # limit".
+    return out[-limit:] if limit > 0 else []
 ```
 
 - [ ] **Step 4: Wire it into `reap`**
@@ -1542,6 +1559,12 @@ def _cmd_kills(args) -> int:
     if not entries:
         print("no kills recorded")
         return 0
+    total = len(killlog.read(q.root))
+    if total > len(entries):
+        # Say so rather than truncating quietly. An operator who sees
+        # four kills and had five is chasing the wrong window.
+        print(f"showing the most recent {len(entries)} of {total} "
+              f"-- pass --limit {total} for all")
     for e in entries:
         print(f"{e.get('ts', '?')}  pid {e.get('pid')}  "
               f"{e.get('used_mb') or '?'} MiB  {e.get('name') or '?'}")
@@ -1588,7 +1611,7 @@ somewhere else.
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `python -m pytest tests/test_killlog.py tests/test_cli_gpuq.py -q`
+Run: `.venv/bin/python -m pytest tests/test_killlog.py tests/test_cli_gpuq.py -q`
 Expected: PASS
 
 - [ ] **Step 8: Mutation-check**
@@ -1600,7 +1623,7 @@ Expected: PASS
 - [ ] **Step 9: Run the full suite and commit**
 
 ```bash
-python -m pytest -q
+.venv/bin/python -m pytest -q
 git add src/gpuqueue/killlog.py src/gpuqueue/reaper.py \
         src/gpuqueue/cli_gpuq.py tests/test_killlog.py \
         tests/test_cli_gpuq.py skills/gpu-jobs/SKILL.md
