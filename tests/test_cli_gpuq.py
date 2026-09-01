@@ -313,3 +313,25 @@ def test_submit_rejects_a_nonsense_declaration(tmp_path, capsys):
                "--vram-mb", "0", "--", "python", "t.py"])
     assert rc == 2
     assert "vram_mb" in capsys.readouterr().err
+
+
+def test_kills_prints_recent_kills(tmp_path, monkeypatch, capsys):
+    # The thing an agent that sees `killed by signal 9` can be TOLD to
+    # run. A file nobody thinks to open is barely better than the runner
+    # log nobody thinks to open, which is #24's actual complaint.
+    from gpuqueue import killlog
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    killlog.append(tmp_path, [{"pid": 2791919, "name": "tig-runtime",
+                               "used_mb": 900,
+                               "cgroup": "/system.slice/docker-abc.scope"}],
+                   ["/workspace/lock/gpu"])
+    assert main(["kills"]) == 0
+    out = capsys.readouterr().out
+    assert "2791919" in out
+    assert "docker-abc.scope" in out
+
+
+def test_kills_with_no_kills_says_so(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("QUEUE_ROOT", str(tmp_path))
+    assert main(["kills"]) == 0
+    assert "no kills" in capsys.readouterr().out.lower()

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import bugfiler
+from . import killlog
 from .claim import job_orphaned
 from .config import ConfigError, default_config_path, load_config
 from .queue import QueueRoot, STATES
@@ -178,6 +179,34 @@ def _cmd_bug(args) -> int:
     return 0
 
 
+def _cmd_kills(args) -> int:
+    """What the orphan sweep killed, most recent last.
+
+    Exists because #24's victim had no way to tell a queue kill from its
+    own crash: SIGKILL writes no stderr, so the caller sees `exit -9` and
+    an empty message. An agent that sees a signal death runs this.
+    """
+    q = _queue(args)
+    entries = killlog.read(q.root, limit=args.limit)
+    if not entries:
+        print("no kills recorded")
+        return 0
+    total = len(killlog.read(q.root))
+    if total > len(entries):
+        # Say so rather than truncating quietly. An operator who sees
+        # four kills and had five is chasing the wrong window.
+        print(f"showing the most recent {len(entries)} of {total} "
+              f"-- pass --limit {total} for all")
+    for e in entries:
+        print(f"{e.get('ts', '?')}  pid {e.get('pid')}  "
+              f"{e.get('used_mb') or '?'} MiB  {e.get('name') or '?'}")
+        print(f"    cgroup:  {e.get('cgroup') or '(none read)'}")
+        print(f"    reason:  {e.get('reason')}")
+        print(f"    ledgers: "
+              f"{', '.join(e.get('ledgers_consulted') or ['(none)'])}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gpuq")
     p.add_argument("--queue-root", default=None)
@@ -234,6 +263,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the report; read from stdin when omitted")
     b.add_argument("--config", default=None)
     b.set_defaults(func=_cmd_bug)
+
+    k = sub.add_parser("kills",
+                       help="what the orphan sweep killed and why")
+    k.add_argument("--limit", type=int, default=20)
+    k.set_defaults(func=_cmd_kills)
     return p
 
 

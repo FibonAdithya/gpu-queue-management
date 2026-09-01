@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from . import cgroups
+from . import killlog
 from . import ledger
 from .claim import sweep_stale, claim_dir, all_claim_dirs
 from .config import RunnerConfig
@@ -442,6 +443,13 @@ def reap(queue: QueueRoot, cfg: RunnerConfig,
                 # rather than what we assume it consulted.
                 exemption_dirs = _consulted_dirs(claims)
                 killed = kill_orphan_cuda(protect, records, apps)
+                # Written here rather than in `kill_orphan_cuda` because
+                # that function does not know the queue root, and giving
+                # it one would tie the kill decision to the queue's
+                # layout. `exemption_dirs` is already in hand on this
+                # line, which is the whole reason the record can name
+                # what was consulted.
+                killlog.append(queue.root, killed, exemption_dirs)
             if cfg.enforce_vram and vram_strikes is not None:
                 convicted = check_vram(records, apps, vram_strikes)
                 for c in convicted:
