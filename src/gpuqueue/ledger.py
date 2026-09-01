@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import cgroups
 from .gpuid import lock_filename
 from .procs import descendants, pid_alive
 from .spec import utcnow_iso
@@ -86,6 +87,13 @@ class Record:
     cmd: list[str]
     started_at: str
     key: str
+    # A tree this record is charged for that it did not spawn. `scope_pid`
+    # is the anchor the claim named; `scope_cgroup` is where that anchor
+    # sat when the claim was taken. Both, because either alone is wrong:
+    # the pid alone drifts onto whatever the kernel recycles it to, and
+    # the path alone outlives the container that owned it.
+    scope_pid: int | None = None
+    scope_cgroup: str | None = None
 
     @property
     def name(self) -> str:
@@ -95,7 +103,8 @@ class Record:
         return {"pid": self.pid, "usage_pid": self.usage_pid,
                 "vram_mb": self.vram_mb, "owner": self.owner,
                 "cmd": self.cmd, "started_at": self.started_at,
-                "key": self.key}
+                "key": self.key, "scope_pid": self.scope_pid,
+                "scope_cgroup": self.scope_cgroup}
 
 
 def mutex_path(key: str, directory) -> Path:
@@ -120,7 +129,15 @@ def _load(path: Path) -> Record | None:
             vram_mb=(int(d["vram_mb"])
                      if d.get("vram_mb") is not None else None),
             owner=d.get("owner", "?"), cmd=list(d.get("cmd") or []),
-            started_at=d.get("started_at", ""), key=d.get("key", ""))
+            started_at=d.get("started_at", ""), key=d.get("key", ""),
+            # `.get`, not `d[...]`: every record written before this
+            # field existed is still on disk, and `_load` returns None on
+            # any exception. A KeyError here would make the reaper unable
+            # to read live claims across an upgrade -- issue #19's
+            # failure reached by a different door.
+            scope_pid=(int(d["scope_pid"])
+                       if d.get("scope_pid") is not None else None),
+            scope_cgroup=d.get("scope_cgroup"))
     except Exception:
         return None  # a garbage record must not blind us to the good ones
 
@@ -185,6 +202,28 @@ def write_record(rec: Record) -> None:
 def set_usage_pid(rec: Record, pid: int | None) -> None:
     rec.usage_pid = pid
     write_record(rec)
+
+
+def scope_is_live(rec: Record) -> bool:
+    """True when a record's scope still names what it named at claim time.
+
+    Both halves are load-bearing, and each covers the other's blind spot.
+    `pid_alive` alone lets the kernel recycle `scope_pid` onto an
+    unrelated process and drift the exemption onto *its* cgroup. The path
+    alone outlives the container: a restart gives docker a new scope id,
+    so the recorded path would name a cgroup that no longer exists, or
+    worse, one reissued to something else.
+
+    Disagreement means the scope covers nothing, rather than covering
+    something the claimant did not name. `reap()` reports which records
+    went void, because a claim that has quietly stopped covering anything
+    is the same silent failure issue #24 is about.
+    """
+    if rec.scope_pid is None or rec.scope_cgroup is None:
+        return False
+    if not pid_alive(rec.scope_pid):
+        return False
+    return cgroups.cgroup_of(rec.scope_pid) == rec.scope_cgroup
 
 
 def remove(rec: Record) -> None:
@@ -334,7 +373,9 @@ def _take_mutex(fd: int, timeout_s: float) -> None:
 def acquire(key: str, *, vram_mb: int | None, owner: str,
             cmd: list[str] | None, directory, usable_mb: int | None,
             usage_pid: int | None = None,
-            max_holders: int | None = None) -> Record:
+            max_holders: int | None = None,
+            scope_pid: int | None = None,
+            scope_cgroup: str | None = None) -> Record:
     """Take a share of the card, or raise ClaimBusy.
 
     Non-blocking on capacity by design: the caller decides whether to wait,
@@ -364,7 +405,8 @@ def acquire(key: str, *, vram_mb: int | None, owner: str,
         rec = Record(path=ldir / f"{os.getpid()}.{secrets.token_hex(3)}.json",
                      pid=os.getpid(), usage_pid=usage_pid, vram_mb=vram_mb,
                      owner=owner, cmd=list(cmd or []),
-                     started_at=utcnow_iso(), key=key)
+                     started_at=utcnow_iso(), key=key,
+                     scope_pid=scope_pid, scope_cgroup=scope_cgroup)
         write_record(rec)
         return rec
     finally:

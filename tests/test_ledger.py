@@ -425,3 +425,69 @@ def test_a_dead_holder_does_not_spend_a_slot(tmp_path):
     rec = lg.acquire(KEY, vram_mb=500, owner="live", cmd=["train"],
                      directory=tmp_path, usable_mb=8000, max_holders=1)
     assert rec.owner == "live"
+
+
+def test_a_record_written_without_scope_keys_still_loads(tmp_path):
+    # Every record already on disk at upgrade time lacks these keys. A
+    # `d["scope_pid"]` would send `_load` down its `except` and return
+    # None for all of them -- and a record the reaper cannot read is a
+    # claim it will not spare. That is issue #19 with a new cause.
+    p = tmp_path / "old.json"
+    p.write_text(json.dumps({"pid": 4321, "usage_pid": 4321,
+                             "vram_mb": 512, "owner": "someone",
+                             "cmd": ["train"], "started_at": "",
+                             "key": "k"}))
+    rec = lg._load(p)
+    assert rec is not None
+    assert rec.pid == 4321
+    assert rec.scope_pid is None and rec.scope_cgroup is None
+
+
+def test_acquire_records_the_scope(tmp_path):
+    rec = lg.acquire("k", vram_mb=512, owner="me", cmd=["x"],
+                         directory=tmp_path, usable_mb=8000,
+                         usage_pid=os.getpid(),
+                         scope_pid=4321,
+                         scope_cgroup="/system.slice/docker-abc.scope")
+    on_disk = json.loads(rec.path.read_text())
+    assert on_disk["scope_pid"] == 4321
+    assert on_disk["scope_cgroup"] == "/system.slice/docker-abc.scope"
+    assert lg._load(rec.path).scope_cgroup == \
+        "/system.slice/docker-abc.scope"
+
+
+def _scoped(tmp_path, scope_pid, scope_cgroup):
+    return lg.Record(
+        path=tmp_path / "r.json", pid=os.getpid(), usage_pid=os.getpid(),
+        vram_mb=512, owner="me", cmd=[], started_at="", key="k",
+        scope_pid=scope_pid, scope_cgroup=scope_cgroup)
+
+
+def test_scope_is_live_when_the_anchor_still_sits_where_it_did(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": "/system.slice/d.scope")
+    rec = _scoped(tmp_path, os.getpid(), "/system.slice/d.scope")
+    assert lg.scope_is_live(rec) is True
+
+
+def test_scope_is_dead_when_the_anchor_is_gone(tmp_path, monkeypatch):
+    # A dead anchor whose pid the kernel later reuses would otherwise
+    # drift the exemption onto an unrelated process's cgroup.
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": "/system.slice/d.scope")
+    rec = _scoped(tmp_path, 999999, "/system.slice/d.scope")
+    assert lg.scope_is_live(rec) is False
+
+
+def test_scope_is_dead_when_the_anchor_moved_cgroup(tmp_path, monkeypatch):
+    # The container restarted: same pid alive, new docker scope id. A
+    # check of `pid_alive` alone would honour the stale path.
+    monkeypatch.setattr(lg.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": "/system.slice/NEW.scope")
+    rec = _scoped(tmp_path, os.getpid(), "/system.slice/OLD.scope")
+    assert lg.scope_is_live(rec) is False
+
+
+def test_a_record_with_no_scope_is_not_live_scoped(tmp_path):
+    assert lg.scope_is_live(_scoped(tmp_path, None, None)) is False
