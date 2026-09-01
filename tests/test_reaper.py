@@ -98,6 +98,11 @@ def test_kills_orphan_cuda_when_enabled(q, monkeypatch):
     # still exercises the escalation to `_kill`, and shrink the grace to
     # 0 so the test does not pay ORPHAN_TERM_GRACE_S in wall-clock time.
     monkeypatch.setattr(rp, "_signal", lambda pid, sig: True)
+    # `_exited` too, like every sibling: the zeroed grace makes the loop
+    # body unreachable today, so the real `_exited` is only ever consulted
+    # if that boundary changes -- and then this test would fail for a
+    # reason that has nothing to do with what it asserts.
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
     monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
     killed = []
     monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
@@ -118,12 +123,19 @@ def test_does_not_kill_pids_of_running_jobs(q, monkeypatch):
     monkeypatch.setattr(rp, "compute_apps",
                         lambda: [{"pid": 4321, "used_mb": 900, "name": "t.py"}])
     monkeypatch.setattr(rp, "_kill", lambda pid: pytest.fail("killed a live job"))
+    # The ladder starts at SIGTERM, so `_kill` alone no longer covers this:
+    # an exemption that broke would send a real SIGTERM to whatever holds
+    # pid 4321 on this box.
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pytest.fail("signalled a live job"))
     assert reap(q, cfg)["killed_pids"] == []
 
 def test_does_not_kill_when_cuda_list_is_invisible(q, monkeypatch):
     cfg = RunnerConfig(queue_root=q.root, kill_orphan_cuda=True)
     monkeypatch.setattr(rp, "compute_apps", lambda: None)
     monkeypatch.setattr(rp, "_kill", lambda pid: pytest.fail("killed blind"))
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pytest.fail("signalled blind"))
     assert reap(q, cfg)["killed_pids"] == []
 
 
@@ -443,6 +455,8 @@ def test_a_ledgered_co_tenants_process_is_not_an_orphan(q, tmp_path, monkeypatch
     monkeypatch.setattr(lg, "descendants",
                         lambda pid: {5150} if pid == _os.getpid() else set())
     monkeypatch.setattr(rp, "_kill", lambda pid: pytest.fail("killed a co-tenant"))
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pytest.fail("signalled a co-tenant"))
     assert reap(q, cfg)["killed_pids"] == []
 
 
@@ -452,9 +466,19 @@ def test_an_unledgered_process_is_still_killed(q, tmp_path, monkeypatch):
     monkeypatch.setattr(rp, "compute_apps",
                         lambda: [{"pid": 4321, "used_mb": 900, "name": "x.py"}])
     monkeypatch.setattr(rp, "descendants", lambda pid: set())
+    # `_signal` too, not just `_kill`. pid 4321 is not a real process, so
+    # the real `_signal` fails the SIGTERM and the victim never reaches the
+    # escalation at all -- this asserted on a list that was returned
+    # regardless of whether anything was signalled, so it no longer proved
+    # a kill landed. Stubbing it also stops the suite firing a real SIGTERM
+    # at whatever pid 4321 is after a `pid_max` wrap.
+    monkeypatch.setattr(rp, "_signal", lambda pid, sig: True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
     killed = []
     monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
     assert reap(q, cfg)["killed_pids"] == [4321]
+    assert killed == [4321]
 
 
 # --- the VRAM watchdog ---------------------------------------------------
@@ -723,6 +747,8 @@ def test_sweep_spares_the_whole_tree_of_a_running_job(q, tmp_path, monkeypatch):
                         lambda pid: {4242} if pid == os.getpid() else set())
     killed = []
     monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pytest.fail("signalled a live job"))
 
     assert reap(q, cfg)["killed_pids"] == []
     assert killed == []
@@ -742,9 +768,18 @@ def test_sweep_still_kills_a_process_under_nobody(q, tmp_path, monkeypatch):
                         lambda: [{"pid": 9999, "used_mb": 100}])
     monkeypatch.setattr(rp, "descendants",
                         lambda pid: {4242} if pid == os.getpid() else set())
-    monkeypatch.setattr(rp, "_kill", lambda pid: True)
+    # See `test_an_unledgered_process_is_still_killed`: without a `_signal`
+    # stub the real SIGTERM to pid 9999 fails, nothing is escalated, and
+    # this asserted on a list returned regardless -- while firing a real
+    # signal at whatever pid 9999 is after a `pid_max` wrap.
+    monkeypatch.setattr(rp, "_signal", lambda pid, sig: True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: False)
+    monkeypatch.setattr(rp, "ORPHAN_TERM_GRACE_S", 0.0)
+    killed = []
+    monkeypatch.setattr(rp, "_kill", lambda pid: killed.append(pid) or True)
 
     assert reap(q, cfg)["killed_pids"] == [9999]
+    assert killed == [9999]
 
 
 # --- Which ledgers the sweep consulted (issue #19) -----------------------
@@ -986,6 +1021,56 @@ def test_a_kill_records_the_victims_cgroup(monkeypatch):
     killed = rp.kill_orphan_cuda(set(), [], apps)
     assert killed[0]["cgroup"] == "/system.slice/docker-abc.scope"
     assert killed[0]["name"] == "tig-runtime"
+
+
+def test_a_victim_whose_sigterm_failed_is_not_reported_as_killed(monkeypatch):
+    """`_signal` swallows two failures that mean the sweep did nothing.
+
+    ESRCH: the process exited on its own between the nvidia-smi sample and
+    the SIGTERM. EPERM: it belongs to another user -- this claim directory
+    is shared with hand-run `gpu-claim` jobs -- so it goes on holding the
+    card. Either way it is dropped from the escalation list and never
+    reaches SIGKILL either, so reporting it as killed is a claim about a
+    signal that was not delivered.
+
+    It matters because `skills/gpu-jobs/SKILL.md` tells an agent that a
+    pid in `gpuq kills` was killed by the queue. A process that crashed on
+    its own, named there, stops the agent debugging its real crash --
+    issue #24's misdiagnosis with the arrow reversed.
+    """
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: pid != 4321)   # EPERM on 4321
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    apps = [{"pid": 4321, "used_mb": 900, "name": "someone-elses"},
+            {"pid": 4322, "used_mb": 900, "name": "ours"}]
+    killed = rp.kill_orphan_cuda(set(), [], apps)
+    assert [d["pid"] for d in killed] == [4322], \
+        "reported a kill for a process no signal reached"
+
+
+def test_the_grace_loop_stops_as_soon_as_everything_has_exited(monkeypatch):
+    """The `_exited` filter is what keeps the shared grace from being paid
+    in full. Delete it and `alive` never empties, so every sweep that kills
+    anything burns ORPHAN_TERM_GRACE_S on the runner's single thread and
+    escalates to SIGKILL a process that took the SIGTERM.
+
+    The real grace is deliberately not zeroed here -- that is the property
+    under test -- and the test still runs in microseconds, because the loop
+    breaks on its first pass.
+    """
+    assert rp.ORPHAN_TERM_GRACE_S >= 1.0, "the real grace, not a zeroed one"
+    sent = []
+    monkeypatch.setattr(rp, "_signal",
+                        lambda pid, sig: sent.append(sig) or True)
+    monkeypatch.setattr(rp, "_exited", lambda pid: True)
+    monkeypatch.setattr(rp.cgroups, "cgroup_of",
+                        lambda pid, proc_root="/proc": None)
+    started = _time.monotonic()
+    rp.kill_orphan_cuda(set(), [], [{"pid": 4321, "used_mb": 1, "name": "x"}])
+    assert sent == [signal.SIGTERM], "escalated past SIGTERM needlessly"
+    assert _time.monotonic() - started < 1.0, "paid the whole grace"
 
 
 def test_an_exempt_process_is_never_signalled(monkeypatch):

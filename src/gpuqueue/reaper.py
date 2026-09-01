@@ -110,7 +110,11 @@ def kill_orphan_cuda(protect: set[int], records: list,
     # operator it was their container and not their algorithm.
     killed = [{"pid": a["pid"], "name": a.get("name"),
                "used_mb": a.get("used_mb"),
-               "cgroup": cgroups.cgroup_of(a["pid"])}
+               "cgroup": cgroups.cgroup_of(a["pid"]),
+               # Filled in below. Present from the start so every record
+               # this writes has the field, whether or not the ladder got
+               # that far.
+               "sigkilled": False}
               for a in victims]
     # SIGTERM everything, then one shared grace, then SIGKILL what is
     # left. Batched rather than per-victim: a grace each would stall the
@@ -122,7 +126,24 @@ def kill_orphan_cuda(protect: set[int], records: list,
     # bug -- on 2026-09-01 an agent rewrote a correct index and submitted
     # a worse method on that reading (issue #24). `_kill_tree` has had
     # this since it was written; the orphan sweep never did.
-    alive = [d for d in killed if _signal(d["pid"], signal.SIGTERM)]
+    #
+    # Only what was actually signalled is returned, and `signalled` is its
+    # own name because the grace loop below reassigns `alive` down to the
+    # survivors. `_signal` swallows two failures that mean nothing was
+    # done: ESRCH, where the victim exited on its own between the
+    # nvidia-smi sample and the SIGTERM, and EPERM, where it belongs to
+    # another user -- this claim directory is shared with hand-run
+    # `gpu-claim` jobs -- and goes on holding the card. Neither is
+    # escalated to SIGKILL either, since both drop out of the list here.
+    #
+    # Reporting them anyway put them in `kills.jsonl`, and
+    # `skills/gpu-jobs/SKILL.md` tells an agent that a pid there was killed
+    # by the queue: a process that crashed on its own would be named as a
+    # queue kill and the agent would stop debugging its real crash. That is
+    # issue #24's misdiagnosis with the arrow reversed, so `killed` stays
+    # purely the pre-signal cgroup snapshot and this is the answer.
+    signalled = [d for d in killed if _signal(d["pid"], signal.SIGTERM)]
+    alive = list(signalled)
     if alive:
         deadline = time.monotonic() + ORPHAN_TERM_GRACE_S
         while time.monotonic() < deadline:
@@ -131,8 +152,11 @@ def kill_orphan_cuda(protect: set[int], records: list,
                 break
             time.sleep(0.1)
         for d in alive:
-            _kill(d["pid"])
-    return killed
+            # Recorded per victim so the runner's line can say what the
+            # ladder actually did rather than describing both rungs
+            # whenever it kills anything.
+            d["sigkilled"] = _kill(d["pid"])
+    return signalled
 
 
 def _running_trees(queue: QueueRoot) -> set[int]:
