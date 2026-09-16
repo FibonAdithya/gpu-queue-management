@@ -53,7 +53,9 @@ else
 fi
 
 # 2. state directories
-for d in pending running done failed logs work; do
+# "done" quoted: bash reads it as a plain word here, but shellcheck 0.11
+# cannot tell that from a missing semicolon before the loop's own `done`.
+for d in pending running "done" failed logs work; do
   run mkdir -p "$QUEUE_ROOT/$d"
 done
 run mkdir -p "$GPU_CLAIM_DIR"
