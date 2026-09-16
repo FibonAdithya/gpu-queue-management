@@ -12,10 +12,33 @@ change.
 export BOX=my-gpu-box     # an alias in ~/.ssh/config
 ```
 
+## 0. The short version
+
+`./deploy.sh` does steps 1, 2, 3 and 5 in one pass, and is safe to re-run:
+
+```bash
+./deploy.sh $BOX                 # probe, install, verify, report
+./deploy.sh $BOX --probe-only    # read the box, change nothing
+./deploy.sh $BOX --verify-only   # re-check an existing install
+```
+
+It reads the box, picks the interpreter itself, runs `bootstrap.sh` there,
+then establishes what the box actually gives you and prints a verdict plus a
+row for [Boxes](#boxes). Exit status is 0 verified, 1 a check failed, 2 the
+box was refused before anything was installed.
+
+Step 4 is deliberately not automated: declaring a project decides how much
+GitHub access the box holds, and anyone who can queue a job can use it. That
+is a decision, not a step.
+
+The rest of this document is what `deploy.sh` is doing and why. Read it when
+a check comes back WARN, when you are deploying somewhere unusual, or when
+you want to do it by hand.
+
 ## 1. Check the box before installing
 
-Run this first. It answers every question the design depends on, and changes
-nothing:
+`./deploy.sh $BOX --probe-only` runs this and interprets the answers. By
+hand, it answers every question the design depends on and changes nothing:
 
 ```bash
 ssh $BOX 'bash -s' <<'EOF'
@@ -147,7 +170,11 @@ changes no behaviour — preflight is already enforcing it — but it stops
 
 ## 2. Get the code onto the box
 
-Either is fine. Neither publishes anything.
+`deploy.sh` does this, cloning over HTTPS at the current branch. Note that it
+deploys **the branch, not your local HEAD** — the box clones from origin and
+cannot check out a commit you have not pushed; it warns when the two differ.
+
+By hand, either is fine. Neither publishes anything.
 
 ```bash
 # from a clone (the box needs read access to the remote)
@@ -172,6 +199,10 @@ ssh $BOX 'chown -R root:root /workspace/gpu-queue-management &&
 environment holding torch, and that is usually where the runner belongs — this
 package has no dependencies, so installing into it cannot conflict with the ML
 stack.
+
+This is the choice `deploy.sh` makes for you: among interpreters that are
+3.11+ and have pip, one holding torch wins, and ties break to the highest
+version. `--python` overrides it.
 
 ```bash
 ssh $BOX 'cd /workspace/gpu-queue-management &&
@@ -536,6 +567,13 @@ accept that nothing enforces the review.
 
 ## 5. Verify
 
+`./deploy.sh $BOX --verify-only` runs these and reports a verdict. It also
+settles the pid-namespace question above, which needs a live CUDA process:
+it reads one already on the card, and allocates a small probe only when the
+card is idle, so it is safe to run against a box someone is using.
+
+By hand:
+
 ```bash
 ssh $BOX 'export PATH=/venv/main/bin:$PATH GPU_CLAIM_DIR=/workspace/lock/gpu
   supervisorctl status gpuq-runner
@@ -602,7 +640,7 @@ is an example of the useful level of detail; the rest are real.
 | Alias | Hardware | Interpreter | Notes |
 |---|---|---|---|
 | `<your-box>` | e.g. RTX 4060, 8 GB | e.g. `/venv/main/bin/python` 3.12, torch 2.x | Hosted unprivileged container, root. `nvidia-smi` enumerates compute apps, so preflight is a real guard — record this either way, it is the difference between a guard and a warning. Verified `<date>` |
-| `tig-gpu` | RTX 3060, 12288 MiB | `/venv/main/bin/python` 3.12.14, **no torch** (system `python3` is 3.12.3) | vast.ai unprivileged container, root; no docker, no volume, so `/workspace` does **not** survive a recycle. `nvidia-smi` enumerates compute apps, but **in the host's pid namespace** — preflight refuses a busy card (exit 69, measured), while the orphan sweep and `enforce_vram` are inert and VRAM sharing degrades to one GPU job at a time. See [Host pids](#nvidia-smi-may-report-pids-from-the-hosts-namespace). Verified 2026-09-16 at 9d48f99 |
+| `tig-gpu` | RTX 3060, 12288 MiB | `/venv/main/bin/python` 3.12.14, torch 2.13.0+cu126 (system `python3` is 3.12.3, no torch) | vast.ai unprivileged container, root; no docker, no volume, so `/workspace` does **not** survive a recycle. `nvidia-smi` enumerates compute apps, but **in the host's pid namespace** — preflight refuses a busy card (exit 69, measured), while the orphan sweep and `enforce_vram` are inert and VRAM sharing degrades to one GPU job at a time. See [Host pids](#nvidia-smi-may-report-pids-from-the-hosts-namespace). Verified 2026-09-16 at 9d48f99 |
 
 The one field worth being precise about is whether `nvidia-smi` could enumerate
 compute apps, because it varies by image and decides whether preflight actually
