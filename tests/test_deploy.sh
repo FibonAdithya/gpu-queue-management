@@ -134,6 +134,17 @@ check "capacity discovery failure also means one GPU job at a time" \
   "run_fn verdict local-pids none 1 | grep -qi 'one GPU job at a time'"
 check "no nvidia-smi means no GPU lane" \
   "run_fn verdict nosmi none 0 | grep -qi 'no GPU lane'"
+# An idle card is the absence of evidence, and on 2026-09-16 it produced
+# "sharing works" for a KVM box nothing had been measured on. Asserted in
+# both directions: a verdict that printed nothing would pass the negative.
+check "an idle card is not reported as sharing works" \
+  "! run_fn verdict idle 12288 1 | grep -qi 'sharing works'"
+check "an idle card is reported as unverified" \
+  "run_fn verdict idle 12288 1 | grep -qi 'unverified'"
+# Only an actual local-pid result earns the good verdict; a class this
+# function has never heard of must not fall through to it.
+check "an unrecognised pid class is unverified, not sharing works" \
+  "run_fn verdict '' 12288 1 | grep -qi 'unverified'"
 
 # --------------------------------------------------------------- ref_warning
 #
@@ -257,6 +268,55 @@ check "the deployed ref is the branch, not the local HEAD sha" \
   "grep -q \"checkout --quiet 'main'\" '$tmp/scripts/install.script'"
 check "an unpushed local HEAD is never handed to the box as a ref" \
   "! grep -q '$head_sha' '$tmp/scripts/install.script'"
+
+# ------------------------------------------------- verify on a driver-only box
+#
+# The pid check needs a CUDA process to look at, and on an idle card verify
+# has to make one. It could only do that with nvcc or torch, so on
+# 2026-09-16 a KVM box with neither verified nothing and was called "sharing
+# works". The driver's own libcuda can open a context on any box that has
+# a driver at all.
+#
+# So: run the verify script deploy.sh really sends, on a fake box with a
+# driver-only toolset. Its nvidia-smi lists a process only once something
+# has loaded libcuda, and names that process's real pid, so a fallback that
+# does not exist leaves the pid check with no subject.
+fb="$tmp/fakebox"; mkdir -p "$fb/bin" "$fb/sys"
+# A PATH holding only what the script needs, so an nvcc or a torch on the
+# machine running this suite cannot take the path under test away from it.
+for t in bash sh awk cat tr sed sleep rm touch head; do
+  ln -s "$(command -v "$t")" "$fb/sys/$t"
+done
+cat > "$fb/bin/python" <<FAKE
+#!/bin/bash
+[ "\$1" = "-c" ] || exit 1
+case "\$2" in
+  *libcuda*) echo \$\$ > '$fb/ctx.pid'; exec sleep 30 ;;
+  *) exit 1 ;;   # no torch, and no gpuqueue to import
+esac
+FAKE
+cat > "$fb/bin/nvidia-smi" <<FAKE
+#!/bin/bash
+[ -s '$fb/ctx.pid' ] && printf '%s, 104 MiB, python\n' "\$(cat '$fb/ctx.pid')"
+exit 0
+FAKE
+printf '#!/bin/bash\nexit 0\n' > "$fb/bin/gpu-claim"
+printf '#!/bin/bash\nexit 0\n' > "$fb/bin/gpuq"
+chmod +x "$fb/bin/"*
+
+rm -f "$tmp/scripts/verify.script"
+DEPLOY_SSH="$tmp/fake-capture" bash "$repo/deploy.sh" fake-box --verify-only \
+  --python "$fb/bin/python" >/dev/null 2>&1 || true
+env -i PATH="$fb/sys" HOME="$tmp" bash "$tmp/scripts/verify.script" \
+  > "$fb/verify.out" 2>/dev/null
+fb_localpids="$(sed -n '/^localpids<<<$/,/^localpids>>>$/p' "$fb/verify.out" | sed '1d;$d')"
+
+check "verify on a driver-only box opens a context through libcuda" \
+  "[ -s '$fb/ctx.pid' ]"
+check "verify on a driver-only box has a local pid to test" \
+  "[ -n \"\$fb_localpids\" ] && [ \"\$fb_localpids\" = \"\$(cat '$fb/ctx.pid' 2>/dev/null)\" ]"
+check "verify on a driver-only box cleans up its probe" \
+  "! kill -0 \"\$(cat '$fb/ctx.pid' 2>/dev/null || echo 999999)\" 2>/dev/null"
 
 # A box that refuses at probe must not be installed on. This fake reports
 # only a 3.10, which is below the floor.

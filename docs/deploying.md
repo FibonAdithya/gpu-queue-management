@@ -570,7 +570,11 @@ accept that nothing enforces the review.
 `./deploy.sh $BOX --verify-only` runs these and reports a verdict. It also
 settles the pid-namespace question above, which needs a live CUDA process:
 it reads one already on the card, and allocates a small probe only when the
-card is idle, so it is safe to run against a box someone is using.
+card is idle, so it is safe to run against a box someone is using. The probe
+is built with `nvcc`, or torch, or failing both a bare context opened
+through the driver's `libcuda.so.1`, so a box with only a driver is still
+measured. If no probe could run, the verdict says sharing is *unverified*
+rather than that it works.
 
 By hand:
 
@@ -640,7 +644,7 @@ is an example of the useful level of detail; the rest are real.
 | Alias | Hardware | Interpreter | Notes |
 |---|---|---|---|
 | `<your-box>` | e.g. RTX 4060, 8 GB | e.g. `/venv/main/bin/python` 3.12, torch 2.x | Hosted unprivileged container, root. `nvidia-smi` enumerates compute apps, so preflight is a real guard — record this either way, it is the difference between a guard and a warning. Verified `<date>` |
-| `tig-gpu` | RTX 3060, 12288 MiB | `/venv/main/bin/python` 3.12.14, torch 2.13.0+cu126 (system `python3` is 3.12.3, no torch) | vast.ai unprivileged container, root; no docker, no volume, so `/workspace` does **not** survive a recycle. `nvidia-smi` enumerates compute apps, but **in the host's pid namespace** — preflight refuses a busy card (exit 69, measured), while the orphan sweep and `enforce_vram` are inert and VRAM sharing degrades to one GPU job at a time. See [Host pids](#nvidia-smi-may-report-pids-from-the-hosts-namespace). Verified 2026-09-16 at 9d48f99 |
+| `tig-gpu` | RTX 3060 Ti, 8192 MiB | `/venv/main/bin/python` 3.12.14, no torch (system `python3` is 3.12.3) | vast.ai unprivileged container, Ubuntu 24.04, root; CUDA 12.8 toolkit with `nvcc`; no volume (`workspace_is_volume: false`), so `/workspace` does **not** survive a recycle. `nvidia-smi` reports **host pids** (a probe's local pid 1790 was listed as 203731, `[Not Found]`, absent from `/proc`, measured) — preflight refuses a busy card (exit 69, measured), while the orphan sweep and `enforce_vram` are inert and VRAM sharing degrades to one GPU job at a time. See [Host pids](#nvidia-smi-may-report-pids-from-the-hosts-namespace). Replaced the RTX 3060 container on 2026-09-16. Verified 2026-09-16 at 9d48f99 |
 
 The one field worth being precise about is whether `nvidia-smi` could enumerate
 compute apps, because it varies by image and decides whether preflight actually

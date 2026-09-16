@@ -155,8 +155,12 @@ verdict() {
       printf 'usable, one GPU job at a time (nvidia-smi reports host pids)\n' ;;
     unsupported)
       printf 'usable, one GPU job at a time (no preflight guard; advisory lock only)\n' ;;
-    *)
+    local-pids)
       printf 'usable, GPU sharing works\n' ;;
+    # idle, or anything unrecognised: nothing was measured, and the good
+    # verdict is the one that must be earned rather than defaulted to.
+    *)
+      printf 'usable, GPU sharing unverified (no CUDA process to test pids with)\n' ;;
   esac
 }
 
@@ -367,6 +371,13 @@ CU
   elif '$P_PYTHON' -c 'import torch' 2>/dev/null; then
     '$P_PYTHON' -c 'import torch,time;x=torch.zeros(64*1024*1024,device="cuda");time.sleep(30)' >/dev/null 2>&1 &
     PROBE_PID=\$!; allocated=1; sleep 10
+  fi
+  # No toolkit, no torch, or a compile that failed. The driver's own
+  # libcuda can still open a context, which is all the pid check needs --
+  # without this, a box with only a driver verifies nothing.
+  if [ "\$allocated" = "0" ]; then
+    '$P_PYTHON' -c 'import ctypes,time;c=ctypes.CDLL("libcuda.so.1");d=ctypes.c_int();x=ctypes.c_void_p();assert c.cuInit(0)==0 and c.cuDeviceGet(ctypes.byref(d),0)==0 and c.cuCtxCreate_v2(ctypes.byref(x),0,d)==0;time.sleep(30)' >/dev/null 2>&1 &
+    PROBE_PID=\$!; allocated=1; sleep 6
   fi
   apps="\$(nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv,noheader 2>/dev/null)"
 fi
