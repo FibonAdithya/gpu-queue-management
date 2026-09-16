@@ -74,17 +74,76 @@ the nameplate total.
 
 ### Preflight is only as good as nvidia-smi
 
-`--query-compute-apps` behaves three ways, and the difference matters:
+`--query-compute-apps` behaves four ways, and the difference matters:
 
-- **Lists processes** → preflight is a real guard. It will refuse to start when
-  a stranger holds the card, naming the pid.
+- **Lists processes, with pids you can find in `/proc`** → preflight is a real
+  guard and so is everything built on it. It will refuse to start when a
+  stranger holds the card, naming the pid.
+- **Lists processes, with pids you cannot find in `/proc`** → the driver is
+  reporting the *host's* pid namespace into your container. Preflight still
+  refuses a busy card, but every other pid-keyed mechanism silently stops
+  working — including on your own jobs. See
+  [Host pids](#nvidia-smi-may-report-pids-from-the-hosts-namespace) below;
+  this one is worth the two commands it takes to rule out.
 - **Empty, exit 0** → the card is idle. Verify it can *actually* see processes,
   because a container that cannot will also look like this. Start a CUDA
   process and re-run the query. If your own process does not appear, treat it
-  as the next case.
+  as the `[Not Supported]` case.
 - **`[Not Supported]` or missing** → preflight degrades to a warning and the
   advisory lock is all you have. Everything still works; accidental contention
   just fails later and less legibly.
+
+### nvidia-smi may report pids from the host's namespace
+
+An unprivileged container can be shown compute apps it cannot address. The
+check is two commands, and the answer is unambiguous:
+
+```bash
+nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv,noheader
+# 3006382, 614 MiB, [Not Found]        <-- a pid, and a name it could not resolve
+ls -d /proc/3006382                     # No such file or directory
+```
+
+`[Not Found]` as the process name beside a live allocation is the tell: the
+driver can see the process, and your `/proc` cannot. Measured on `tig-gpu`
+(2026-09-16), where one CUDA process was pid **2245** inside the container
+and pid **3006382** to `nvidia-smi`.
+
+Every pid-keyed mechanism in gpuq compares those two numbers, because
+`ledger.attribute` charges an `nvidia-smi` pid to the claim record whose
+`usage_pid` tree contains it. Across a namespace boundary the two sets never
+intersect, so *every* CUDA process on the box reads as unledgered — a
+stranger's and your own alike. Three consequences, in descending order of how
+much they cost you:
+
+- **VRAM sharing stops working, and this is the one that bites.** As soon as
+  any claim's CUDA work is actually on the card, the holder's own process
+  reads as an unledgered stranger, and preflight refuses the *next* claim.
+  Measured: with a `--vram-mb 1000` claim held on a 12288 MiB card,
+  a second `gpu-claim --vram-mb 1000` — 1 of 2 job slots, 1000 of 11776
+  MiB — exited **69**, naming the first holder's own pid. The GPU lane
+  degrades to one job at a time. Jobs *queue* rather than fail, since the
+  runner defers on `PreflightFailed` rather than failing the spec, so this
+  costs throughput and not correctness.
+- **The orphan sweep is inert.** Every CUDA process is a victim, and every
+  SIGTERM gets ESRCH against a pid that does not exist locally. `_signal`
+  swallows ESRCH by design, so nothing is killed, nothing is escalated, and
+  nothing is logged. Measured: an unclaimed CUDA process survived 140s —
+  more than two 60s sweep intervals — with `gpuq kills` reporting
+  `no kills recorded` and not one line in the runner log. Note that the
+  silence is total: there is no symptom to notice in passing.
+- **`enforce_vram` is inert**, by the same missing attribution — a job's
+  usage is never charged to it, so it is never convicted.
+
+None of this touches what the advisory lock itself guarantees. `flock` and the
+ledger are keyed on the GPU UUID, not on pids, so exclusive claims still
+serialize correctly and two jobs still never overlap. What you lose is the
+capacity layer on top: treat such a box as one-GPU-job-at-a-time and do not
+rely on `gpu_max_jobs`, `--vram-mb` admission, or orphan protection.
+
+Setting `gpu_max_jobs = 1` makes that explicit rather than emergent. It
+changes no behaviour — preflight is already enforcing it — but it stops
+`gpuq` describing a capacity the box cannot deliver.
 
 ## 2. Get the code onto the box
 
@@ -527,15 +586,23 @@ Things that have actually bitten, and what they look like:
   resumes. Preflight is what stops a new job colliding with it in the meantime.
 - **Rebuilding a box loses `$QUEUE_ROOT`.** Only committed artifacts survive.
   That is the design's position, not an oversight.
+- **A claim that refuses the card to itself.** `gpu-claim` exits 69 naming a pid
+  you cannot find in `/proc`, and the allocation it names is your *own* running
+  job. The box is reporting host pids through `nvidia-smi`; see
+  [Host pids](#nvidia-smi-may-report-pids-from-the-hosts-namespace). The
+  giveaway is `[Not Found]` where the process name should be. Nothing is
+  misconfigured and there is no config that fixes it — the box is
+  one-GPU-job-at-a-time.
 
 ## Boxes
 
-Record deployments here so the next person knows what to expect. The row below
-is an example of the useful level of detail — replace it with your own.
+Record deployments here so the next person knows what to expect. The first row
+is an example of the useful level of detail; the rest are real.
 
 | Alias | Hardware | Interpreter | Notes |
 |---|---|---|---|
 | `<your-box>` | e.g. RTX 4060, 8 GB | e.g. `/venv/main/bin/python` 3.12, torch 2.x | Hosted unprivileged container, root. `nvidia-smi` enumerates compute apps, so preflight is a real guard — record this either way, it is the difference between a guard and a warning. Verified `<date>` |
+| `tig-gpu` | RTX 3060, 12288 MiB | `/venv/main/bin/python` 3.12.14, **no torch** (system `python3` is 3.12.3) | vast.ai unprivileged container, root; no docker, no volume, so `/workspace` does **not** survive a recycle. `nvidia-smi` enumerates compute apps, but **in the host's pid namespace** — preflight refuses a busy card (exit 69, measured), while the orphan sweep and `enforce_vram` are inert and VRAM sharing degrades to one GPU job at a time. See [Host pids](#nvidia-smi-may-report-pids-from-the-hosts-namespace). Verified 2026-09-16 at 9d48f99 |
 
 The one field worth being precise about is whether `nvidia-smi` could enumerate
 compute apps, because it varies by image and decides whether preflight actually
