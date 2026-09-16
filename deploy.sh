@@ -204,7 +204,7 @@ row()  { printf '           %-22s %-20s %s\n' "$1" "$2" "$3" >&2; }
 # --------------------------------------------------------------- phase 1
 
 PROBE_OUT=""
-P_PYTHON=""; P_GPU=""; P_UUID=""; P_TOTAL="none"; P_SMI=0
+P_PYTHON=""; P_GPU=""; P_TOTAL="none"; P_SMI=0
 P_SUPERVISOR=0; P_WRITABLE=0; P_GIT=0
 
 do_probe() {
@@ -237,11 +237,12 @@ fi
 EOF
 )" || { say "deploy: could not reach '$BOX' over ssh"; return 2; }
 
-  local tag a b c
-  while IFS=$'\t' read -r tag a b c; do
+  local tag a c
+  # The gpu line's third field is the card UUID, which nothing here uses.
+  while IFS=$'\t' read -r tag a _ c; do
     case "$tag" in
       smi)            P_SMI="$a" ;;
-      gpu)            P_GPU="$a"; P_UUID="$b"; P_TOTAL="${c:-none}" ;;
+      gpu)            P_GPU="$a"; P_TOTAL="${c:-none}" ;;
       supervisor)     P_SUPERVISOR="$a" ;;
       git)            P_GIT="$a" ;;
       prefixwritable) P_WRITABLE="$a" ;;
@@ -491,6 +492,8 @@ do_report() {
   v="$(verdict "$VERDICT_PIDCLASS" "$VERDICT_TOTAL" "$P_SMI")"
   printf '\n  %-8s %s\n' "VERDICT" "$v" >&2
   printf '\n  Row for docs/deploying.md — Boxes:\n\n' >&2
+  # The backticks are Markdown for the docs table, not command substitution.
+  # shellcheck disable=SC2016
   printf '| `%s` | %s, %s MiB | `%s` | %s. Verified %s |\n\n' \
     "$BOX" "${P_GPU:-no GPU}" "$P_TOTAL" "$P_PYTHON" "$v" "$(date +%F)" >&2
 }
