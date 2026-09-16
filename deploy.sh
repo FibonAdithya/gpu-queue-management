@@ -52,7 +52,7 @@ Options:
   --verify-only       Skip probe and install; verify an existing install.
   --python PATH       Interpreter to install into. Default: chosen by probe.
   --prefix PATH       GPUQ_PREFIX on the box. Default: /workspace.
-  --ref REF           Branch or commit to check out. Default: current HEAD.
+  --ref REF           Branch or tag on origin. Default: current branch.
   --slow              Also run the 140s orphan-sweep test, which is
                       otherwise derived from the pid-namespace check.
   --dry-run           Print what each phase would do.
@@ -317,11 +317,11 @@ do_install() {
   local out
   if ! out="$(remote install <<EOF
 set -e
-if [ -d '$REPO_DIR/.git' ]; then
-  cd '$REPO_DIR' && git fetch --quiet origin && git checkout --quiet '$ref'
-else
-  git clone --quiet '$url' '$REPO_DIR' && cd '$REPO_DIR' && git checkout --quiet '$ref'
-fi
+[ -d '$REPO_DIR/.git' ] || git clone --quiet '$url' '$REPO_DIR'
+# Check out what was fetched, not a local branch of the same name: on a
+# box that already has a clone, that branch is the previous deploy's
+# commit, and switching to it would reinstall that.
+cd '$REPO_DIR' && git fetch --quiet origin '$ref' && git checkout --quiet --detach FETCH_HEAD
 git -C '$REPO_DIR' rev-parse --short HEAD
 cd '$REPO_DIR' && PYTHON='$P_PYTHON' GPUQ_PREFIX='$PREFIX' ./bootstrap.sh $sup_flag 2>&1 | tail -5
 EOF

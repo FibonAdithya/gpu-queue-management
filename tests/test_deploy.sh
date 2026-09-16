@@ -265,9 +265,33 @@ DEPLOY_SSH="$tmp/fake-capture" bash "$tmp/work/deploy.sh" fake-box >/dev/null 2>
 check "install was reached with a script to inspect" \
   "[ -s '$tmp/scripts/install.script' ]"
 check "the deployed ref is the branch, not the local HEAD sha" \
-  "grep -q \"checkout --quiet 'main'\" '$tmp/scripts/install.script'"
+  "grep -q \"fetch --quiet origin 'main'\" '$tmp/scripts/install.script'"
 check "an unpushed local HEAD is never handed to the box as a ref" \
   "! grep -q '$head_sha' '$tmp/scripts/install.script'"
+
+# "Safe to re-run" has to mean a re-run deploys what origin has now. A box
+# that already holds a clone has a local branch of the same name, and
+# `git fetch && git checkout <branch>` switches to that stale branch rather
+# than to what was just fetched -- so every deploy after the first would
+# reinstall the first one's commit and report success.
+#
+# So: run the install script deploy.sh really sends, twice, against a real
+# origin, pushing a new commit in between.
+boxprefix="$tmp/boxprefix"; mkdir -p "$boxprefix"
+DEPLOY_SSH="$tmp/fake-capture" bash "$tmp/work/deploy.sh" fake-box \
+  --prefix "$boxprefix" >/dev/null 2>&1 || true
+bash "$tmp/scripts/install.script" >/dev/null 2>&1 || true
+first_box_sha="$(git -C "$boxprefix/gpu-queue-management" rev-parse HEAD 2>/dev/null)"
+gitq -C "$tmp/work" push --quiet origin main
+DEPLOY_SSH="$tmp/fake-capture" bash "$tmp/work/deploy.sh" fake-box \
+  --prefix "$boxprefix" >/dev/null 2>&1 || true
+bash "$tmp/scripts/install.script" >/dev/null 2>&1 || true
+second_box_sha="$(git -C "$boxprefix/gpu-queue-management" rev-parse HEAD 2>/dev/null)"
+
+check "a first deploy checks out what origin had" \
+  "[ '$first_box_sha' = '$pushed_sha' ]"
+check "a re-deploy onto an existing clone checks out what origin has now" \
+  "[ '$second_box_sha' = '$head_sha' ]"
 
 # ------------------------------------------------- verify on a driver-only box
 #
