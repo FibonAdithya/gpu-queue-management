@@ -70,8 +70,13 @@ lock without training, and if your lock has a timeout shorter than a run,
 it fails with your code's own "GPU busy" error. That failure is not an OOM
 and not a queue kill.
 
-Check before submitting: `grep -rn "flock\|gpu_lock\|claim_gpu" src/`. If
-your code takes such a lock, omit `--vram-mb`. The job then holds the whole
+Check before submitting, from the root of the repo you are submitting:
+`git grep -nE 'flock|lockf|FileLock|gpu_lock|claim_gpu'`. That covers every
+tracked file, not only `src/`, and the common ways Python takes a file lock
+(`fcntl.flock`, `fcntl.lockf`, the `filelock` package). A match is not proof:
+read it and see whether the lock is held around training. No match is not
+proof either, if your project locks some other way. If your code takes such
+a lock, omit `--vram-mb`. The job then holds the whole
 card, and your jobs run one after another instead of blocking each other.
 The cost is that nobody else's job shares the card while yours runs.
 
