@@ -42,7 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "reports it (so including the ~250 MiB CUDA "
                         "context and the allocator's high-water mark, "
                         "not torch's max_memory_allocated). Omit to "
-                        "take the whole card.")
+                        "take the whole card, and omit it for a command "
+                        "whose own code takes an exclusive lock on the "
+                        "card: two such commands admitted together run "
+                        "one at a time and the second can time out "
+                        "waiting.")
     p.add_argument("--scope-pid", dest="scope_pid", type=int, default=None,
                    help="claim on behalf of the cgroup this pid belongs "
                         "to, for CUDA that runs in a container rather "
