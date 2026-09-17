@@ -244,7 +244,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="VRAM this job needs, in MiB as nvidia-smi reports "
                         "it (so including the ~250 MiB CUDA context and the "
                         "allocator's high-water mark, not torch's "
-                        "max_memory_allocated). Omit to take the whole card.")
+                        "max_memory_allocated). Omit to take the whole card, "
+                        "and omit it for a job whose own code takes an "
+                        "exclusive lock on the card: two such jobs admitted "
+                        "together run one at a time and the second can "
+                        "time out waiting.")
     s.add_argument("--wait", action="store_true",
                    help="block until the job finishes, then exit with its result")
     s.add_argument("--timeout", type=float, default=None,
