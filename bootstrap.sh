@@ -167,10 +167,22 @@ fi
 if [ "$DRY_RUN" -eq 1 ]; then
   say "would: write $GPUQ_PREFIX/env.sh"
 else
+  # Where pip put `gpuq`, asked rather than assumed to be beside the
+  # interpreter: a non-root install into a system Python lands in the user
+  # scheme (~/.local/bin), and Debian's root scheme is /usr/local/bin.
+  SCRIPTS_DIR="$("$PYTHON" - <<'PYEOF'
+import os
+import sysconfig
+
+dirs = [sysconfig.get_path("scripts"),
+        sysconfig.get_path("scripts", f"{os.name}_user")]
+print(next((d for d in dirs if os.path.exists(os.path.join(d, "gpuq"))), dirs[0]))
+PYEOF
+)"
   cat > "$GPUQ_PREFIX/env.sh" <<ENVEOF
 # Written by bootstrap.sh; rerunning it rewrites this file.
 # Use:  . $GPUQ_PREFIX/env.sh
-export PATH="$(dirname "$PYTHON_ABS"):\$PATH"
+export PATH="$SCRIPTS_DIR:\$PATH"
 export QUEUE_ROOT="$QUEUE_ROOT"
 export GPU_CLAIM_DIR="$GPU_CLAIM_DIR"
 export GPUQ_CONFIG="$GPUQ_CONFIG"
