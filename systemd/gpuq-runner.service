@@ -1,0 +1,34 @@
+# systemd/gpuq-runner.service — installed by bootstrap.sh, not by hand.
+# The alternative to supervisor/gpuq-runner.conf, for a box that runs
+# systemd and no supervisord. Same placeholders, same environment.
+[Unit]
+Description=gpuq runner
+
+[Service]
+Type=simple
+# Absolute interpreter for the same reason as the supervisor program file:
+# systemd's PATH does not include a venv's bin directory.
+ExecStart=@PYTHON@ -m gpuqueue.cli_runner --config @GPUQ_CONFIG@
+WorkingDirectory=@GPUQ_PREFIX@
+Environment="QUEUE_ROOT=@QUEUE_ROOT@"
+Environment="GPU_CLAIM_DIR=@GPU_CLAIM_DIR@"
+Environment="GPUQ_CONFIG=@GPUQ_CONFIG@"
+Environment="PYTHONUNBUFFERED=1"
+# The autofix PAT is deliberately absent, as it is from the supervisor
+# file: this unit is world-readable. Put GPUQ_GITHUB_TOKEN in a 0600 file
+# and name it with EnvironmentFile= in a drop-in (`systemctl edit
+# gpuq-runner`), which a bootstrap re-run does not touch.
+Restart=always
+RestartSec=5
+# The runner stops its own jobs on SIGTERM and leaves them for the reaper
+# to requeue. control-group is the backstop for anything that outlives
+# that, which is what stopasgroup/killasgroup are under supervisor.
+KillMode=control-group
+TimeoutStopSec=30
+# Same file supervisor writes, so "check the runner log" means one path on
+# every box. systemd does not rotate it; supervisor caps it at 50MB.
+StandardOutput=append:@QUEUE_ROOT@/logs/runner.log
+StandardError=inherit
+
+[Install]
+WantedBy=@WANTED_BY@

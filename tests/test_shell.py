@@ -35,7 +35,8 @@ TESTS_DIR = Path(__file__).parent
 # any value chosen here would be this harness deciding something the
 # script is supposed to decide.
 _SCRUBBED = ("GPUQ_PREFIX", "QUEUE_ROOT", "GPU_CLAIM_DIR", "GPUQ_CONFIG",
-             "GPUQ_SKILLS_DIR", "SUPERVISOR_CONF_DIR", "PYTHON")
+             "GPUQ_SKILLS_DIR", "SUPERVISOR_CONF_DIR", "PYTHON",
+             "GPUQ_VENV", "GET_PIP_URL", "SYSTEMD_UNIT_DIR", "SYSTEMD_RUN_DIR")
 
 
 def _shell_tests() -> list[Path]:

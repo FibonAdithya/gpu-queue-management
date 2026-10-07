@@ -1,6 +1,6 @@
 ---
 name: gpu-jobs
-description: Use when running training, evaluation or any GPU work on this box, and when a long CPU job would otherwise block you - submit it to the queue instead of running it directly, then either wait for it or go do something else. Also use when you have anything to report about the queue itself - a bug, a measurement, or a proposal about how it behaves.
+description: Use when running training, evaluation or any GPU work on this box, and when a long CPU job would otherwise block you - submit it to the queue instead of running it directly, then either wait for it or go do something else. Covers boxes with no GPU at all, and submitting to a remote box over ssh and reading the result back. Also use when you have anything to report about the queue itself - a bug, a measurement, or a proposal about how it behaves.
 ---
 
 # Running work on a shared GPU box
@@ -40,6 +40,80 @@ The runner will already have been working through them.
 Putting CPU work in the GPU lane blocks everyone else's training for no
 reason. Putting GPU work in the CPU lane means several jobs hit the card at
 once, which is the failure this queue exists to prevent.
+
+## On a box with no GPU
+
+The queue runs on CPU-only boxes too. Everything above applies, with these
+differences:
+
+- Use `--lane cpu` for every job. It is also the default. A `--lane gpu`
+  job is not run on the CPU: it fails with `no usable GPU`.
+- Leave out `--vram-mb`. It has no meaning in the CPU lane.
+- `gpu-claim` has nothing to claim and exits non-zero. You do not need it.
+
+Several agents can use the box at once without coordinating with each
+other:
+
+- Each job runs in its own worktree of the commit it pinned, so two jobs
+  never see each other's files, even two jobs from the same repository at
+  different commits.
+- The runner starts at most `[queue].cpu_slots` jobs at a time (4 unless
+  the box's config says otherwise) and the rest wait. Submit everything
+  you have. Do not hold work back to be polite, and do not start anything
+  directly to get around a full queue.
+- If two agents might submit the same piece of work, give it a
+  `--dedupe-key`. A second submit with the same key while the first is
+  pending or running returns the first job's id and queues nothing.
+
+A job is killed when it runs longer than `--timeout-s`, which defaults to
+3600 seconds. Set it for anything that takes more than an hour.
+
+## Submitting to a box from another machine
+
+The queue is a directory on the box, so everything goes through ssh. Source
+the box's `env.sh` first in every command. It is written by `bootstrap.sh`
+at the install prefix (`/workspace` unless the box was deployed with
+another), and without it `gpuq` is either not on PATH or reading the wrong
+queue.
+
+    BOX=<ssh-alias>
+    id=$(ssh $BOX '. /workspace/env.sh && gpuq submit --project <name> \
+      --commit <sha> --branch <branch> --lane cpu \
+      --artifact out/summary.json -- python -m src.analyse')
+
+Push the commit before you submit. The box fetches it from the project's
+remote, and a commit that only exists on your machine fails the job with
+"push it first".
+
+Then check on it without holding a connection open for the whole run:
+
+    ssh $BOX ". /workspace/env.sh && gpuq wait $id --timeout 600"
+    # 0 done, 1 failed, 124 still going after 600s -- run it again later
+    ssh $BOX ". /workspace/env.sh && gpuq show $id"        # spec, error, log paths
+    ssh $BOX ". /workspace/env.sh && gpuq list --json"     # every job, by state
+
+Use a bounded `--timeout` and repeat, not one `gpuq wait` for hours: a
+dropped ssh connection tells you nothing about the job, which carries on
+either way. Keep the job id. It is the only handle you have, and `gpuq
+wait` on a finished job returns at once.
+
+Results come back two ways:
+
+- Declared with `--artifact`, when the project's config on the box has
+  `commit_artifacts`. The runner commits those files, and pushes them if
+  the project has `push` or a results repository. You read them from git.
+  In a results repository they are at `<project>/<job-id>/<path>`.
+- The job's stdout and stderr. `gpuq show $id` prints the paths of both
+  logs, and they stay on the box after the job ends. For a small result,
+  print it and read the log over ssh.
+
+Nothing else survives. The job's worktree is removed when it finishes, so
+do not plan to copy files out of it, and do not look in the directories
+beside it, which belong to other agents' jobs.
+
+Do not run the work itself over ssh (`ssh $BOX 'python -m ...'`). It
+bypasses `cpu_slots`, so it slows every queued job down, and it dies with
+your connection.
 
 ## Say how much VRAM you need
 

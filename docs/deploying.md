@@ -1,6 +1,7 @@
 # Deploying to a remote GPU box
 
-A running document. It covers taking this repo to *any* remote box with a GPU —
+A running document. It covers taking this repo to *any* remote box — with a
+GPU, or without one as a [CPU job queue](#a-box-with-no-gpu) —
 nothing here is specific to one host. Add a row to [Boxes](#boxes) when you
 deploy somewhere new, and add to [Gotchas](#gotchas) when something bites you.
 
@@ -54,8 +55,11 @@ echo "== can it enumerate CUDA processes? =="
 nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv,noheader
 echo "== does it report a total? (capacity discovery) =="
 nvidia-smi --query-gpu=memory.total --format=csv,noheader
-echo "== supervisor / git =="
-command -v supervisord supervisorctl; ls -d /etc/supervisor/conf.d; git --version
+echo "== pip, or the means to get it =="
+python3 -c 'import pip' && echo pip; python3 -c 'import ensurepip' && echo ensurepip
+echo "== supervisor / systemd / git =="
+command -v supervisord supervisorctl; ls -d /etc/supervisor/conf.d
+ls -d /run/systemd/system && command -v systemctl; git --version
 echo "== workspace =="
 ls -d /workspace && touch /workspace/.probe && rm /workspace/.probe && echo writable
 EOF
@@ -66,10 +70,11 @@ What the answers mean:
 | Check | Requirement | If it fails |
 |---|---|---|
 | A Python **3.11+** | stdlib `tomllib`; there is no `tomli` fallback | Use another interpreter on the box (step 3), or install one |
-| `nvidia-smi -L` | GPU identity comes from here — torch is never imported | Without it the GPU lane refuses every job, by design |
+| pip in that Python | How the runner is installed | Not a refusal. `bootstrap.sh` creates `$GPUQ_PREFIX/venv` and installs there; see [No pip](#an-interpreter-with-no-pip) |
+| `nvidia-smi -L` | GPU identity comes from here — torch is never imported | Without it the GPU lane refuses every job, by design. The CPU lane is unaffected; see [A box with no GPU](#a-box-with-no-gpu) |
 | `--query-compute-apps` | Decides whether preflight is a real guard | See [Preflight](#preflight-is-only-as-good-as-nvidia-smi) below |
 | `--query-gpu=memory.total` | Capacity discovery for the GPU lane | Must print like `8188 MiB`. See [Capacity discovery](#capacity-discovery-fails-quietly) below |
-| supervisor + `conf.d` | How the runner is kept alive | `./bootstrap.sh --no-supervisor` and run `gpuq-runner` yourself |
+| supervisor, or a running systemd | How the runner is kept alive | With neither, `./bootstrap.sh --init none` and run `gpuq-runner` yourself |
 | `/workspace` writable | Default prefix for queue, locks, checkouts | Set `GPUQ_PREFIX` to somewhere writable |
 
 ### Capacity discovery fails quietly
@@ -201,8 +206,8 @@ package has no dependencies, so installing into it cannot conflict with the ML
 stack.
 
 This is the choice `deploy.sh` makes for you: among interpreters that are
-3.11+ and have pip, one holding torch wins, and ties break to the highest
-version. `--python` overrides it.
+3.11+, one with pip beats one without, then one holding torch wins, and ties
+break to the highest version. `--python` overrides it.
 
 ```bash
 ssh $BOX 'cd /workspace/gpu-queue-management &&
@@ -222,8 +227,67 @@ ssh $BOX 'cd /workspace/gpu-queue-management &&
 | `GPUQ_CONFIG` | `$GPUQ_PREFIX/gpuq.toml` | Written once, never overwritten |
 | `GPUQ_SKILLS_DIR` | `~/.claude/skills` | Where the agent skill is installed |
 | `SUPERVISOR_CONF_DIR` | `/etc/supervisor/conf.d` | |
+| `SYSTEMD_UNIT_DIR` | `/etc/systemd/system` as root, else `~/.config/systemd/user` | |
+| `GPUQ_VENV` | `$GPUQ_PREFIX/venv` | Only used when `PYTHON` has no pip |
+| `GET_PIP_URL` | `https://bootstrap.pypa.io/get-pip.py` | Only fetched when `PYTHON` has neither pip nor `ensurepip`. Point it at a mirror on a box that cannot reach pypa.io |
 
-Flags: `--dry-run`, `--no-supervisor`.
+Flags: `--dry-run`, and `--init supervisor|systemd|none`. `--no-supervisor`
+is the older spelling of `--init none` and still works.
+
+It also writes `$GPUQ_PREFIX/env.sh`, which exports `PATH`, `QUEUE_ROOT`,
+`GPU_CLAIM_DIR` and `GPUQ_CONFIG` as this install uses them. Source it in
+any shell or ssh command that runs `gpuq` or `gpu-claim`:
+`ssh $BOX '. /workspace/env.sh && gpuq list'`. It is rewritten on every run.
+
+### An interpreter with no pip
+
+Debian and Ubuntu ship `python3` without pip, and without `ensurepip`
+unless `python3-venv` is installed, so `python3 -m venv` fails on the same
+boxes. `bootstrap.sh` handles both and never modifies the interpreter it
+was given:
+
+1. `PYTHON` has pip: install into it, as before.
+2. No pip, but `ensurepip`: create `$GPUQ_VENV` and install into that.
+3. Neither: create `$GPUQ_VENV` with `--without-pip`, fetch `get-pip.py`
+   from `GET_PIP_URL` and run it with the venv's interpreter.
+
+In cases 2 and 3 the runner lives in the venv, and the last line but one of
+bootstrap's output says so (`runner python: …`). `deploy.sh` reads that
+line and verifies against the venv. If the fetch in case 3 fails,
+bootstrap stops and names the package to install instead.
+
+The venv holds gpuq and nothing else. Jobs get their own interpreter from
+the project's `venv` key (step 4), not from this one.
+
+### supervisor or systemd
+
+Left to choose, `bootstrap.sh` uses supervisor wherever `supervisorctl`
+exists, and systemd only when supervisor is absent and systemd is the
+running init (`/run/systemd/system` exists — a `systemctl` binary alone is
+not enough, container images ship one with no manager behind it). With
+neither it installs the supervisor program file and does not start it.
+`deploy.sh` makes the same choice from its probe and passes it as `--init`.
+
+Under systemd, root gets a system unit. Anyone else gets a user unit, which
+stops at logout unless lingering is on; bootstrap prints the command:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+`deploy.sh` checks this in verify: a user unit with lingering off gets a
+`lingering off WARN` row under `runner RUNNING`, because the unit is active
+only for as long as the ssh session that asked.
+
+Day to day, where the supervisor instructions in this document say
+`supervisorctl status|restart gpuq-runner`, use
+`systemctl status|restart gpuq-runner` (add `--user` for a user unit). The
+runner log is at `$QUEUE_ROOT/logs/runner.log` under both. systemd does not
+rotate it.
+
+Do not move a box from one manager to the other by rerunning bootstrap
+with a different `--init`. Stop and remove the old unit first, or two
+runners work one queue.
 
 **The first run always reports a failed clone.** It writes a config full of
 example placeholders and tells you to edit it, so there is nothing real to
@@ -356,6 +420,9 @@ So export it in any shell that will run `gpu-claim`:
 ```sh
 export GPU_CLAIM_DIR=/workspace/lock/gpu
 ```
+
+Sourcing `$GPUQ_PREFIX/env.sh`, which `bootstrap.sh` writes, does this and
+puts `gpuq` on PATH as well.
 
 If a job dies with `exit -9`, an empty stderr and no message of its own, check
 the runner log: an orphan-sweep kill now names the pids it killed and the
@@ -506,6 +573,20 @@ Three things to set up, once:
    supervisorctl restart gpuq-runner
    ```
 
+   Under systemd, keep the token in a file only its owner can read and
+   name that file from a drop-in. A bootstrap re-run overwrites the unit
+   and leaves drop-ins alone. Not `Environment=` in the drop-in itself:
+   that file is world-readable, and so is `systemctl show`.
+
+   ```bash
+   install -m 600 /dev/null /etc/gpuq-runner.env
+   echo 'GPUQ_GITHUB_TOKEN=<the-pat>' > /etc/gpuq-runner.env
+   systemctl edit gpuq-runner        # add --user for a user unit
+   #   [Service]
+   #   EnvironmentFile=/etc/gpuq-runner.env
+   systemctl restart gpuq-runner
+   ```
+
    The name matters, and `GPUQ_GITHUB_TOKEN` being unset means *no
    credentials* rather than "whatever else this box is logged in as". `gh`
    reads `GH_TOKEN` and `GITHUB_TOKEN` on its own and falls back to
@@ -580,7 +661,7 @@ By hand:
 
 ```bash
 ssh $BOX 'export PATH=/venv/main/bin:$PATH GPU_CLAIM_DIR=/workspace/lock/gpu
-  supervisorctl status gpuq-runner
+  supervisorctl status gpuq-runner           # or: systemctl is-active gpuq-runner
   gpu-claim -- nvidia-smi -L                 # holds the lock around a command
   gpu-claim --status                         # who holds the card right now
   gpuq list'
@@ -606,6 +687,27 @@ Worth confirming once per box, since these are the properties the design rests o
   python -c "import torch;from gpuqueue.gpuid import normalize_gpu_uuid,gpu_key;
   print(normalize_gpu_uuid(str(torch.cuda.get_device_properties(0).uuid)) == gpu_key())"
   ```
+
+### A box with no GPU
+
+A box without `nvidia-smi` is a CPU job queue. `deploy.sh` checks that the
+runner is up and that `gpuq list` answers, reports the GPU checks as n/a,
+and exits 0 with the verdict `usable, no GPU lane`. The claim round-trip is
+skipped because `gpu-claim` cannot derive a key with no card and refuses by
+design; that is not a fault on such a box.
+
+Everything else is the same: declare projects (step 4), and `cpu_slots`
+bounds how many jobs run at once. A job submitted with `--lane gpu` fails
+with `no usable GPU`. The agent skill has a section on using such a box,
+including from another machine over ssh.
+
+End to end, once a project is declared:
+
+```bash
+ssh $BOX '. /workspace/env.sh && cd /workspace/checkouts/myproject &&
+  gpuq submit --project myproject --commit "$(git rev-parse HEAD)" --branch main \
+    --lane cpu --wait --poll 2 -- python -c "print(1)"'
+```
 
 ## Gotchas
 

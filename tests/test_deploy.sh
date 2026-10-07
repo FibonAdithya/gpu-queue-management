@@ -102,6 +102,28 @@ EOF
 check "skips a 3.11+ interpreter that has no pip" \
   "[ \"\$(probe_no_pip | run_fn choose_python)\" = '/venv/main/bin/python' ]"
 
+# A box where nothing has pip is not refused: bootstrap builds a venv from
+# the interpreter chosen here. pip is a preference, the version is not.
+probe_only_pipless() {
+  cat <<'EOF'
+py	/usr/bin/python3	3.12.3	0	0
+py	/usr/bin/python3.11	3.11.9	0	0
+py	/usr/bin/python3.10	3.10.6	1	0
+EOF
+}
+check "falls back to the newest pip-less 3.11+ when nothing 3.11+ has pip" \
+  "[ \"\$(probe_only_pipless | run_fn choose_python)\" = '/usr/bin/python3' ]"
+probe_pipless_torch() {
+  cat <<'EOF'
+py	/opt/ml/bin/python	3.12.3	0	1
+py	/usr/bin/python3	3.11.2	1	0
+EOF
+}
+# Installing into the pip one costs nothing; building a venv beside a
+# torch interpreter would leave the runner without torch anyway.
+check "an interpreter with pip beats a pip-less one that holds torch" \
+  "[ \"\$(probe_pipless_torch | run_fn choose_python)\" = '/usr/bin/python3' ]"
+
 # -------------------------------------------------------- classify_gpu_pids
 #
 # The check today's deploy turned up. nvidia-smi listing processes is not
@@ -367,6 +389,110 @@ check "a box below the version floor was still probed" \
   "grep -qx 'probe' '$DEPLOY_FAKE_LOG'"
 check "a box below the version floor is never installed on" \
   "! grep -qx 'install' '$DEPLOY_FAKE_LOG'"
+
+# ------------------------------------------- a CPU-only, pip-less, systemd box
+#
+# No card, no pip, no supervisor: every one of those used to end the
+# deploy, at probe or as a FAIL in verify. The verify answers below are
+# what such a box gives -- `claim 0` in particular, since gpu-claim cannot
+# derive a key with no card -- and none of it is a fault on this box.
+cat > "$tmp/fake-cpu" <<'FAKE'
+#!/usr/bin/env bash
+script="$(cat)"
+op="$(printf '%s\n' "$script" | sed -n 's/^#gpuq-op:\(.*\)$/\1/p' | head -1)"
+printf '%s' "$script" > "$DEPLOY_FAKE_DIR/$op.script"
+case "$op" in
+  probe)
+    printf 'py\t/usr/bin/python3\t3.12.3\t0\t0\nsmi\t0\n'
+    printf 'supervisor\t0\nsystemd\t1\nprefixwritable\t1\ngit\t1\n' ;;
+  install) printf 'abc1234\nrunner python: /workspace/venv/bin/python\nbootstrap complete\n' ;;
+  verify)  printf 'runner\tRUNNING\ntotal\tnone\ngpuqlist\t1\npreflight\tskip\nclaim\t0\n' ;;
+  *) : ;;
+esac
+FAKE
+chmod +x "$tmp/fake-cpu"
+mkdir -p "$tmp/scripts-cpu"
+DEPLOY_FAKE_DIR="$tmp/scripts-cpu" DEPLOY_SSH="$tmp/fake-cpu" \
+  bash "$tmp/work/deploy.sh" fake-box >"$tmp/cpu.out" 2>&1
+rc=$?
+check "a CPU-only box with a healthy runner exits 0" "[ $rc -eq 0 ]"
+check "a CPU-only box gets the no-GPU-lane verdict" \
+  "grep -q 'VERDICT.*no GPU lane' '$tmp/cpu.out'"
+check "a CPU-only box reports no FAIL row" "! grep -q 'FAIL' '$tmp/cpu.out'"
+check "the probe says a venv will be created for a pip-less interpreter" \
+  "grep -q 'interpreter.*/usr/bin/python3.*venv' '$tmp/cpu.out'"
+check "a box with systemd and no supervisor is bootstrapped with --init systemd" \
+  "grep -q 'bootstrap.sh --init systemd' '$tmp/scripts-cpu/install.script'"
+# Verify must use where the runner actually is. The probed interpreter has
+# no gpuqueue in it on this box, so every check run through it would fail.
+check "verify uses the interpreter bootstrap reported, not the probed one" \
+  "grep -q \"PATH='/workspace/venv/bin'\" '$tmp/scripts-cpu/verify.script'"
+
+# The same box with a runner that is not up is still a failure: skipping
+# the GPU checks must not skip the ones that apply.
+sed 's/runner\\tRUNNING/runner\\t/' "$tmp/fake-cpu" > "$tmp/fake-cpu-down"
+chmod +x "$tmp/fake-cpu-down"
+DEPLOY_FAKE_DIR="$tmp/scripts-cpu" DEPLOY_SSH="$tmp/fake-cpu-down" \
+  bash "$tmp/work/deploy.sh" fake-box >"$tmp/cpu-down.out" 2>&1
+check "a CPU-only box whose runner is down exits 1" "[ \$? -eq 1 ]"
+
+# And the script verify really sends, run on a box with no card: it reads
+# the runner's state from systemd, and does not ask gpu-claim anything.
+cb="$tmp/cpubox"; mkdir -p "$cb/bin"
+printf '#!/bin/bash\n[ "$1" = is-active ] && echo active\nexit 0\n' > "$cb/bin/systemctl"
+printf '#!/bin/bash\ntouch "%s"\nexit 69\n' "$cb/claim.ran" > "$cb/bin/gpu-claim"
+printf '#!/bin/bash\nexit 0\n' > "$cb/bin/gpuq"
+printf '#!/bin/bash\nexit 1\n' > "$cb/bin/python"
+chmod +x "$cb/bin/"*
+DEPLOY_FAKE_DIR="$tmp/scripts-cpu" DEPLOY_SSH="$tmp/fake-cpu" \
+  bash "$tmp/work/deploy.sh" fake-box --verify-only --python "$cb/bin/python" >/dev/null 2>&1 || true
+env -i PATH="$cb/bin:$fb/sys" HOME="$tmp" bash "$tmp/scripts-cpu/verify.script" \
+  > "$cb/verify.out" 2>/dev/null
+check "verify reads a systemd-managed runner as RUNNING" \
+  "grep -qx \$'runner\\tRUNNING' '$cb/verify.out'"
+check "verify on a box with no card still checks gpuq" \
+  "grep -qx \$'gpuqlist\\t1' '$cb/verify.out'"
+check "verify on a box with no card does not run gpu-claim" "[ ! -e '$cb/claim.ran' ]"
+
+# A user unit without lingering is RUNNING for exactly as long as the ssh
+# session that asked, so "runner RUNNING ok" alone is the one answer verify
+# must not give. bootstrap prints the remedy, but deploy shows bootstrap's
+# output only when it fails; the report has to carry it.
+sed 's/gpuqlist\\t1\\n/gpuqlist\\t1\\nlinger\\tno\\tbob\\n/' "$tmp/fake-cpu" > "$tmp/fake-cpu-nolinger"
+chmod +x "$tmp/fake-cpu-nolinger"
+DEPLOY_FAKE_DIR="$tmp/scripts-cpu" DEPLOY_SSH="$tmp/fake-cpu-nolinger" \
+  bash "$tmp/work/deploy.sh" fake-box >"$tmp/cpu-nolinger.out" 2>&1
+check "a user unit without lingering is reported, with the command that fixes it" \
+  "grep -q 'WARN.*loginctl enable-linger bob' '$tmp/cpu-nolinger.out'"
+check "a box that needs no lingering gets no lingering row" \
+  "! grep -qi 'linger' '$tmp/cpu.out'"
+
+# And the verify script itself: a runner only the user manager knows about,
+# on a box where lingering is off, on, and where the unit is a system one.
+ub="$tmp/userbox"; mkdir -p "$ub/bin"
+printf '#!/bin/bash\n[ "$1" = --user ] && [ "$2" = is-active ] && echo active\nexit 0\n' > "$ub/bin/systemctl"
+printf '#!/bin/bash\n[ "$1" = -un ] && echo bob || echo 1000\n' > "$ub/bin/id"
+printf '#!/bin/bash\necho "Linger=$(cat "%s")"\n' "$ub/linger" > "$ub/bin/loginctl"
+printf '#!/bin/bash\nexit 0\n' > "$ub/bin/gpuq"
+chmod +x "$ub/bin/"*
+echo no > "$ub/linger"
+env -i PATH="$ub/bin:$fb/sys" HOME="$tmp" bash "$tmp/scripts-cpu/verify.script" \
+  > "$ub/verify.out" 2>/dev/null
+check "verify reads a user unit as RUNNING" \
+  "grep -qx \$'runner\\tRUNNING' '$ub/verify.out'"
+check "verify says so when that user has lingering off" \
+  "grep -qx \$'linger\\tno\\tbob' '$ub/verify.out'"
+echo yes > "$ub/linger"
+env -i PATH="$ub/bin:$fb/sys" HOME="$tmp" bash "$tmp/scripts-cpu/verify.script" \
+  > "$ub/verify-on.out" 2>/dev/null
+check "verify says nothing about lingering when it is on" \
+  "! grep -q '^linger' '$ub/verify-on.out'"
+echo no > "$ub/linger"
+env -i PATH="$cb/bin:$ub/bin:$fb/sys" HOME="$tmp" bash "$tmp/scripts-cpu/verify.script" \
+  > "$ub/verify-system.out" 2>/dev/null
+check "verify says nothing about lingering for a system unit" \
+  "grep -qx \$'runner\\tRUNNING' '$ub/verify-system.out' && ! grep -q '^linger' '$ub/verify-system.out'"
+
 
 echo "---"
 [ "$fails" -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }
