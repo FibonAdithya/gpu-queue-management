@@ -389,9 +389,16 @@ if [ -z "\$runner" ]; then
   # Not under supervisor. A system unit, or a user unit -- which an ssh
   # command line can only ask about with the runtime dir set.
   export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/\$(id -u 2>/dev/null)}"
-  if [ "\$(systemctl is-active gpuq-runner 2>/dev/null)" = "active" ] ||
-     [ "\$(systemctl --user is-active gpuq-runner 2>/dev/null)" = "active" ]; then
+  if [ "\$(systemctl is-active gpuq-runner 2>/dev/null)" = "active" ]; then
     runner=RUNNING
+  elif [ "\$(systemctl --user is-active gpuq-runner 2>/dev/null)" = "active" ]; then
+    runner=RUNNING
+    # Active now proves little for a user unit: without lingering the
+    # user manager, and the runner with it, stops when this ssh session
+    # ends and starts again for the next one.
+    me="\$(id -un 2>/dev/null)"
+    [ "\$(loginctl show-user "\$me" -p Linger 2>/dev/null)" = "Linger=yes" ] ||
+      printf 'linger\tno\t%s\n' "\$me"
   fi
 fi
 printf 'runner\t%s\n' "\$runner"
@@ -454,8 +461,9 @@ gpu-claim -- true >/dev/null 2>&1 && printf 'claim\t1\n' || printf 'claim\t0\n'
 EOF
 )" || { say "deploy: verify could not run on $BOX"; return 1; }
 
-  local runner total gpuqlist preflight claim apps localpids
+  local runner linger total gpuqlist preflight claim apps localpids
   runner="$(printf '%s\n' "$out"  | sed -n 's/^runner\t//p'   | head -1)"
+  linger="$(printf '%s\n' "$out"  | sed -n 's/^linger\tno\t//p' | head -1)"
   total="$(printf '%s\n' "$out"   | sed -n 's/^total\t//p'    | head -1)"
   gpuqlist="$(printf '%s\n' "$out"| sed -n 's/^gpuqlist\t//p' | head -1)"
   preflight="$(printf '%s\n' "$out"|sed -n 's/^preflight\t//p'| head -1)"
@@ -465,6 +473,8 @@ EOF
 
   if [ "$runner" = "RUNNING" ]; then row "runner" "RUNNING" "ok"
   else row "runner" "${runner:-absent}" "FAIL"; fails=$((fails+1)); fi
+  [ -z "$linger" ] ||
+    row "lingering" "off" "WARN — runner stops at logout; as root: loginctl enable-linger $linger"
 
   if [ "$gpuqlist" = "1" ]; then row "gpuq list" "exit 0" "ok"
   else row "gpuq list" "nonzero" "FAIL"; fails=$((fails+1)); fi

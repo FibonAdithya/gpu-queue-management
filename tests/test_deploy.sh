@@ -454,5 +454,45 @@ check "verify on a box with no card still checks gpuq" \
   "grep -qx \$'gpuqlist\\t1' '$cb/verify.out'"
 check "verify on a box with no card does not run gpu-claim" "[ ! -e '$cb/claim.ran' ]"
 
+# A user unit without lingering is RUNNING for exactly as long as the ssh
+# session that asked, so "runner RUNNING ok" alone is the one answer verify
+# must not give. bootstrap prints the remedy, but deploy shows bootstrap's
+# output only when it fails; the report has to carry it.
+sed 's/gpuqlist\\t1\\n/gpuqlist\\t1\\nlinger\\tno\\tbob\\n/' "$tmp/fake-cpu" > "$tmp/fake-cpu-nolinger"
+chmod +x "$tmp/fake-cpu-nolinger"
+DEPLOY_FAKE_DIR="$tmp/scripts-cpu" DEPLOY_SSH="$tmp/fake-cpu-nolinger" \
+  bash "$tmp/work/deploy.sh" fake-box >"$tmp/cpu-nolinger.out" 2>&1
+check "a user unit without lingering is reported, with the command that fixes it" \
+  "grep -q 'WARN.*loginctl enable-linger bob' '$tmp/cpu-nolinger.out'"
+check "a box that needs no lingering gets no lingering row" \
+  "! grep -qi 'linger' '$tmp/cpu.out'"
+
+# And the verify script itself: a runner only the user manager knows about,
+# on a box where lingering is off, on, and where the unit is a system one.
+ub="$tmp/userbox"; mkdir -p "$ub/bin"
+printf '#!/bin/bash\n[ "$1" = --user ] && [ "$2" = is-active ] && echo active\nexit 0\n' > "$ub/bin/systemctl"
+printf '#!/bin/bash\n[ "$1" = -un ] && echo bob || echo 1000\n' > "$ub/bin/id"
+printf '#!/bin/bash\necho "Linger=$(cat "%s")"\n' "$ub/linger" > "$ub/bin/loginctl"
+printf '#!/bin/bash\nexit 0\n' > "$ub/bin/gpuq"
+chmod +x "$ub/bin/"*
+echo no > "$ub/linger"
+env -i PATH="$ub/bin:$fb/sys" HOME="$tmp" bash "$tmp/scripts-cpu/verify.script" \
+  > "$ub/verify.out" 2>/dev/null
+check "verify reads a user unit as RUNNING" \
+  "grep -qx \$'runner\\tRUNNING' '$ub/verify.out'"
+check "verify says so when that user has lingering off" \
+  "grep -qx \$'linger\\tno\\tbob' '$ub/verify.out'"
+echo yes > "$ub/linger"
+env -i PATH="$ub/bin:$fb/sys" HOME="$tmp" bash "$tmp/scripts-cpu/verify.script" \
+  > "$ub/verify-on.out" 2>/dev/null
+check "verify says nothing about lingering when it is on" \
+  "! grep -q '^linger' '$ub/verify-on.out'"
+echo no > "$ub/linger"
+env -i PATH="$cb/bin:$ub/bin:$fb/sys" HOME="$tmp" bash "$tmp/scripts-cpu/verify.script" \
+  > "$ub/verify-system.out" 2>/dev/null
+check "verify says nothing about lingering for a system unit" \
+  "grep -qx \$'runner\\tRUNNING' '$ub/verify-system.out' && ! grep -q '^linger' '$ub/verify-system.out'"
+
+
 echo "---"
 [ "$fails" -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }

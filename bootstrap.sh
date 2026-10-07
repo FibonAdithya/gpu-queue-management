@@ -45,7 +45,7 @@ INIT=auto
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)       DRY_RUN=1 ;;
-    --init)          INIT="${2:-}"; shift ;;
+    --init)          INIT="${2:-}"; [ $# -lt 2 ] || shift ;;
     --init=*)        INIT="${1#--init=}" ;;
     --no-supervisor) INIT=none ;;      # the older spelling of --init none
     -h|--help)

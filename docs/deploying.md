@@ -275,6 +275,10 @@ stops at logout unless lingering is on; bootstrap prints the command:
 sudo loginctl enable-linger $USER
 ```
 
+`deploy.sh` checks this in verify: a user unit with lingering off gets a
+`lingering off WARN` row under `runner RUNNING`, because the unit is active
+only for as long as the ssh session that asked.
+
 Day to day, where the supervisor instructions in this document say
 `supervisorctl status|restart gpuq-runner`, use
 `systemctl status|restart gpuq-runner` (add `--user` for a user unit). The

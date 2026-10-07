@@ -138,6 +138,12 @@ check "--init none calls no service manager" "[ ! -s '$tmp/systemctl.log' ]"
 
 GPUQ_PREFIX="$tmp/ws" bash "$repo/bootstrap.sh" --dry-run --init upstart >/dev/null 2>&1
 check "an unknown --init is refused with exit 2" "[ \$? -eq 2 ]"
+# The last argument, with nothing after it: a usage error like any other,
+# not a silent exit 1 from shifting past the end.
+out="$(GPUQ_PREFIX="$tmp/ws" bash "$repo/bootstrap.sh" --dry-run --init 2>&1)"
+check "--init with no value is refused with exit 2" "[ \$? -eq 2 ]"
+check "--init with no value says what it takes" \
+  "grep -q 'supervisor, systemd or none' <<<'$out'"
 
 # Left to choose: supervisor wins where it exists, because that is what
 # every box deployed so far runs and a re-run must not move the runner to
