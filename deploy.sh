@@ -45,7 +45,8 @@ Phases, in order. Each is safe to re-run.
   install  Get the code across, then run bootstrap.sh on the box.
   verify   Establish what the box actually gives you: capacity
            discovery, the preflight guard, and whether nvidia-smi's
-           pids mean anything locally.
+           pids mean anything locally. On a box with no GPU, that the
+           runner is up and the queue answers.
 
 Options:
   --probe-only        Run probe, print the report, stop. Changes nothing.
@@ -76,31 +77,38 @@ ver_ge() {
 # Choose the interpreter to install the runner into.
 #
 # Reads probe lines on stdin; prints the chosen path, or fails naming the
-# floor. The rule, in order: it must be >= PY_FLOOR and have pip, and
-# among those an interpreter holding torch wins -- that is where the ML
-# stack lives, gpuq has no dependencies so it cannot conflict with it, and
-# jobs that say `-- python train.py` need it on PATH. Ties break to the
-# highest version.
+# floor. The rule, in order: it must be >= PY_FLOOR; one with pip beats
+# one without; and among those an interpreter holding torch wins -- that
+# is where the ML stack lives, gpuq has no dependencies so it cannot
+# conflict with it, and jobs that say `-- python train.py` need it on
+# PATH. Ties break to the highest version.
+#
+# pip is a preference and not a requirement: bootstrap.sh builds a venv
+# from an interpreter that lacks it. It still outranks torch, because that
+# venv would not hold torch either, and installing where pip already is
+# changes nothing else on the box.
 #
 # Deliberately not "whatever is called python3": on the boxes this targets
 # that is routinely the wrong answer, and picking it is the mistake this
 # function exists to stop someone repeating at 2am.
 choose_python() {
-  local best="" best_ver="" best_torch=0
-  local tag path ver haspip hastorch
+  local best="" best_ver="" best_rank=-1
+  local tag path ver haspip hastorch rank
   while IFS=$'\t' read -r tag path ver haspip hastorch; do
     [ "$tag" = "py" ] || continue
-    [ "$haspip" = "1" ] || continue
     ver_ge "$ver" "$PY_FLOOR" || continue
-    # torch beats version; version only breaks ties within a torch class.
-    if [ -z "$best" ] ||
-       { [ "$hastorch" = "1" ] && [ "$best_torch" = "0" ]; } ||
-       { [ "$hastorch" = "$best_torch" ] && ver_ge "$ver" "$best_ver"; }; then
-      best="$path"; best_ver="$ver"; best_torch="$hastorch"
+    # pip beats torch beats version; version only breaks ties within a
+    # class.
+    rank=0
+    [ "$hastorch" = "1" ] && rank=1
+    [ "$haspip" = "1" ] && rank=$((rank + 2))
+    if [ "$rank" -gt "$best_rank" ] ||
+       { [ "$rank" -eq "$best_rank" ] && ver_ge "$ver" "$best_ver"; }; then
+      best="$path"; best_ver="$ver"; best_rank="$rank"
     fi
   done
   if [ -z "$best" ]; then
-    echo "deploy: no interpreter on this box is Python $PY_FLOOR+ with pip." >&2
+    echo "deploy: no interpreter on this box is Python $PY_FLOOR+." >&2
     echo "        gpuq needs $PY_FLOOR for stdlib tomllib; there is no fallback." >&2
     echo "        Install one, or point --python at it if the probe missed it." >&2
     return 1
@@ -203,14 +211,24 @@ row()  { printf '           %-22s %-20s %s\n' "$1" "$2" "$3" >&2; }
 
 # --------------------------------------------------------------- phase 1
 
+# Which service manager bootstrap is told to use. Decided here and passed
+# explicitly, so the probe report and the install cannot disagree.
+init_choice() {
+  if [ "$P_SUPERVISOR" = "1" ]; then printf 'supervisor\n'
+  elif [ "$P_SYSTEMD" = "1" ]; then printf 'systemd\n'
+  else printf 'none\n'
+  fi
+}
+
 PROBE_OUT=""
 P_PYTHON=""; P_GPU=""; P_TOTAL="none"; P_SMI=0
-P_SUPERVISOR=0; P_WRITABLE=0; P_GIT=0
+P_SUPERVISOR=0; P_SYSTEMD=0; P_WRITABLE=0; P_GIT=0
 
 do_probe() {
   PROBE_OUT="$(remote probe <<EOF
 for p in python python3 python3.11 python3.12 python3.13 python3.14 \
-         /venv/main/bin/python /opt/conda/bin/python; do
+         /venv/main/bin/python /opt/conda/bin/python \
+         '$PREFIX/venv/bin/python'; do
   command -v "\$p" >/dev/null 2>&1 || continue
   full="\$(command -v "\$p")"
   v="\$("\$full" -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])' 2>/dev/null)" || continue
@@ -228,6 +246,10 @@ else
   printf 'smi\t0\n'
 fi
 command -v supervisorctl >/dev/null 2>&1 && printf 'supervisor\t1\n' || printf 'supervisor\t0\n'
+# The directory, not the binary: it exists exactly when systemd is the
+# running init, and an image can ship systemctl with nothing behind it.
+[ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 &&
+  printf 'systemd\t1\n' || printf 'systemd\t0\n'
 command -v git >/dev/null 2>&1 && printf 'git\t1\n' || printf 'git\t0\n'
 if mkdir -p '$PREFIX' 2>/dev/null && touch '$PREFIX/.gpuq-probe' 2>/dev/null; then
   rm -f '$PREFIX/.gpuq-probe'; printf 'prefixwritable\t1\n'
@@ -244,6 +266,7 @@ EOF
       smi)            P_SMI="$a" ;;
       gpu)            P_GPU="$a"; P_TOTAL="${c:-none}" ;;
       supervisor)     P_SUPERVISOR="$a" ;;
+      systemd)        P_SYSTEMD="$a" ;;
       git)            P_GIT="$a" ;;
       prefixwritable) P_WRITABLE="$a" ;;
     esac
@@ -265,6 +288,8 @@ EOF
     local why="highest $PY_FLOOR+"
     printf '%s\n' "$PROBE_OUT" | grep -qP "^py\t\Q$P_PYTHON\E\t[^\t]*\t1\t1$" &&
       why="$PY_FLOOR+, holds torch"
+    printf '%s\n' "$PROBE_OUT" | grep -qP "^py\t\Q$P_PYTHON\E\t[^\t]*\t0\t" &&
+      why="no pip — bootstrap creates $PREFIX/venv from it"
     row "interpreter" "$P_PYTHON" "($why)"
   fi
 
@@ -273,8 +298,11 @@ EOF
     return 2
   }
   row "prefix" "$PREFIX" "writable"
-  [ "$P_SUPERVISOR" = "1" ] ||
-    row "supervisor" "absent" "WARN — installing with --no-supervisor"
+  case "$(init_choice)" in
+    supervisor) ;;
+    systemd) row "init" "systemd" "no supervisor — installing a systemd unit" ;;
+    *) row "init" "none" "WARN — no supervisor or systemd; run gpuq-runner yourself" ;;
+  esac
   [ "$P_GIT" = "1" ] || row "git" "absent" "WARN — will stream a tarball"
   return 0
 }
@@ -311,8 +339,8 @@ do_install() {
     return 0
   fi
 
-  local sup_flag=""
-  [ "$P_SUPERVISOR" = "1" ] || sup_flag="--no-supervisor"
+  local init
+  init="$(init_choice)"
 
   local out
   if ! out="$(remote install <<EOF
@@ -323,7 +351,7 @@ set -e
 # commit, and switching to it would reinstall that.
 cd '$REPO_DIR' && git fetch --quiet origin '$ref' && git checkout --quiet --detach FETCH_HEAD
 git -C '$REPO_DIR' rev-parse --short HEAD
-cd '$REPO_DIR' && PYTHON='$P_PYTHON' GPUQ_PREFIX='$PREFIX' ./bootstrap.sh $sup_flag 2>&1 | tail -5
+cd '$REPO_DIR' && PYTHON='$P_PYTHON' GPUQ_PREFIX='$PREFIX' ./bootstrap.sh --init $init 2>&1 | tail -5
 EOF
 )"; then
     say "deploy: install failed on $BOX"
@@ -333,6 +361,14 @@ EOF
   row "checkout" "$(printf '%s\n' "$out" | head -1)" "$ref"
   if printf '%s\n' "$out" | grep -q 'bootstrap complete'; then
     row "bootstrap" "complete" ""
+    # Where the runner actually went. On a box with no pip that is the
+    # venv bootstrap built, and verify has to look there.
+    local installed
+    installed="$(printf '%s\n' "$out" | sed -n 's/^runner python: //p' | tail -1)"
+    if [ -n "$installed" ] && [ "$installed" != "$P_PYTHON" ]; then
+      P_PYTHON="$installed"
+      row "runner python" "$P_PYTHON" "(created by bootstrap)"
+    fi
   else
     row "bootstrap" "PROBLEM" "see output below"
     printf '%s\n' "$out" >&2
@@ -348,9 +384,21 @@ do_verify() {
   out="$(remote verify <<EOF
 export PATH='$(dirname "$P_PYTHON")':\$PATH
 export GPUQ_CONFIG='$PREFIX/gpuq.toml' GPU_CLAIM_DIR='$PREFIX/lock/gpu'
-printf 'runner\t%s\n' "\$(supervisorctl status gpuq-runner 2>/dev/null | awk '{print \$2}')"
+runner="\$(supervisorctl status gpuq-runner 2>/dev/null | awk '{print \$2}')"
+if [ -z "\$runner" ]; then
+  # Not under supervisor. A system unit, or a user unit -- which an ssh
+  # command line can only ask about with the runtime dir set.
+  export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/\$(id -u 2>/dev/null)}"
+  if [ "\$(systemctl is-active gpuq-runner 2>/dev/null)" = "active" ] ||
+     [ "\$(systemctl --user is-active gpuq-runner 2>/dev/null)" = "active" ]; then
+    runner=RUNNING
+  fi
+fi
+printf 'runner\t%s\n' "\$runner"
 '$P_PYTHON' -c 'from gpuqueue.gpuid import total_vram_mb; print("total\t%s" % (total_vram_mb() or "none"))' 2>/dev/null || printf 'total\tnone\n'
 gpuq list >/dev/null 2>&1 && printf 'gpuqlist\t1\n' || printf 'gpuqlist\t0\n'
+# No card: nothing below has a subject, and gpu-claim refuses by design.
+if [ '$P_SMI' != 1 ]; then exit 0; fi
 
 # Passive first: if the card already has work on it, the pid question is
 # answerable by reading, which costs nothing and touches nobody's job.
@@ -418,11 +466,20 @@ EOF
   if [ "$runner" = "RUNNING" ]; then row "runner" "RUNNING" "ok"
   else row "runner" "${runner:-absent}" "FAIL"; fails=$((fails+1)); fi
 
-  if [ "$total" != "none" ]; then row "capacity discovery" "${total} MiB" "ok"
-  else row "capacity discovery" "none" "WARN — every GPU job admitted exclusively"; fi
-
   if [ "$gpuqlist" = "1" ]; then row "gpuq list" "exit 0" "ok"
   else row "gpuq list" "nonzero" "FAIL"; fails=$((fails+1)); fi
+
+  # A box with no card has no claim to round-trip, no pids to classify and
+  # nothing for preflight to refuse. Those are not failures there: the CPU
+  # lane needs none of them, and the verdict says the GPU lane is absent.
+  if [ "$P_SMI" != "1" ]; then
+    row "GPU checks" "n/a" "no nvidia-smi — CPU lane only"
+    VERDICT_PIDCLASS="nosmi"; VERDICT_TOTAL="none"
+    return "$( [ "$fails" -gt 0 ] && echo 1 || echo 0 )"
+  fi
+
+  if [ "$total" != "none" ]; then row "capacity discovery" "${total} MiB" "ok"
+  else row "capacity discovery" "none" "WARN — every GPU job admitted exclusively"; fi
 
   if [ "$claim" = "1" ]; then row "claim round-trip" "exit 0" "ok"
   else row "claim round-trip" "nonzero" "FAIL"; fails=$((fails+1)); fi
@@ -492,10 +549,12 @@ do_report() {
   v="$(verdict "$VERDICT_PIDCLASS" "$VERDICT_TOTAL" "$P_SMI")"
   printf '\n  %-8s %s\n' "VERDICT" "$v" >&2
   printf '\n  Row for docs/deploying.md — Boxes:\n\n' >&2
+  local hw="no GPU"
+  [ "$P_SMI" = "1" ] && hw="${P_GPU:-unnamed GPU}, $P_TOTAL MiB"
   # The backticks are Markdown for the docs table, not command substitution.
   # shellcheck disable=SC2016
-  printf '| `%s` | %s, %s MiB | `%s` | %s. Verified %s |\n\n' \
-    "$BOX" "${P_GPU:-no GPU}" "$P_TOTAL" "$P_PYTHON" "$v" "$(date +%F)" >&2
+  printf '| `%s` | %s | `%s` | %s. Verified %s |\n\n' \
+    "$BOX" "$hw" "$P_PYTHON" "$v" "$(date +%F)" >&2
 }
 
 # -------------------------------------------------------------------- main

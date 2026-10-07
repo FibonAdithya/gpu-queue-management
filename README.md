@@ -27,7 +27,7 @@ same box should get scheduling without reimplementing it.
 |---|---|
 | `gpu-claim` | Advisory lock keyed on the GPU UUID, with a preflight that refuses to start on an unledgered CUDA process. Wraps any command. |
 | `gpuq` | Submit, list, inspect and cancel jobs. |
-| `gpuq-runner` | Supervisor-managed daemon. Admits CPU jobs concurrently and GPU jobs against their declared VRAM, reaps dead claims, commits artifacts. |
+| `gpuq-runner` | Daemon kept alive by supervisor or systemd. Admits CPU jobs concurrently and GPU jobs against their declared VRAM, reaps dead claims, commits artifacts. |
 | `deploy.sh` | Takes a named ssh box to a *verified* installation: probes it, chooses the interpreter, runs `bootstrap.sh` there, then establishes what the box actually enforces. |
 | `bootstrap.sh` | Takes a bare box to a working runner, idempotently. Runs on the box; `deploy.sh` is what calls it. |
 | `bugreport.py` / `bugfiler.py` | When gpuq's own code raises, file a GitHub issue carrying the traceback and a dedup signature so a headless Claude Code run can open a PR against it. Off unless configured; see `docs/specs/2026-08-05-autofix-design.md`. |
@@ -41,6 +41,11 @@ the architecture and `docs/plans/` for the implementation plan.
 
 Needs Python 3.11+ (stdlib `tomllib`). If the box's `python3` is older,
 point `bootstrap.sh` at the right one with `PYTHON=/path/to/python3.11`.
+The interpreter does not need pip: without it, `bootstrap.sh` installs
+into a venv it creates under the prefix.
+
+A box with no GPU works as a CPU job queue. `deploy.sh` verifies it as
+such, and `skills/gpu-jobs/SKILL.md` covers submitting to it over ssh.
 
 A GPU job may declare what it needs, and jobs are admitted while their
 declarations fit the card:
